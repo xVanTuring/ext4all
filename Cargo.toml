@@ -22,7 +22,9 @@ ext4-core = { path = "crates/ext4-core" }
 [profile.release]
 debug = 1
 lto = "thin"
-panic = "abort"
+# unwind (not abort): the FFI layer turns panics into EIO instead of
+# killing the file system extension
+panic = "unwind"
 
 [profile.dev]
 opt-level = 1

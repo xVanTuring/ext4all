@@ -1,6 +1,20 @@
 [package]
 name = "ext4-ffi"
-version = "0.1.0"
-edition = "2024"
+description = "C ABI over ext4-core for the FSKit extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true
 
 [dependencies]
+ext4-core.workspace = true
+log = "0.4.34"
+
+[dev-dependencies]
+tempfile = "3.27.0"

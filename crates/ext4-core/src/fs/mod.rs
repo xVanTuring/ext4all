@@ -584,8 +584,23 @@ impl Fs {
         if self.read_only { Err(Error::ReadOnly) } else { Ok(()) }
     }
 
-    /// Journal inode number (hidden from directory listings of the root?
-    /// no — it has no directory entry; exposed for tools).
+    /// Current volume label.
+    pub fn label(&self) -> String {
+        self.sb.volume_name()
+    }
+
+    /// Change the volume label (at most 16 bytes of UTF-8).
+    pub fn set_label(&mut self, label: &str) -> Result<()> {
+        self.require_rw()?;
+        if label.len() > 16 {
+            return Err(Error::NameTooLong);
+        }
+        self.sb.set_volume_name(label);
+        self.dirty_super();
+        self.commit()
+    }
+
+    /// Journal inode number, if the file system has an internal journal.
     pub fn journal_ino(&self) -> Option<Ino> {
         self.journal.as_ref().map(|_| JOURNAL_INO)
     }

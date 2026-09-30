@@ -520,4 +520,34 @@ impl Fs {
         }
         self.all_extents(ino, &inode)
     }
+
+    /// `lseek(SEEK_DATA)` (`data = true`) or `lseek(SEEK_HOLE)`.
+    /// Unwritten (preallocated) blocks count as holes. The end of file is
+    /// an implicit hole.
+    pub fn seek_data_hole(&mut self, ino: Ino, offset: u64, data: bool) -> Result<u64> {
+        let inode = self.read_live_inode(ino)?;
+        let size = inode.size();
+        if offset >= size {
+            return Err(Error::NoSuchOffset);
+        }
+        if inode.has_flag(flags::INLINE_DATA) {
+            return Ok(if data { offset } else { size });
+        }
+        let bs = self.bs as u64;
+        let mut lblk = offset / bs;
+        loop {
+            let pos = (lblk * bs).max(offset);
+            if pos >= size {
+                return if data { Err(Error::NoSuchOffset) } else { Ok(size) };
+            }
+            let (is_data, run) = match self.map_block(ino, &inode, lblk)? {
+                Mapping::Mapped { len, unwritten, .. } => (!unwritten, len),
+                Mapping::Hole { len } => (false, len),
+            };
+            if is_data == data {
+                return Ok(pos);
+            }
+            lblk = lblk.saturating_add(run.max(1));
+        }
+    }
 }

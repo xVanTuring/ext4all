@@ -10,6 +10,7 @@ pub mod errno {
     pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
     pub const EIO: i32 = 5;
+    pub const ENXIO: i32 = 6;
     pub const EBADF: i32 = 9;
     pub const ENOMEM: i32 = 12;
     pub const EACCES: i32 = 13;
@@ -74,6 +75,8 @@ pub enum Error {
     NotPermitted,
     #[error("resource busy")]
     Busy,
+    #[error("no data or hole past the given offset")]
+    NoSuchOffset,
 }
 
 impl Error {
@@ -112,6 +115,7 @@ impl Error {
             Error::NoAttr => ENOATTR,
             Error::NotPermitted => EPERM,
             Error::Busy => EBUSY,
+            Error::NoSuchOffset => ENXIO,
         }
     }
 }

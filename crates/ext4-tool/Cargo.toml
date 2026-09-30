@@ -1,6 +1,20 @@
 [package]
 name = "ext4-tool"
-version = "0.1.0"
-edition = "2024"
+description = "Command line tool to inspect and modify ext4 images with ext4-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ext4-tool"
+path = "src/main.rs"
+
+[lints]
+workspace = true
 
 [dependencies]
+ext4-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

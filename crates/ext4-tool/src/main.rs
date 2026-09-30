@@ -1,3 +1,413 @@
+//! `ext4-tool IMAGE COMMAND [ARGS...]` — inspect and modify ext4 images.
+
+use ext4_core::{Error, FileDevice, FileType, Fs, Ino, MountOptions, RenameFlags, Result, XattrSetMode};
+use std::io::Write;
+use std::sync::Arc;
+
+const USAGE: &str = "\
+usage: ext4-tool IMAGE COMMAND [ARGS...]
+
+read-only commands:
+  info                      superblock summary and features
+  ls [-l] PATH              list a directory
+  tree [PATH]               recursive listing
+  cat PATH                  print file contents
+  stat PATH                 print inode attributes
+  get PATH HOSTFILE         copy a file out of the image
+  readlink PATH             print a symlink target
+  xattr-list PATH           list extended attributes
+  xattr-get PATH NAME       print an extended attribute
+
+modifying commands:
+  put HOSTFILE PATH         copy a host file into the image
+  mkdir PATH                create a directory
+  rm PATH                   remove a file
+  rmdir PATH                remove an empty directory
+  mv SRC DST                rename
+  ln TARGET PATH            create a hard link
+  symlink TARGET PATH       create a symbolic link
+  truncate PATH SIZE        change a file's size
+  chmod MODE PATH           change permission bits (octal)
+  xattr-set PATH NAME VALUE set an extended attribute
+  xattr-rm PATH NAME        remove an extended attribute
+  label NAME                change the volume label
+  recover                   replay the journal and process orphans
+";
+
+fn split(path: &str) -> Result<(&str, &str)> {
+    let p = path.trim_end_matches('/');
+    match p.rfind('/') {
+        Some(i) => Ok((if i == 0 { "/" } else { &p[..i] }, &p[i + 1..])),
+        None => Ok(("/", p)),
+    }
+}
+
+fn type_char(ft: FileType) -> char {
+    match ft {
+        FileType::Directory => 'd',
+        FileType::Symlink => 'l',
+        FileType::CharDev => 'c',
+        FileType::BlockDev => 'b',
+        FileType::Fifo => 'p',
+        FileType::Socket => 's',
+        _ => '-',
+    }
+}
+
+fn perm_string(mode: u16) -> String {
+    let mut s = String::new();
+    for (i, c) in "rwxrwxrwx".chars().enumerate() {
+        s.push(if mode & (0o400 >> i) != 0 { c } else { '-' });
+    }
+    s
+}
+
+fn ls(fs: &mut Fs, out: &mut dyn Write, path: &str, long: bool) -> Result<()> {
+    let dir = fs.resolve(path)?;
+    let mut entries = fs.list_dir(dir)?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in entries {
+        let name = String::from_utf8_lossy(&e.name);
+        if long {
+            let a = fs.stat(e.ino)?;
+            writeln!(
+                out,
+                "{}{} {:>3} {:>5} {:>5} {:>12} {:>8} {}",
+                type_char(a.file_type),
+                perm_string(a.perm),
+                a.nlink,
+                a.uid,
+                a.gid,
+                a.size,
+                e.ino,
+                name
+            )?;
+        } else {
+            writeln!(out, "{name}")?;
+        }
+    }
+    Ok(())
+}
+
+fn tree(fs: &mut Fs, out: &mut dyn Write, dir: Ino, prefix: &str, depth: usize) -> Result<()> {
+    if depth > 64 {
+        return Ok(());
+    }
+    let mut entries = fs.list_dir(dir)?;
+    entries.retain(|e| e.name != b"." && e.name != b"..");
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in entries {
+        let name = String::from_utf8_lossy(&e.name);
+        writeln!(
+            out,
+            "{prefix}{name}{}",
+            if e.file_type == FileType::Directory { "/" } else { "" }
+        )?;
+        if e.file_type == FileType::Directory {
+            tree(fs, out, e.ino, &format!("{prefix}  "), depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_all(fs: &mut Fs, ino: Ino) -> Result<Vec<u8>> {
+    let size = fs.stat(ino)?.size as usize;
+    let mut buf = vec![0u8; size];
+    let mut done = 0;
+    while done < size {
+        let n = fs.read(ino, done as u64, &mut buf[done..])?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+    buf.truncate(done);
+    Ok(buf)
+}
+
+fn info(fs: &Fs, out: &mut dyn Write) -> Result<()> {
+    let sb = fs.superblock();
+    let u = sb.uuid();
+    let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
+    writeln!(out, "label:        {}", sb.volume_name())?;
+    writeln!(
+        out,
+        "uuid:         {}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )?;
+    writeln!(out, "block size:   {}", sb.block_size())?;
+    writeln!(out, "blocks:       {}", sb.blocks_count())?;
+    writeln!(out, "inodes:       {}", sb.inodes_count())?;
+    writeln!(out, "inode size:   {}", sb.inode_size())?;
+    writeln!(out, "groups:       {}", sb.group_count())?;
+    let s = fs.statfs();
+    writeln!(out, "free blocks:  {}", s.free_blocks)?;
+    writeln!(out, "free inodes:  {}", s.free_files)?;
+    writeln!(out, "features:     {}", ext4_core::features::describe(sb).join(" "))?;
+    writeln!(
+        out,
+        "mode:         {}",
+        if fs.is_read_only() { "read-only" } else { "read-write" }
+    )?;
+    let r = fs.mount_report();
+    if r.journal_replayed {
+        writeln!(out, "journal:      replayed {} transactions", r.replayed_transactions)?;
+    }
+    for reason in &r.read_only_reasons {
+        writeln!(out, "read-only because: {reason}")?;
+    }
+    Ok(())
+}
+
+const MODIFYING: &[&str] = &[
+    "put",
+    "mkdir",
+    "rm",
+    "rmdir",
+    "mv",
+    "ln",
+    "symlink",
+    "truncate",
+    "chmod",
+    "xattr-set",
+    "xattr-rm",
+    "label",
+    "recover",
+];
+
+fn run(args: &[String], out: &mut dyn Write) -> Result<()> {
+    if args.len() < 2 {
+        return Err(Error::invalid(USAGE));
+    }
+    let image = &args[0];
+    let cmd = args[1].as_str();
+    let rest = &args[2..];
+    let need = |n: usize| -> Result<()> {
+        if rest.len() < n {
+            Err(Error::invalid(format!("{cmd}: missing arguments\n{USAGE}")))
+        } else {
+            Ok(())
+        }
+    };
+    let rw = MODIFYING.contains(&cmd);
+    let dev = Arc::new(FileDevice::open(image, !rw)?);
+    let mut fs = Fs::mount(
+        dev,
+        MountOptions {
+            read_only: !rw,
+            ..Default::default()
+        },
+    )?;
+    if rw && fs.is_read_only() {
+        return Err(Error::ReadOnly);
+    }
+    match cmd {
+        "info" => info(&fs, out)?,
+        "ls" => {
+            let long = rest.first().is_some_and(|a| a == "-l");
+            let path = rest.iter().find(|a| !a.starts_with('-')).map_or("/", |s| s.as_str());
+            ls(&mut fs, out, path, long)?;
+        }
+        "tree" => {
+            let dir = fs.resolve(rest.first().map_or("/", |s| s.as_str()))?;
+            tree(&mut fs, out, dir, "", 0)?;
+        }
+        "cat" => {
+            need(1)?;
+            let ino = fs.resolve(&rest[0])?;
+            let data = read_all(&mut fs, ino)?;
+            out.write_all(&data)?;
+        }
+        "stat" => {
+            need(1)?;
+            let ino = fs.resolve(&rest[0])?;
+            let a = fs.stat(ino)?;
+            writeln!(out, "inode:  {}", a.ino)?;
+            writeln!(out, "type:   {:?}", a.file_type)?;
+            writeln!(out, "mode:   {:o}", a.mode())?;
+            writeln!(out, "links:  {}", a.nlink)?;
+            writeln!(out, "uid:    {}", a.uid)?;
+            writeln!(out, "gid:    {}", a.gid)?;
+            writeln!(out, "size:   {}", a.size)?;
+            writeln!(out, "alloc:  {}", a.allocated)?;
+            writeln!(out, "flags:  {:#x}", a.flags)?;
+            writeln!(out, "mtime:  {}.{:09}", a.mtime.sec, a.mtime.nsec)?;
+            writeln!(out, "ctime:  {}.{:09}", a.ctime.sec, a.ctime.nsec)?;
+            writeln!(out, "atime:  {}.{:09}", a.atime.sec, a.atime.nsec)?;
+            if let Some(c) = a.crtime {
+                writeln!(out, "crtime: {}.{:09}", c.sec, c.nsec)?;
+            }
+            if let Ok(exts) = fs.file_extents(ino) {
+                for e in exts {
+                    writeln!(
+                        out,
+                        "extent: {}..{} -> {}{}",
+                        e.block,
+                        e.end(),
+                        e.start,
+                        if e.unwritten { " (unwritten)" } else { "" }
+                    )?;
+                }
+            }
+        }
+        "get" => {
+            need(2)?;
+            let ino = fs.resolve(&rest[0])?;
+            let data = read_all(&mut fs, ino)?;
+            std::fs::write(&rest[1], data)?;
+        }
+        "readlink" => {
+            need(1)?;
+            let ino = fs.resolve(&rest[0])?;
+            out.write_all(&fs.read_link(ino)?)?;
+            writeln!(out)?;
+        }
+        "xattr-list" => {
+            need(1)?;
+            let ino = fs.resolve(&rest[0])?;
+            for n in fs.list_xattr(ino)? {
+                writeln!(out, "{}", String::from_utf8_lossy(&n))?;
+            }
+        }
+        "xattr-get" => {
+            need(2)?;
+            let ino = fs.resolve(&rest[0])?;
+            out.write_all(&fs.get_xattr(ino, rest[1].as_bytes())?)?;
+        }
+        "put" => {
+            need(2)?;
+            let data = std::fs::read(&rest[0])?;
+            let (parent, name) = split(&rest[1])?;
+            let dir = fs.resolve(parent)?;
+            let ino = match fs.lookup(dir, name.as_bytes()) {
+                Ok(ino) => {
+                    fs.truncate(ino, 0)?;
+                    ino
+                }
+                Err(Error::NotFound) => fs.create(dir, name.as_bytes(), FileType::Regular, 0o644, 0, 0, 0)?.ino,
+                Err(e) => return Err(e),
+            };
+            let mut off = 0;
+            for chunk in data.chunks(1 << 20) {
+                fs.write(ino, off as u64, chunk)?;
+                off += chunk.len();
+            }
+        }
+        "mkdir" => {
+            need(1)?;
+            let (parent, name) = split(&rest[0])?;
+            let dir = fs.resolve(parent)?;
+            fs.mkdir(dir, name.as_bytes(), 0o755, 0, 0)?;
+        }
+        "rm" | "rmdir" => {
+            need(1)?;
+            let (parent, name) = split(&rest[0])?;
+            let dir = fs.resolve(parent)?;
+            if cmd == "rm" {
+                fs.unlink(dir, name.as_bytes())?;
+            } else {
+                fs.rmdir(dir, name.as_bytes())?;
+            }
+        }
+        "mv" => {
+            need(2)?;
+            let (sp, sn) = split(&rest[0])?;
+            let (dp, dn) = split(&rest[1])?;
+            let s = fs.resolve(sp)?;
+            let d = fs.resolve(dp)?;
+            fs.rename(s, sn.as_bytes(), d, dn.as_bytes(), RenameFlags::default())?;
+        }
+        "ln" => {
+            need(2)?;
+            let target = fs.resolve(&rest[0])?;
+            let (parent, name) = split(&rest[1])?;
+            let dir = fs.resolve(parent)?;
+            fs.link(target, dir, name.as_bytes())?;
+        }
+        "symlink" => {
+            need(2)?;
+            let (parent, name) = split(&rest[1])?;
+            let dir = fs.resolve(parent)?;
+            fs.symlink(dir, name.as_bytes(), rest[0].as_bytes(), 0, 0)?;
+        }
+        "truncate" => {
+            need(2)?;
+            let ino = fs.resolve(&rest[0])?;
+            let size: u64 = rest[1].parse().map_err(|_| Error::invalid("bad size"))?;
+            fs.truncate(ino, size)?;
+        }
+        "chmod" => {
+            need(2)?;
+            let mode = u16::from_str_radix(&rest[0], 8).map_err(|_| Error::invalid("bad mode"))?;
+            let ino = fs.resolve(&rest[1])?;
+            fs.set_attr(
+                ino,
+                &ext4_core::SetAttr {
+                    perm: Some(mode),
+                    ..Default::default()
+                },
+            )?;
+        }
+        "xattr-set" => {
+            need(3)?;
+            let ino = fs.resolve(&rest[0])?;
+            fs.set_xattr(ino, rest[1].as_bytes(), rest[2].as_bytes(), XattrSetMode::Any)?;
+        }
+        "xattr-rm" => {
+            need(2)?;
+            let ino = fs.resolve(&rest[0])?;
+            fs.remove_xattr(ino, rest[1].as_bytes())?;
+        }
+        "label" => {
+            need(1)?;
+            fs.set_label(&rest[0])?;
+        }
+        "recover" => {
+            let r = fs.mount_report().clone();
+            writeln!(
+                out,
+                "journal replayed: {} ({} transactions, {} blocks), orphans: {}",
+                r.journal_replayed, r.replayed_transactions, r.replayed_blocks, r.orphans_processed
+            )?;
+        }
+        _ => return Err(Error::invalid(format!("unknown command {cmd}\n{USAGE}"))),
+    }
+    fs.unmount()?;
+    Ok(())
+}
+
 fn main() {
-    println!("Hello, world!");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if let Err(e) = run(&args, &mut out) {
+        let _ = out.flush();
+        eprintln!("ext4-tool: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_paths() {
+        assert_eq!(split("/a").unwrap(), ("/", "a"));
+        assert_eq!(split("/a/b").unwrap(), ("/a", "b"));
+        assert_eq!(split("/a/b/").unwrap(), ("/a", "b"));
+        assert_eq!(split("c").unwrap(), ("/", "c"));
+    }
+
+    #[test]
+    fn perms() {
+        assert_eq!(perm_string(0o755), "rwxr-xr-x");
+        assert_eq!(perm_string(0o600), "rw-------");
+        assert_eq!(type_char(FileType::Directory), 'd');
+        assert_eq!(type_char(FileType::Regular), '-');
+    }
 }

@@ -89,10 +89,19 @@ dependencies = [
 [[package]]
 name = "ext4-ffi"
 version = "0.1.0"
+dependencies = [
+ "ext4-core",
+ "log",
+ "tempfile",
+]
 
 [[package]]
 name = "ext4-tool"
 version = "0.1.0"
+dependencies = [
+ "ext4-core",
+ "tempfile",
+]
 
 [[package]]
 name = "fastrand"

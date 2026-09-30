@@ -1,0 +1,153 @@
+import Ext4FFI
+import FSKit
+import XCTest
+
+final class FSKitLayerTests: XCTestCase {
+    func testMountOptionParsing() {
+        XCTAssertFalse(Ext4FileSystem.wantsReadOnly(["-o", "noowners"]))
+        XCTAssertTrue(Ext4FileSystem.wantsReadOnly(["-r"]))
+        XCTAssertTrue(Ext4FileSystem.wantsReadOnly(["-o", "nosuid,ro"]))
+        XCTAssertTrue(Ext4FileSystem.wantsReadOnly(["-o", "rdonly"]))
+        XCTAssertTrue(Ext4FileSystem.wantsReadOnly(["-oro"]))
+        XCTAssertFalse(Ext4FileSystem.wantsReadOnly(["-o", "rw"]))
+        XCTAssertFalse(Ext4FileSystem.wantsReadOnly(["-o"]))
+        XCTAssertFalse(Ext4FileSystem.wantsReadOnly([]))
+    }
+
+    func testItemTypeMapping() {
+        let pairs: [(Int32, FSItem.ItemType)] = [
+            (EXT4_FT_REG, .file), (EXT4_FT_DIR, .directory), (EXT4_FT_LNK, .symlink), (EXT4_FT_FIFO, .fifo),
+            (EXT4_FT_CHR, .charDevice), (EXT4_FT_BLK, .blockDevice), (EXT4_FT_SOCK, .socket),
+        ]
+        for (raw, t) in pairs {
+            XCTAssertEqual(FSItem.ItemType(ext4Type: UInt8(raw)), t)
+            XCTAssertEqual(t.ext4Type, UInt8(raw))
+        }
+        XCTAssertEqual(FSItem.ItemType(ext4Type: 0), .unknown)
+        XCTAssertNil(FSItem.ItemType.unknown.ext4Type)
+    }
+
+    func testItemTableReusesObjects() {
+        let t = ItemTable()
+        let a = t.item(for: 12, parent: 2)
+        let b = t.item(for: 12, parent: 5)
+        XCTAssertTrue(a === b)
+        XCTAssertEqual(b.parentIno, 5)
+        let root = t.item(for: 2, parent: 2)
+        _ = t.item(for: 2, parent: 99)
+        XCTAssertEqual(root.parentIno, 2, "root parent is fixed")
+        XCTAssertEqual(t.count, 2)
+        t.remove(12)
+        XCTAssertFalse(t.item(for: 12, parent: 2) === a)
+        t.removeAll()
+        XCTAssertEqual(t.count, 0)
+    }
+
+    func testAttributesConversion() {
+        var a = Ext4Attr()
+        a.ino = 42
+        a.file_type = UInt8(EXT4_FT_REG)
+        a.mode = 0o100640
+        a.nlink = 3
+        a.uid = 1000
+        a.gid = 1000
+        a.size = 12345
+        a.allocated = 16384
+        a.mtime = Ext4Time(sec: 100, nsec: 5)
+        a.ctime = Ext4Time(sec: 200, nsec: 6)
+        a.atime = Ext4Time(sec: 300, nsec: 7)
+        a.has_crtime = true
+        a.crtime = Ext4Time(sec: 50, nsec: 1)
+        a.bsd_flags = 2
+        let f = FSItem.Attributes(a, parent: 7)
+        XCTAssertEqual(f.type, .file)
+        XCTAssertEqual(f.mode, 0o100640)
+        XCTAssertEqual(f.linkCount, 3)
+        XCTAssertEqual(f.uid, 1000)
+        XCTAssertEqual(f.size, 12345)
+        XCTAssertEqual(f.allocSize, 16384)
+        XCTAssertEqual(f.fileID.rawValue, 42)
+        XCTAssertEqual(f.parentID.rawValue, 7)
+        XCTAssertEqual(f.modifyTime.tv_sec, 100)
+        XCTAssertEqual(f.modifyTime.tv_nsec, 5)
+        XCTAssertEqual(f.birthTime.tv_sec, 50)
+        XCTAssertEqual(f.flags, 2)
+        XCTAssertTrue(f.inhibitKernelOffloadedIO)
+
+        var r = Ext4Attr()
+        r.ino = 2
+        r.file_type = UInt8(EXT4_FT_DIR)
+        let rf = FSItem.Attributes(r, parent: 2)
+        XCTAssertEqual(rf.fileID, .rootDirectory)
+        XCTAssertEqual(rf.parentID, .parentOfRoot)
+        XCTAssertEqual(rf.birthTime.tv_sec, rf.changeTime.tv_sec, "no crtime falls back to ctime")
+    }
+
+    func testVolumeHandlersWithoutContext() throws {
+        try XCTSkipUnless(TestImage.available, "e2fsprogs not installed")
+        let path = try TestImage.make(options: ["-t", "ext4", "-b", "4096"], label: "vol")
+        let mount = try Ext4Mount(FileBlockIO(path: path, readOnly: false), readOnly: false)
+        let volume = Ext4Volume(mount: mount, info: try mount.volumeInfo(), bsdName: "disk99s1")
+        XCTAssertEqual(volume.name.string, "vol")
+        XCTAssertEqual(volume.maximumNameLength, 255)
+        XCTAssertEqual(volume.maximumLinkCount, 65000)
+        XCTAssertTrue(volume.supportedVolumeCapabilities.supportsHardLinks)
+        XCTAssertEqual(volume.supportedVolumeCapabilities.caseFormat, .sensitive)
+        XCTAssertEqual(volume.requestedMountOptions, [])
+
+        let stats = volume.volumeStatistics
+        XCTAssertEqual(stats.fileSystemTypeName, "ext4")
+        XCTAssertEqual(stats.blockSize, 4096)
+        XCTAssertGreaterThan(stats.freeBlocks, 0)
+        XCTAssertLessThanOrEqual(stats.availableBlocks, stats.freeBlocks)
+
+        // FSTaskOptions/FSContext cannot be created outside FSKit, so only
+        // handlers without them are exercised here.
+        _ = volume.items.item(for: 2, parent: 2)
+
+        // write + read through the handler using an item from the table
+        let a = try mount.create(2, Data("f".utf8), type: UInt8(EXT4_FT_REG), perm: 0o644, uid: 0, gid: 0)
+        let item = volume.items.item(for: a.ino, parent: 2)
+        let wrote = expectation(description: "write")
+        volume.write(contents: Data("handler data".utf8), to: item, at: 3) { result, error in
+            XCTAssertNil(error)
+            XCTAssertNotNil(result)
+            wrote.fulfill()
+        }
+        wait(for: [wrote], timeout: 5)
+        XCTAssertEqual(try mount.read(a.ino, offset: 0, length: 100), Data([0, 0, 0]) + Data("handler data".utf8))
+
+        let failed = expectation(description: "negative offset")
+        volume.write(contents: Data("x".utf8), to: item, at: -1) { _, error in
+            XCTAssertEqual(posixCode(error!), .EINVAL)
+            failed.fulfill()
+        }
+        wait(for: [failed], timeout: 5)
+
+        let synced = expectation(description: "sync")
+        volume.synchronize(flags: .wait) { error in
+            XCTAssertNil(error)
+            synced.fulfill()
+        }
+        wait(for: [synced], timeout: 5)
+
+        let reclaimed = expectation(description: "reclaim")
+        volume.reclaimItem(item) { error in
+            XCTAssertNil(error)
+            reclaimed.fulfill()
+        }
+        wait(for: [reclaimed], timeout: 5)
+        XCTAssertEqual(volume.items.count, 1)
+
+        let unmounted = expectation(description: "unmount")
+        volume.unmount { unmounted.fulfill() }
+        wait(for: [unmounted], timeout: 10)
+        let deactivated = expectation(description: "deactivate")
+        volume.deactivateVolume(options: []) { error in
+            XCTAssertNil(error)
+            deactivated.fulfill()
+        }
+        wait(for: [deactivated], timeout: 5)
+        try TestImage.assertClean(path)
+    }
+}

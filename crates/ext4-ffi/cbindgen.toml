@@ -8,6 +8,8 @@ documentation = true
 documentation_style = "doxy"
 style = "both"
 cpp_compat = true
+# Swift imports size_t as Int (uintptr_t would be UInt)
+usize_is_size_t = true
 
 [export]
 include = ["Ext4Attr", "Ext4SetAttr", "Ext4StatFs", "Ext4ProbeInfo", "Ext4MountOptions", "Ext4DeviceOps", "Ext4Time"]

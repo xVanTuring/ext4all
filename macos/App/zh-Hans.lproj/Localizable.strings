@@ -1,0 +1,14 @@
+"Enable the file system extension" = "启用文件系统扩展";
+"Open System Settings › General › Login Items & Extensions › File System Extensions and turn on Ext4Kit." = "打开「系统设置 › 通用 › 登录项与扩展 › 文件系统扩展」，然后打开 Ext4Kit。";
+"Open System Settings" = "打开系统设置";
+"Connect an ext4 disk" = "连接 ext4 磁盘";
+"Disks formatted with ext4 (and ext2/ext3, read-only) are mounted automatically once the extension is enabled." = "启用扩展后，ext4 格式的磁盘会自动挂载（ext2/ext3 以只读方式挂载）。";
+"Mount manually (optional)" = "手动挂载（可选）";
+"To mount a partition or a disk image yourself, run in Terminal:" = "如需自行挂载分区或磁盘镜像，请在终端中运行：";
+"Read and write Linux ext4 disks on your Mac" = "在 Mac 上读写 Linux ext4 磁盘";
+"Version %@" = "版本 %@";
+"Changes are journaled: an interrupted write never corrupts the file system." = "所有修改都写入日志：写入过程被中断也不会损坏文件系统。";
+"Always eject the disk before unplugging it." = "拔出磁盘前请先推出。";
+"Encrypted, compressed or casefolded ext4 volumes are mounted read-only." = "加密、压缩或启用大小写不敏感的 ext4 卷以只读方式挂载。";
+"Good to know" = "注意事项";
+"Copy" = "拷贝";

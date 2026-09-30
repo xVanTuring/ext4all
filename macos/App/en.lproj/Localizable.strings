@@ -1,0 +1,14 @@
+"Enable the file system extension" = "Enable the file system extension";
+"Open System Settings › General › Login Items & Extensions › File System Extensions and turn on Ext4Kit." = "Open System Settings › General › Login Items & Extensions › File System Extensions and turn on Ext4Kit.";
+"Open System Settings" = "Open System Settings";
+"Connect an ext4 disk" = "Connect an ext4 disk";
+"Disks formatted with ext4 (and ext2/ext3, read-only) are mounted automatically once the extension is enabled." = "Disks formatted with ext4 (and ext2/ext3, read-only) are mounted automatically once the extension is enabled.";
+"Mount manually (optional)" = "Mount manually (optional)";
+"To mount a partition or a disk image yourself, run in Terminal:" = "To mount a partition or a disk image yourself, run in Terminal:";
+"Read and write Linux ext4 disks on your Mac" = "Read and write Linux ext4 disks on your Mac";
+"Version %@" = "Version %@";
+"Changes are journaled: an interrupted write never corrupts the file system." = "Changes are journaled: an interrupted write never corrupts the file system.";
+"Always eject the disk before unplugging it." = "Always eject the disk before unplugging it.";
+"Encrypted, compressed or casefolded ext4 volumes are mounted read-only." = "Encrypted, compressed or casefolded ext4 volumes are mounted read-only.";
+"Good to know" = "Good to know";
+"Copy" = "Copy";

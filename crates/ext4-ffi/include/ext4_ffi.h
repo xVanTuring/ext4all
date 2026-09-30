@@ -90,8 +90,8 @@ typedef void (*Ext4LogCallback)(int32_t level, const char *msg);
  */
 typedef struct Ext4DeviceOps {
   void *ctx;
-  int32_t (*read)(void *ctx, uint64_t offset, uint8_t *buf, uintptr_t len);
-  int32_t (*write)(void *ctx, uint64_t offset, const uint8_t *buf, uintptr_t len);
+  int32_t (*read)(void *ctx, uint64_t offset, uint8_t *buf, size_t len);
+  int32_t (*write)(void *ctx, uint64_t offset, const uint8_t *buf, size_t len);
   int32_t (*flush)(void *ctx);
   /**
    * Called once when the device is no longer used (may be null).
@@ -198,7 +198,7 @@ typedef struct Ext4Attr {
  */
 typedef bool (*Ext4DirCallback)(void *ctx,
                                 const uint8_t *name,
-                                uintptr_t len,
+                                size_t len,
                                 uint32_t ino,
                                 uint8_t file_type,
                                 uint64_t next_cookie,
@@ -305,7 +305,7 @@ int32_t ext4_statfs(const struct Ext4Handle *h, struct Ext4StatFs *out);
  * # Safety
  * `h` must be a live handle; `name` valid for `len` bytes.
  */
-int32_t ext4_set_label(const struct Ext4Handle *h, const uint8_t *name, uintptr_t len);
+int32_t ext4_set_label(const struct Ext4Handle *h, const uint8_t *name, size_t len);
 
 /**
  * # Safety
@@ -320,7 +320,7 @@ int32_t ext4_stat(const struct Ext4Handle *h, uint32_t ino, struct Ext4Attr *out
 int32_t ext4_lookup(const struct Ext4Handle *h,
                     uint32_t dir,
                     const uint8_t *name,
-                    uintptr_t len,
+                    size_t len,
                     struct Ext4Attr *out);
 
 /**
@@ -347,8 +347,8 @@ int32_t ext4_read(const struct Ext4Handle *h,
                   uint32_t ino,
                   uint64_t offset,
                   uint8_t *buf,
-                  uintptr_t len,
-                  uintptr_t *nread);
+                  size_t len,
+                  size_t *nread);
 
 /**
  * # Safety
@@ -358,8 +358,8 @@ int32_t ext4_write(const struct Ext4Handle *h,
                    uint32_t ino,
                    uint64_t offset,
                    const uint8_t *buf,
-                   uintptr_t len,
-                   uintptr_t *nwritten);
+                   size_t len,
+                   size_t *nwritten);
 
 /**
  * Create a node of type `file_type` (regular, fifo, socket, char/block
@@ -371,7 +371,7 @@ int32_t ext4_write(const struct Ext4Handle *h,
 int32_t ext4_create(const struct Ext4Handle *h,
                     uint32_t dir,
                     const uint8_t *name,
-                    uintptr_t len,
+                    size_t len,
                     uint8_t file_type,
                     uint16_t perm,
                     uint32_t uid,
@@ -386,9 +386,9 @@ int32_t ext4_create(const struct Ext4Handle *h,
 int32_t ext4_symlink(const struct Ext4Handle *h,
                      uint32_t dir,
                      const uint8_t *name,
-                     uintptr_t len,
+                     size_t len,
                      const uint8_t *target,
-                     uintptr_t target_len,
+                     size_t target_len,
                      uint32_t uid,
                      uint32_t gid,
                      struct Ext4Attr *out);
@@ -403,8 +403,8 @@ int32_t ext4_symlink(const struct Ext4Handle *h,
 int32_t ext4_readlink(const struct Ext4Handle *h,
                       uint32_t ino,
                       uint8_t *buf,
-                      uintptr_t cap,
-                      uintptr_t *len);
+                      size_t cap,
+                      size_t *len);
 
 /**
  * # Safety
@@ -414,7 +414,7 @@ int32_t ext4_link(const struct Ext4Handle *h,
                   uint32_t ino,
                   uint32_t dir,
                   const uint8_t *name,
-                  uintptr_t len,
+                  size_t len,
                   struct Ext4Attr *out);
 
 /**
@@ -424,7 +424,7 @@ int32_t ext4_link(const struct Ext4Handle *h,
  * # Safety
  * `h` must be a live handle; `name` valid for `len` bytes.
  */
-int32_t ext4_remove(const struct Ext4Handle *h, uint32_t dir, const uint8_t *name, uintptr_t len);
+int32_t ext4_remove(const struct Ext4Handle *h, uint32_t dir, const uint8_t *name, size_t len);
 
 /**
  * # Safety
@@ -433,10 +433,10 @@ int32_t ext4_remove(const struct Ext4Handle *h, uint32_t dir, const uint8_t *nam
 int32_t ext4_rename(const struct Ext4Handle *h,
                     uint32_t src_dir,
                     const uint8_t *src_name,
-                    uintptr_t src_len,
+                    size_t src_len,
                     uint32_t dst_dir,
                     const uint8_t *dst_name,
-                    uintptr_t dst_len,
+                    size_t dst_len,
                     uint32_t flags);
 
 /**
@@ -498,10 +498,10 @@ int32_t ext4_seek(const struct Ext4Handle *h,
 int32_t ext4_getxattr(const struct Ext4Handle *h,
                       uint32_t ino,
                       const uint8_t *name,
-                      uintptr_t name_len,
+                      size_t name_len,
                       uint8_t *buf,
-                      uintptr_t cap,
-                      uintptr_t *len);
+                      size_t cap,
+                      size_t *len);
 
 /**
  * # Safety
@@ -510,9 +510,9 @@ int32_t ext4_getxattr(const struct Ext4Handle *h,
 int32_t ext4_setxattr(const struct Ext4Handle *h,
                       uint32_t ino,
                       const uint8_t *name,
-                      uintptr_t name_len,
+                      size_t name_len,
                       const uint8_t *value,
-                      uintptr_t value_len,
+                      size_t value_len,
                       uint32_t mode);
 
 /**
@@ -522,7 +522,7 @@ int32_t ext4_setxattr(const struct Ext4Handle *h,
 int32_t ext4_removexattr(const struct Ext4Handle *h,
                          uint32_t ino,
                          const uint8_t *name,
-                         uintptr_t name_len);
+                         size_t name_len);
 
 /**
  * List visible xattr names as NUL-terminated strings back to back.
@@ -534,8 +534,8 @@ int32_t ext4_removexattr(const struct Ext4Handle *h,
 int32_t ext4_listxattr(const struct Ext4Handle *h,
                        uint32_t ino,
                        uint8_t *buf,
-                       uintptr_t cap,
-                       uintptr_t *len);
+                       size_t cap,
+                       size_t *len);
 
 /**
  * Validate a name as ext4 would (for early rejection in Swift).
@@ -543,7 +543,7 @@ int32_t ext4_listxattr(const struct Ext4Handle *h,
  * # Safety
  * `name` valid for `len` bytes.
  */
-int32_t ext4_validate_name(const uint8_t *name, uintptr_t len);
+int32_t ext4_validate_name(const uint8_t *name, size_t len);
 
 #ifdef __cplusplus
 }  // extern "C"

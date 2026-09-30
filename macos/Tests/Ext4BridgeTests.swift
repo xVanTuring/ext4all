@@ -23,7 +23,9 @@ final class Ext4BridgeTests: XCTestCase {
 
     func testProbeReadOnlyAndUnsupported() throws {
         let ext3 = try TestImage.make(options: ["-t", "ext3"])
-        XCTAssertEqual(try Ext4Mount.probe(StrictBlockIO(path: ext3, readOnly: true)).support, .readOnly)
+        XCTAssertEqual(try Ext4Mount.probe(StrictBlockIO(path: ext3, readOnly: true)).support, .readWrite)
+        let bigalloc = try TestImage.make(sizeMB: 64, options: ["-t", "ext4", "-O", "bigalloc", "-C", "16384"])
+        XCTAssertEqual(try Ext4Mount.probe(StrictBlockIO(path: bigalloc, readOnly: true)).support, .readOnly)
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let zero = dir.appendingPathComponent("zero.img").path

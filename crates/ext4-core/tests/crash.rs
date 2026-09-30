@@ -481,3 +481,8 @@ fn power_loss_without_journal_is_detected_and_repairable() {
         img.assert_clean();
     }
 }
+
+#[test]
+fn random_ops_with_power_loss_ext3() {
+    random_power_loss(&["-t", "ext3", "-b", "1024"], 300..316);
+}

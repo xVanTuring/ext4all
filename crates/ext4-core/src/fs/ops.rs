@@ -232,23 +232,23 @@ impl Fs {
             area[..target.len()].copy_from_slice(target);
             inode.set_size(target.len() as u64);
         } else {
-            if !inode.has_flag(flags::EXTENTS) {
-                self.free_inode(ino, false)?;
-                return Err(Error::unsupported("slow symlinks without extents"));
-            }
             let ipg = self.sb.inodes_per_group();
             let goal = self.group_first_block((ino - 1) / ipg);
             let (pblk, _) = self.alloc_blocks(goal, 1)?;
-            self.ext_insert(
-                ino,
-                &mut inode,
-                Extent {
-                    block: 0,
-                    len: 1,
-                    start: pblk,
-                    unwritten: false,
-                },
-            )?;
+            if inode.has_flag(flags::EXTENTS) {
+                self.ext_insert(
+                    ino,
+                    &mut inode,
+                    Extent {
+                        block: 0,
+                        len: 1,
+                        start: pblk,
+                        unwritten: false,
+                    },
+                )?;
+            } else {
+                self.ind_set(&mut inode, 0, pblk, pblk)?;
+            }
             let mut blk = vec![0u8; self.bs as usize];
             blk[..target.len()].copy_from_slice(target);
             self.cache.put(pblk, &blk);

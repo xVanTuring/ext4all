@@ -125,10 +125,6 @@ pub fn check(sb: &Superblock) -> Support {
     if sb.has_ro_compat(ro_compat::METADATA_CSUM) && sb.has_ro_compat(ro_compat::GDT_CSUM) {
         ro.push("metadata_csum+uninit_bg");
     }
-    if !sb.has_incompat(incompat::EXTENTS) {
-        // ext2/ext3: writing would need block-map allocation
-        ro.push("no extent feature (ext2/ext3)");
-    }
     if sb.has_compat(compat::FAST_COMMIT) {
         // Fast commit blocks cannot be replayed or produced; plain jbd2
         // transactions remain valid, so allow writing only when clean.

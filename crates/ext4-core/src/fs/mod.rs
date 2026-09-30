@@ -10,6 +10,7 @@ mod dir;
 mod extent;
 mod file;
 mod htree;
+mod indirect;
 mod inode;
 mod ops;
 mod orphan;

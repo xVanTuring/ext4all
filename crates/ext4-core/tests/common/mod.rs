@@ -38,6 +38,9 @@ pub const PROFILES: &[(&str, &[&str])] = &[
     ("meta-bg", &["-t", "ext4", "-O", "meta_bg,^resize_inode"]),
     ("no-dir-index", &["-t", "ext4", "-O", "^dir_index"]),
     ("no-orphan-file", &["-t", "ext4", "-O", "^orphan_file"]),
+    ("ext3", &["-t", "ext3"]),
+    ("ext3-1k", &["-t", "ext3", "-b", "1024"]),
+    ("ext2", &["-t", "ext2"]),
 ];
 
 impl Image {

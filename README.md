@@ -5,7 +5,7 @@
 - 完整读写：创建 / 删除 / 重命名 / 硬链接 / 符号链接 / 设备节点、读写 / 截断 / 预分配 / 打洞、扩展属性、卷标
 - 崩溃一致性：实现 jbd2 日志（Linux 同格式），所有元数据修改以事务方式原子提交；挂载时自动回放未完成的日志
 - 兼容现代 Linux 默认格式：`metadata_csum`、`64bit`、`flex_bg`、`extent`、htree 目录、`orphan_file`、`inline_data` 等
-- ext2 / ext3、以及含 `bigalloc`、`quota`、`encrypt`、`casefold` 等特性的卷以**只读**方式挂载
+- ext3 / ext2（间接块映射）同样支持读写；含 `bigalloc`、`quota`、`encrypt`、`casefold` 等特性的卷以**只读**方式挂载
 
 ## 架构
 
@@ -102,4 +102,4 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 - 无日志的 ext4 卷在断电后可能需要 `fsck`（与 Linux 相同，挂载期间会标记为未干净卸载）。
 - 单个操作修改的元数据超过日志容量（极大且极碎片化的文件删除）时，会退化为不经日志的直接写入。
 - 暂未实现 FSKit 的内核直通 I/O（`FSVolumeKernelOffloadedIOHandler`）；数据读写经扩展进程转发。
-- ext2/ext3（无 extent 特性）目前只读。
+- ext2/ext3 的文件不支持预分配（`fallocate`，与 Linux 相同，块映射无法表示未写入块）。

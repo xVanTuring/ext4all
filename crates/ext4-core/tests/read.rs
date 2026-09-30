@@ -215,21 +215,21 @@ fn xattrs_readable() {
 }
 
 #[test]
-fn ext3_image_mounts_read_only() {
+fn ext3_image_readable_and_writable() {
     let tree = sample_tree();
     let img = Image::create(64, &["-t", "ext3"], Some(tree.path()));
     let mut fs = img.mount_opts(MountOptions::default());
-    assert!(fs.is_read_only());
+    assert!(!fs.is_read_only());
     let root = fs.root();
     compare_tree(&mut fs, root, tree.path());
 }
 
 #[test]
-fn ext2_image_mounts_read_only() {
+fn ext2_image_readable_and_writable() {
     let tree = sample_tree();
     let img = Image::create(64, &["-t", "ext2"], Some(tree.path()));
     let mut fs = img.mount();
-    assert!(fs.is_read_only());
+    assert!(!fs.is_read_only());
     let root = fs.root();
     compare_tree(&mut fs, root, tree.path());
 }

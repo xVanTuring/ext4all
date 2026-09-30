@@ -386,18 +386,28 @@ impl Fs {
         if lblk >= u32::MAX as u64 {
             return Err(Error::NoSpace);
         }
-        let goal = self.ext_goal(ino, inode, lblk as u32)?;
+        let extents = inode.has_flag(flags::EXTENTS);
+        let goal = if extents {
+            self.ext_goal(ino, inode, lblk as u32)?
+        } else {
+            self.ind_goal(ino, inode, lblk)?
+        };
         let (pblk, _) = self.alloc_blocks(goal, 1)?;
-        if let Err(e) = self.ext_insert(
-            ino,
-            inode,
-            Extent {
-                block: lblk as u32,
-                len: 1,
-                start: pblk,
-                unwritten: false,
-            },
-        ) {
+        let mapped = if extents {
+            self.ext_insert(
+                ino,
+                inode,
+                Extent {
+                    block: lblk as u32,
+                    len: 1,
+                    start: pblk,
+                    unwritten: false,
+                },
+            )
+        } else {
+            self.ind_set(inode, lblk, pblk, pblk + 1)
+        };
+        if let Err(e) = mapped {
             self.free_blocks(pblk, 1)?;
             return Err(e);
         }

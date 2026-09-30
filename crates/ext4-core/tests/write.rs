@@ -907,3 +907,111 @@ fn directory_listing_cookies_resume() {
     .unwrap();
     assert_eq!(n, 5);
 }
+
+/// ext3 block maps: data at direct, single, double and triple indirect
+/// positions, then truncation back through every level.
+#[test]
+fn ext3_indirect_block_levels() {
+    // 1K blocks: single indirect from 12, double from 268, triple from 65804
+    let img = Image::new(64, &["-t", "ext3", "-b", "1024"]);
+    let positions = [3u64, 100, 10_000, 70_000, 300_000];
+    {
+        let mut fs = img.mount();
+        let root = fs.root();
+        let f = mkfile(&mut fs, root, "sparse", b"");
+        for (i, &blk) in positions.iter().enumerate() {
+            fs.write(f, blk * 1024, &pattern(1024, i as u64)).unwrap();
+        }
+        for (i, &blk) in positions.iter().enumerate() {
+            let mut b = vec![0u8; 1024];
+            fs.read(f, blk * 1024, &mut b).unwrap();
+            assert_eq!(b, pattern(1024, i as u64), "block {blk}");
+        }
+        // holes read as zeros
+        let mut b = vec![1u8; 1024];
+        fs.read(f, 50_000 * 1024, &mut b).unwrap();
+        assert!(b.iter().all(|&x| x == 0));
+        fs.unmount().unwrap();
+    }
+    img.assert_clean();
+    let mut expect = vec![0u8; 300_001 * 1024];
+    for (i, &blk) in positions.iter().enumerate() {
+        expect[blk as usize * 1024..(blk as usize + 1) * 1024].copy_from_slice(&pattern(1024, i as u64));
+    }
+    assert!(img.debugfs_cat("/sparse") == expect);
+    for size in [200_000u64 * 1024, 60_000 * 1024, 150 * 1024, 5 * 1024 + 7, 0] {
+        {
+            let mut fs = img.mount();
+            let f = fs.resolve("/sparse").unwrap();
+            fs.truncate(f, size).unwrap();
+            let a = fs.stat(f).unwrap();
+            assert_eq!(a.size, size);
+            fs.unmount().unwrap();
+        }
+        let (code, out) = img.fsck();
+        assert!(
+            code == 0 && !out.contains("Fix? no"),
+            "after truncate to {size}: exit {code}\n{out}"
+        );
+    }
+    let mut fs = img.mount_ro();
+    let f = fs.resolve("/sparse").unwrap();
+    assert_eq!(fs.stat(f).unwrap().allocated, 0);
+}
+
+#[test]
+fn ext3_large_sequential_file_and_delete() {
+    let img = Image::new(128, &["-t", "ext3", "-b", "4096"]);
+    let data = pattern(40 << 20, 77);
+    {
+        let mut fs = img.mount();
+        let root = fs.root();
+        let f = mkfile(&mut fs, root, "big", b"");
+        for (i, chunk) in data.chunks(1 << 20).enumerate() {
+            fs.write(f, (i as u64) << 20, chunk).unwrap();
+        }
+        assert_eq!(read_all(&mut fs, f), data);
+        assert!(matches!(fs.fallocate(f, 0, 4096, true), Err(Error::Unsupported(_))));
+        fs.punch_hole(f, 10 << 20, 1 << 20).unwrap();
+        fs.unmount().unwrap();
+    }
+    img.assert_clean();
+    let got = img.debugfs_cat("/big");
+    assert_eq!(&got[..10 << 20], &data[..10 << 20]);
+    assert!(got[10 << 20..11 << 20].iter().all(|&b| b == 0));
+    assert_eq!(&got[11 << 20..], &data[11 << 20..]);
+    {
+        let mut fs = img.mount();
+        let free_before = fs.statfs().free_blocks;
+        fs.unlink(2, b"big").unwrap();
+        fs.sync().unwrap();
+        assert!(fs.statfs().free_blocks > free_before + 9000);
+        fs.unmount().unwrap();
+    }
+    img.assert_clean();
+}
+
+#[test]
+fn ext2_directories_and_symlinks() {
+    let img = Image::new(32, &["-t", "ext2", "-b", "1024"]);
+    {
+        let mut fs = img.mount();
+        let root = fs.root();
+        let d = fs.mkdir(root, b"dir", 0o755, 0, 0).unwrap().ino;
+        for i in 0..400 {
+            mkfile(&mut fs, d, &format!("entry-{i}"), format!("{i}").as_bytes());
+        }
+        fs.symlink(root, b"long-link", "z".repeat(500).as_bytes(), 0, 0)
+            .unwrap();
+        let l = fs.lookup(root, b"long-link").unwrap();
+        assert_eq!(fs.read_link(l).unwrap(), "z".repeat(500).as_bytes());
+        for i in (0..400).step_by(3) {
+            fs.unlink(d, format!("entry-{i}").as_bytes()).unwrap();
+        }
+        fs.rename(root, b"dir", root, b"renamed", RenameFlags::default())
+            .unwrap();
+        fs.unmount().unwrap();
+    }
+    img.assert_clean();
+    assert_eq!(img.debugfs_cat("/renamed/entry-1"), b"1");
+}

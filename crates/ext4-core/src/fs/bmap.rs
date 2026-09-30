@@ -23,7 +23,7 @@ impl Fs {
         }
     }
 
-    fn ind_ptr(&mut self, blk: u64, i: u64) -> Result<u32> {
+    pub(crate) fn ind_ptr(&mut self, blk: u64, i: u64) -> Result<u32> {
         if blk >= self.sb.blocks_count() {
             return Err(Error::corrupt(format!("indirect block {blk} out of range")));
         }
@@ -67,7 +67,21 @@ impl Fs {
             (self.ind_ptr(blk, rel)?, Some(blk), rel)
         };
         if ptr == 0 {
-            return Ok(Mapping::Hole { len: 1 });
+            // the hole extends over the following zero pointers of this table
+            let mut len = 1u64;
+            match table {
+                None => {
+                    while idx + len < DIRECT && inode.block_ptr((idx + len) as usize) == 0 {
+                        len += 1;
+                    }
+                }
+                Some(t) => {
+                    while idx + len < per && self.ind_ptr(t, idx + len)? == 0 {
+                        len += 1;
+                    }
+                }
+            }
+            return Ok(Mapping::Hole { len });
         }
         // extend the run while pointers are consecutive in the same table
         let mut len = 1u64;

@@ -131,8 +131,15 @@ fn probe_reports_support_and_label() {
     assert!(!info.needs_recovery);
     // probe must not release the device
     unsafe { cb_release(o.ctx) };
-    let p3 = mkfs(d.path(), &["-t", "ext3"]);
+    let d3 = tempfile::tempdir().unwrap();
+    let p3 = mkfs(d3.path(), &["-t", "ext3"]);
     let o = ops(&p3, true, 512);
+    assert_eq!(unsafe { ext4_probe(&o, &mut info) }, 0);
+    assert_eq!(info.support, EXT4_SUPPORT_READ_WRITE);
+    unsafe { cb_release(o.ctx) };
+    let d4 = tempfile::tempdir().unwrap();
+    let p4 = mkfs(d4.path(), &["-t", "ext4", "-O", "bigalloc", "-C", "16384"]);
+    let o = ops(&p4, true, 512);
     assert_eq!(unsafe { ext4_probe(&o, &mut info) }, 0);
     assert_eq!(info.support, EXT4_SUPPORT_READ_ONLY);
     unsafe { cb_release(o.ctx) };

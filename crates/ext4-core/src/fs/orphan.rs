@@ -133,7 +133,7 @@ impl Fs {
             }
         } else {
             // interrupted truncate: drop blocks past i_size
-            if inode.is_reg() && inode.has_flag(crate::ondisk::inode::flags::EXTENTS) {
+            if inode.is_reg() && !inode.has_flag(crate::ondisk::inode::flags::INLINE_DATA) {
                 let first = inode.size().div_ceil(self.bs as u64);
                 self.free_range(ino, inode, first, 1 << 32)?;
             }

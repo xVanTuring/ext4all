@@ -17,7 +17,14 @@ impl Fs {
             (1u64 << 32) * bs - 1
         } else {
             let per = bs / 4;
-            (12 + per + per * per + per * per * per) * bs
+            let map = (12 + per + per * per + per * per * per) * bs;
+            // without huge_file, i_blocks (512-byte units) is 32 bits
+            let blocks = if self.huge_file() {
+                u64::MAX
+            } else {
+                (1u64 << 32) * 512 - 4 * bs
+            };
+            map.min(blocks)
         }
     }
 
@@ -139,7 +146,9 @@ impl Fs {
         if inode.has_flag(flags::INLINE_DATA) {
             return Ok(Some(self.uninline(ino, inode)?));
         }
-        if !inode.has_flag(flags::EXTENTS) {
+        // On ext4 old block-mapped files are migrated to extents; on
+        // ext2/ext3 they stay block mapped.
+        if !inode.has_flag(flags::EXTENTS) && self.sb.has_incompat(incompat::EXTENTS) {
             self.convert_to_extents(ino, inode)?;
         }
         Ok(None)
@@ -210,7 +219,7 @@ impl Fs {
     /// extending the file never exposes stale data.
     pub(crate) fn zero_tail(&mut self, ino: Ino, inode: &Inode, size: u64) -> Result<()> {
         let bs = self.bs as u64;
-        if size % bs == 0 || !inode.has_flag(flags::EXTENTS) {
+        if size % bs == 0 || inode.has_flag(flags::INLINE_DATA) {
             return Ok(());
         }
         if let Mapping::Mapped {
@@ -224,8 +233,8 @@ impl Fs {
         Ok(())
     }
 
-    /// Core write path; `inode` must be extent mapped. Does not touch the
-    /// size or timestamps.
+    /// Core write path (extent or block mapped, not inline). Does not touch
+    /// the size or timestamps.
     pub(crate) fn write_data(&mut self, ino: Ino, inode: &mut Inode, offset: u64, data: &[u8]) -> Result<usize> {
         let bs = self.bs as u64;
         let mut done = 0usize;
@@ -256,9 +265,14 @@ impl Fs {
                     done += avail;
                 }
                 Mapping::Hole { len: hole } => {
+                    let extents = inode.has_flag(flags::EXTENTS);
                     let want_bytes = in_blk + (len - done) as u64;
                     let want = want_bytes.div_ceil(bs).min(hole).min(MAX_INIT_LEN as u64) as u32;
-                    let goal = self.ext_goal(ino, inode, lblk as u32)?;
+                    let goal = if extents {
+                        self.ext_goal(ino, inode, lblk as u32)?
+                    } else {
+                        self.ind_goal(ino, inode, lblk)?
+                    };
                     let (start, got) = match self.alloc_blocks(goal, want) {
                         Ok(r) => r,
                         Err(e) => {
@@ -272,21 +286,35 @@ impl Fs {
                     let mut img = vec![0u8; got as usize * bs as usize];
                     img[in_blk as usize..in_blk as usize + avail].copy_from_slice(&data[done..done + avail]);
                     self.dev.write_at(start * bs, &img)?;
-                    let ins = self.ext_insert(
-                        ino,
-                        inode,
-                        Extent {
-                            block: lblk as u32,
-                            len: got,
-                            start,
-                            unwritten: false,
-                        },
-                    );
-                    if let Err(e) = ins {
-                        self.free_blocks(start, got as u64)?;
-                        return Err(e);
-                    }
                     let per = bs as i64 / 512;
+                    if extents {
+                        let ins = self.ext_insert(
+                            ino,
+                            inode,
+                            Extent {
+                                block: lblk as u32,
+                                len: got,
+                                start,
+                                unwritten: false,
+                            },
+                        );
+                        if let Err(e) = ins {
+                            self.free_blocks(start, got as u64)?;
+                            return Err(e);
+                        }
+                    } else {
+                        for i in 0..got as u64 {
+                            if let Err(e) = self.ind_set(inode, lblk + i, start + i, start + got as u64) {
+                                // blocks already mapped stay (and count as
+                                // written); release the rest
+                                self.free_blocks(start + i, got as u64 - i)?;
+                                let cur = inode.sectors(self.bs, self.huge_file()) as i64;
+                                inode.set_sectors((cur + i as i64 * per) as u64);
+                                done += ((i * bs).saturating_sub(in_blk) as usize).min(avail);
+                                return if done > 0 { Ok(done) } else { Err(e) };
+                            }
+                        }
+                    }
                     let cur = inode.sectors(self.bs, self.huge_file()) as i64;
                     inode.set_sectors((cur + got as i64 * per) as u64);
                     done += avail;
@@ -358,6 +386,9 @@ impl Fs {
         if from >= to || from >= 1 << 32 {
             return Ok(());
         }
+        if !inode.has_flag(flags::EXTENTS) {
+            return self.ind_free_range(inode, from, to);
+        }
         let removed = self.ext_remove_range(ino, inode, from as u32, to)?;
         let per = self.bs as i64 / 512;
         for (start, n) in removed {
@@ -391,13 +422,7 @@ impl Fs {
         if inode.has_flag(flags::EXTENTS) {
             self.free_range(ino, inode, 0, 1 << 32)?;
         } else {
-            let extents = self.all_extents(ino, inode)?;
-            for e in extents {
-                self.free_blocks(e.start, e.len as u64)?;
-            }
-            for b in self.ind_meta_blocks(inode)? {
-                self.free_blocks(b, 1)?;
-            }
+            self.ind_free_range(inode, 0, u64::MAX)?;
             inode.block_area_mut().fill(0);
         }
         Ok(())
@@ -422,6 +447,10 @@ impl Fs {
                 self.write_data(ino, &mut inode, 0, &old)?;
             }
             inode.set_size(sz);
+        }
+        if !inode.has_flag(flags::EXTENTS) {
+            // block maps cannot express unwritten blocks (like Linux)
+            return Err(Error::unsupported("fallocate on a block-mapped file"));
         }
         let bs = self.bs as u64;
         let mut lblk = offset / bs;

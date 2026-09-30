@@ -392,4 +392,14 @@ proptest! {
     fn random_ops_no_journal_no_csum(ops in prop::collection::vec(op_strategy(), 1..60)) {
         run_case(&["-t", "ext4", "-O", "^has_journal,^metadata_csum,^metadata_csum_seed"], &ops);
     }
+
+    #[test]
+    fn random_ops_ext3(ops in prop::collection::vec(op_strategy(), 1..60)) {
+        run_case(&["-t", "ext3", "-b", "1024"], &ops);
+    }
+
+    #[test]
+    fn random_ops_ext2(ops in prop::collection::vec(op_strategy(), 1..60)) {
+        run_case(&["-t", "ext2"], &ops);
+    }
 }

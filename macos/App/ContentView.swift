@@ -29,7 +29,7 @@ struct ContentView: View {
                     number: 2,
                     title: L("Connect an ext4 disk"),
                     detail: L(
-                        "Disks formatted with ext4 (and ext2/ext3, read-only) are mounted automatically once the extension is enabled."
+                        "Disks formatted with ext4, ext3 or ext2 are mounted automatically once the extension is enabled."
                     )
                 ) {
                     EmptyView()

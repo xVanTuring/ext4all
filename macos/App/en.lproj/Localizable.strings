@@ -2,7 +2,7 @@
 "Open System Settings › General › Login Items & Extensions › File System Extensions and turn on Ext4Kit." = "Open System Settings › General › Login Items & Extensions › File System Extensions and turn on Ext4Kit.";
 "Open System Settings" = "Open System Settings";
 "Connect an ext4 disk" = "Connect an ext4 disk";
-"Disks formatted with ext4 (and ext2/ext3, read-only) are mounted automatically once the extension is enabled." = "Disks formatted with ext4 (and ext2/ext3, read-only) are mounted automatically once the extension is enabled.";
+"Disks formatted with ext4, ext3 or ext2 are mounted automatically once the extension is enabled." = "Disks formatted with ext4, ext3 or ext2 are mounted automatically once the extension is enabled.";
 "Mount manually (optional)" = "Mount manually (optional)";
 "To mount a partition or a disk image yourself, run in Terminal:" = "To mount a partition or a disk image yourself, run in Terminal:";
 "Read and write Linux ext4 disks on your Mac" = "Read and write Linux ext4 disks on your Mac";

@@ -322,3 +322,162 @@ fn memory_device_flush_ordering() {
     fs.unmount().unwrap();
     let _ = dev.size();
 }
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self, m: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % m
+    }
+}
+
+/// Random operations with frequent commits, interrupted by a power loss at
+/// a random write. Recovery must never need repairs.
+fn random_power_loss(opts: &[&str], seeds: std::ops::Range<u64>) {
+    use ext4_core::Error;
+    let base = Image::new(32, opts);
+    let total = seeds.end - seeds.start;
+    let mut crashed_mid_op = 0;
+    for seed in seeds {
+        let img = base.copy();
+        let dev = load(&img);
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let mut fs = Fs::mount(
+            dev.clone(),
+            MountOptions {
+                commit_threshold: 8 + rng.next(64) as usize,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let root = fs.root();
+        let dirs = [root, fs.mkdir(root, b"d", 0o755, 0, 0).unwrap().ino];
+        let crash_at = 1 + rng.next(60) as usize;
+        let mut armed = false;
+        for step in 0..400 {
+            if step == 40 && !armed {
+                dev.fail_writes_after(Some(crash_at));
+                armed = true;
+            }
+            let d = dirs[rng.next(2) as usize];
+            let name = format!("n{}", rng.next(12));
+            let res: ext4_core::Result<()> = match rng.next(8) {
+                0 | 1 => fs
+                    .create(d, name.as_bytes(), FileType::Regular, 0o644, 0, 0, 0)
+                    .map(|_| ()),
+                2 | 3 => match fs.lookup(d, name.as_bytes()) {
+                    Ok(ino) if fs.stat(ino).map(|a| !a.is_dir()).unwrap_or(false) => {
+                        let off = rng.next(200_000);
+                        let len = 1 + rng.next(50_000) as usize;
+                        fs.write(ino, off, &pattern(len, seed ^ step)).map(|_| ())
+                    }
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                },
+                4 => match fs.lookup(d, name.as_bytes()) {
+                    Ok(ino) if fs.stat(ino).map(|a| !a.is_dir()).unwrap_or(false) => {
+                        fs.truncate(ino, rng.next(100_000)).map(|_| ())
+                    }
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                },
+                5 => fs.unlink(d, name.as_bytes()),
+                6 => {
+                    let d2 = dirs[rng.next(2) as usize];
+                    let n2 = format!("n{}", rng.next(12));
+                    fs.rename(d, name.as_bytes(), d2, n2.as_bytes(), RenameFlags::default())
+                }
+                _ => fs.mkdir(d, name.as_bytes(), 0o755, 0, 0).map(|_| ()),
+            };
+            if let Err(Error::Device(_)) = res {
+                // power is gone
+                crashed_mid_op += 1;
+                break;
+            }
+        }
+        // make sure the failure point is reached even if ops were cheap
+        let _ = fs.commit();
+        std::mem::forget(fs);
+        dev.fail_writes_after(None);
+        save(&img, &dev);
+
+        let c = img.copy();
+        let (code, out) = c.fsck_fix();
+        assert!(code <= 1, "seed {seed}: e2fsck -fy exit {code}\n{out}");
+        assert!(!out.contains("Fix? yes"), "seed {seed}: e2fsck had to repair\n{out}");
+        c.assert_clean();
+
+        let fs = img.mount();
+        fs.unmount().unwrap();
+        let (code, out) = img.fsck();
+        assert!(
+            code == 0 && !out.contains("Fix? no"),
+            "seed {seed}: after our recovery\n{out}"
+        );
+    }
+    assert!(
+        crashed_mid_op * 2 >= total,
+        "only {crashed_mid_op}/{total} runs lost power inside an operation"
+    );
+}
+
+#[test]
+fn random_ops_with_power_loss_4k() {
+    random_power_loss(&["-t", "ext4", "-b", "4096"], 1..16);
+}
+
+#[test]
+fn random_ops_with_power_loss_1k() {
+    random_power_loss(&["-t", "ext4", "-b", "1024"], 100..116);
+}
+
+#[test]
+fn random_ops_with_power_loss_no_csum() {
+    random_power_loss(&["-t", "ext4", "-O", "^metadata_csum,^metadata_csum_seed"], 200..210);
+}
+
+/// Long soak (run with `cargo test --release -- --ignored`).
+#[test]
+#[ignore]
+fn random_ops_with_power_loss_soak() {
+    random_power_loss(&["-t", "ext4", "-b", "4096"], 1000..1400);
+    random_power_loss(&["-t", "ext4", "-b", "1024"], 2000..2400);
+}
+
+/// Without a journal a crash may leave damage (as on Linux). The volume
+/// must be flagged as not clean so fsck runs, and fsck must be able to
+/// repair it.
+#[test]
+fn power_loss_without_journal_is_detected_and_repairable() {
+    let base = Image::new(32, &["-t", "ext4", "-O", "^has_journal"]);
+    for seed in 0..6u64 {
+        let img = base.copy();
+        let dev = load(&img);
+        let mut fs = Fs::mount(dev.clone(), MountOptions::default()).unwrap();
+        let root = fs.root();
+        for i in 0..30u64 {
+            let a = fs
+                .create(root, format!("f{i}").as_bytes(), FileType::Regular, 0o644, 0, 0, 0)
+                .unwrap();
+            fs.write(a.ino, 0, &pattern(3000, i)).unwrap();
+        }
+        dev.fail_writes_after(Some(3 + seed as usize * 5));
+        let _ = fs.commit();
+        std::mem::forget(fs);
+        dev.fail_writes_after(None);
+        save(&img, &dev);
+        // state is "not clean" so e2fsck -p / boot-time fsck will check it
+        assert!(
+            img.dumpe2fs().contains("Filesystem state:         not clean"),
+            "seed {seed}"
+        );
+        let (code, out) = img.fsck_fix();
+        assert!(code <= 1, "seed {seed}: e2fsck could not repair\n{out}");
+        img.assert_clean();
+        let fs = img.mount();
+        fs.unmount().unwrap();
+        img.assert_clean();
+    }
+}

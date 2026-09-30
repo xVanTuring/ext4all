@@ -563,6 +563,180 @@ impl Fs {
         self.all_extents(ino, &inode)
     }
 
+    /// Map `[offset, offset+len)` for direct I/O by the kernel.
+    ///
+    /// Reads get data extents and zero-fill extents (holes, unwritten
+    /// blocks, beyond EOF). Writes allocate missing blocks as *unwritten*
+    /// extents and return every block as a data extent; the caller must
+    /// report completion with [`Fs::complete_direct_write`], which converts
+    /// them and grows the file. Until then (and after a crash) the new
+    /// blocks read as zeros, so no stale data is ever exposed.
+    pub fn map_for_io(&mut self, ino: Ino, offset: u64, len: u64, write: bool) -> Result<Vec<super::IoExtent>> {
+        if write {
+            self.op(|fs| fs.map_for_io_impl(ino, offset, len, true))
+        } else {
+            self.map_for_io_impl(ino, offset, len, false)
+        }
+    }
+
+    fn map_for_io_impl(&mut self, ino: Ino, offset: u64, len: u64, write: bool) -> Result<Vec<super::IoExtent>> {
+        use super::IoExtent;
+        if write {
+            self.require_rw()?;
+        }
+        let mut inode = self.read_live_inode(ino)?;
+        if !inode.is_reg() {
+            return Err(Error::invalid("direct I/O on a non-regular file"));
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset.checked_add(len).ok_or(Error::TooBig)?;
+        if write {
+            if inode.has_flag(flags::IMMUTABLE) || inode.has_flag(flags::APPEND) && offset < inode.size() {
+                return Err(Error::NotPermitted);
+            }
+            if end > self.max_file_size(&inode) {
+                return Err(Error::TooBig);
+            }
+            if let Some(old) = self.prepare_for_write(ino, &mut inode)? {
+                let sz = inode.size();
+                inode.set_size(0);
+                if !old.is_empty() {
+                    self.write_data(ino, &mut inode, 0, &old)?;
+                }
+                inode.set_size(sz);
+            }
+            if !inode.has_flag(flags::EXTENTS) {
+                return Err(Error::unsupported("direct I/O on a block-mapped file"));
+            }
+        } else if inode.has_flag(flags::INLINE_DATA) {
+            return Err(Error::unsupported("direct I/O on inline data"));
+        }
+        let bs = self.bs as u64;
+        let size = inode.size();
+        let mut out: Vec<IoExtent> = Vec::new();
+        let mut push = |e: IoExtent| {
+            if let Some(last) = out.last_mut()
+                && last.zero_fill == e.zero_fill
+                && last.logical + last.length == e.logical
+                && (e.zero_fill || last.physical + last.length == e.physical)
+            {
+                last.length += e.length;
+            } else {
+                out.push(e);
+            }
+        };
+        let first = offset / bs;
+        let last_blk = end.div_ceil(bs);
+        let mut lblk = first;
+        let mut allocated = false;
+        while lblk < last_blk {
+            let pos = lblk * bs;
+            if !write && pos >= size {
+                push(IoExtent {
+                    logical: pos,
+                    physical: 0,
+                    length: (last_blk - lblk) * bs,
+                    zero_fill: true,
+                });
+                break;
+            }
+            match self.map_block(ino, &inode, lblk)? {
+                Mapping::Mapped {
+                    pblk,
+                    len: run,
+                    unwritten,
+                } => {
+                    let n = run.min(last_blk - lblk);
+                    push(IoExtent {
+                        logical: pos,
+                        physical: pblk * bs,
+                        length: n * bs,
+                        zero_fill: unwritten && !write,
+                    });
+                    lblk += n;
+                }
+                Mapping::Hole { len: hole } => {
+                    let n = hole.min(last_blk - lblk);
+                    if !write {
+                        push(IoExtent {
+                            logical: pos,
+                            physical: 0,
+                            length: n * bs,
+                            zero_fill: true,
+                        });
+                        lblk += n;
+                        continue;
+                    }
+                    let want = n.min(32767) as u32;
+                    let goal = self.ext_goal(ino, &inode, lblk as u32)?;
+                    let (start, got) = self.alloc_blocks(goal, want)?;
+                    // new blocks are exposed to the kernel for writing only
+                    // after the unwritten mapping is in place
+                    self.ext_insert(
+                        ino,
+                        &mut inode,
+                        crate::ondisk::extent::Extent {
+                            block: lblk as u32,
+                            len: got,
+                            start,
+                            unwritten: true,
+                        },
+                    )?;
+                    let per = bs as i64 / 512;
+                    let cur = inode.sectors(self.bs, self.huge_file()) as i64;
+                    inode.set_sectors((cur + got as i64 * per) as u64);
+                    allocated = true;
+                    push(IoExtent {
+                        logical: pos,
+                        physical: start * bs,
+                        length: got as u64 * bs,
+                        zero_fill: false,
+                    });
+                    lblk += got as u64;
+                }
+            }
+        }
+        if allocated {
+            self.write_inode(ino, &inode)?;
+            self.maybe_commit()?;
+        }
+        Ok(out)
+    }
+
+    /// The kernel finished writing `[offset, offset+len)` directly to the
+    /// blocks returned by [`Fs::map_for_io`]: mark them written and grow
+    /// the file.
+    pub fn complete_direct_write(&mut self, ino: Ino, offset: u64, len: u64) -> Result<()> {
+        self.op(|fs| {
+            fs.require_rw()?;
+            let mut inode = fs.read_live_inode(ino)?;
+            if !inode.is_reg() || !inode.has_flag(flags::EXTENTS) {
+                return Err(Error::invalid("direct write completion on an unsupported file"));
+            }
+            if len == 0 {
+                return Ok(());
+            }
+            let end = offset.checked_add(len).ok_or(Error::TooBig)?;
+            let bs = fs.bs as u64;
+            let first = offset / bs;
+            let last = end.div_ceil(bs);
+            // only whole blocks the kernel wrote can become "written"; a
+            // partial block at either edge was read-modify-written by the
+            // kernel through its page cache, so it is complete as well
+            fs.ext_mark_written(ino, &mut inode, first as u32, (last - first) as u32)?;
+            if end > inode.size() {
+                inode.set_size(end);
+            }
+            let now = Timestamp::now();
+            inode.set_mtime(now);
+            inode.set_ctime(now);
+            fs.write_inode(ino, &inode)?;
+            fs.maybe_commit()
+        })
+    }
+
     /// `lseek(SEEK_DATA)` (`data = true`) or `lseek(SEEK_HOLE)`.
     /// Unwritten (preallocated) blocks count as holes. The end of file is
     /// an implicit hole.

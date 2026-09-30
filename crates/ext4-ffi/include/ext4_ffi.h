@@ -220,6 +220,16 @@ typedef struct Ext4SetAttr {
   uint32_t bsd_flags;
 } Ext4SetAttr;
 
+/**
+ * Extent callback for [`ext4_map_for_io`]: offsets and length in bytes;
+ * `zero_fill` extents have no device location. Return false to stop.
+ */
+typedef bool (*Ext4ExtentCallback)(void *ctx,
+                                   uint64_t logical,
+                                   uint64_t physical,
+                                   uint64_t length,
+                                   bool zero_fill);
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -487,6 +497,33 @@ int32_t ext4_seek(const struct Ext4Handle *h,
                   uint64_t offset,
                   bool data,
                   uint64_t *out);
+
+/**
+ * Map a file range for kernel offloaded I/O. For writes, missing blocks
+ * are allocated as unwritten; report completion with
+ * [`ext4_complete_write`].
+ *
+ * # Safety
+ * `h` must be a live handle; `cb` must not call into this library.
+ */
+int32_t ext4_map_for_io(const struct Ext4Handle *h,
+                        uint32_t ino,
+                        uint64_t offset,
+                        uint64_t len,
+                        bool write,
+                        Ext4ExtentCallback cb,
+                        void *ctx);
+
+/**
+ * The kernel finished writing `[offset, offset+len)` of `ino` directly.
+ *
+ * # Safety
+ * `h` must be a live handle.
+ */
+int32_t ext4_complete_write(const struct Ext4Handle *h,
+                            uint32_t ino,
+                            uint64_t offset,
+                            uint64_t len);
 
 /**
  * Read xattr `name` (macOS naming). With `buf == NULL` only the size is

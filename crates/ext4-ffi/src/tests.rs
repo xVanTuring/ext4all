@@ -554,3 +554,66 @@ fn concurrent_operations_are_serialized() {
     unsafe { ext4_close(h as *mut Ext4Handle) };
     fsck_clean(&p);
 }
+
+#[test]
+fn direct_io_mapping_through_c_abi() {
+    let d = tempfile::tempdir().unwrap();
+    let p = mkfs(d.path(), &["-t", "ext4", "-b", "4096"]);
+    let o = ops(&p, false, 4096);
+    let h = mount(&o, None);
+    let f = create(h, 2, "koio", EXT4_FT_REG);
+    let mut exts: Vec<(u64, u64, u64, bool)> = Vec::new();
+    unsafe extern "C" fn collect(ctx: *mut c_void, l: u64, p: u64, n: u64, z: bool) -> bool {
+        let v = unsafe { &mut *(ctx as *mut Vec<(u64, u64, u64, bool)>) };
+        v.push((l, p, n, z));
+        true
+    }
+    let rc = unsafe {
+        ext4_map_for_io(
+            h,
+            f.ino,
+            0,
+            65536,
+            true,
+            Some(collect),
+            &mut exts as *mut _ as *mut c_void,
+        )
+    };
+    assert_eq!(rc, 0);
+    let total: u64 = exts.iter().map(|e| e.2).sum();
+    assert_eq!(total, 65536);
+    assert!(exts.iter().all(|e| !e.3));
+    // write the data "as the kernel" through a second handle on the file
+    {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        for e in &exts {
+            file.write_all_at(&vec![0xABu8; e.2 as usize], e.1).unwrap();
+        }
+    }
+    // not completed yet: reads return zeros
+    let mut buf = vec![1u8; 4096];
+    let mut n = 0;
+    assert_eq!(unsafe { ext4_read(h, f.ino, 0, buf.as_mut_ptr(), 4096, &mut n) }, 0);
+    assert_eq!(n, 0, "size is still 0");
+    assert_eq!(unsafe { ext4_complete_write(h, f.ino, 0, 65536) }, 0);
+    assert_eq!(unsafe { ext4_read(h, f.ino, 0, buf.as_mut_ptr(), 4096, &mut n) }, 0);
+    assert_eq!(n, 4096);
+    assert!(buf.iter().all(|&b| b == 0xAB));
+    let mut rd: Vec<(u64, u64, u64, bool)> = Vec::new();
+    unsafe {
+        ext4_map_for_io(
+            h,
+            f.ino,
+            0,
+            131072,
+            false,
+            Some(collect),
+            &mut rd as *mut _ as *mut c_void,
+        )
+    };
+    assert_eq!(rd.iter().filter(|e| !e.3).map(|e| e.2).sum::<u64>(), 65536);
+    assert_eq!(rd.iter().filter(|e| e.3).map(|e| e.2).sum::<u64>(), 65536);
+    unsafe { ext4_close(h) };
+    fsck_clean(&p);
+}

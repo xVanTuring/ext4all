@@ -37,6 +37,18 @@ impl Attr {
     }
 }
 
+/// A byte range of a file mapped for direct (kernel offloaded) I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoExtent {
+    /// Offset in the file.
+    pub logical: u64,
+    /// Offset on the device (meaningless for `zero_fill`).
+    pub physical: u64,
+    pub length: u64,
+    /// Reads must return zeros (hole or not yet written).
+    pub zero_fill: bool,
+}
+
 /// One directory entry as returned by `read_dir`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntryInfo {

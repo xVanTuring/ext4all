@@ -733,6 +733,51 @@ pub unsafe extern "C" fn ext4_seek(h: *const Ext4Handle, ino: u32, offset: u64, 
     })
 }
 
+/// Extent callback for [`ext4_map_for_io`]: offsets and length in bytes;
+/// `zero_fill` extents have no device location. Return false to stop.
+pub type Ext4ExtentCallback =
+    Option<unsafe extern "C" fn(ctx: *mut c_void, logical: u64, physical: u64, length: u64, zero_fill: bool) -> bool>;
+
+/// Map a file range for kernel offloaded I/O. For writes, missing blocks
+/// are allocated as unwritten; report completion with
+/// [`ext4_complete_write`].
+///
+/// # Safety
+/// `h` must be a live handle; `cb` must not call into this library.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_map_for_io(
+    h: *const Ext4Handle,
+    ino: u32,
+    offset: u64,
+    len: u64,
+    write: bool,
+    cb: Ext4ExtentCallback,
+    ctx: *mut c_void,
+) -> i32 {
+    guard(|| {
+        let cb = cb.ok_or_else(|| Error::invalid("null callback"))?;
+        // SAFETY: caller contract
+        let exts = unsafe { handle(h) }?.with(|fs| fs.map_for_io(ino, offset, len, write))?;
+        for e in exts {
+            // SAFETY: callback contract
+            if !unsafe { cb(ctx, e.logical, e.physical, e.length, e.zero_fill) } {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The kernel finished writing `[offset, offset+len)` of `ino` directly.
+///
+/// # Safety
+/// `h` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_complete_write(h: *const Ext4Handle, ino: u32, offset: u64, len: u64) -> i32 {
+    // SAFETY: caller contract
+    guard(|| unsafe { handle(h) }?.with(|fs| fs.complete_direct_write(ino, offset, len)))
+}
+
 // --- extended attributes (macOS names) --------------------------------------------
 
 /// Read xattr `name` (macOS naming). With `buf == NULL` only the size is

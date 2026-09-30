@@ -19,5 +19,5 @@ pub use device::{AlignedDevice, BlockDevice, FileDevice, MemDevice};
 pub use error::{Error, Result};
 pub mod fs;
 
-pub use fs::{Attr, DirEntryInfo, Fs, Ino, MountOptions, RenameFlags, SetAttr, StatFs, XattrSetMode};
+pub use fs::{Attr, DirEntryInfo, Fs, Ino, IoExtent, MountOptions, RenameFlags, SetAttr, StatFs, XattrSetMode};
 pub use ondisk::inode::{FileType, Timestamp};

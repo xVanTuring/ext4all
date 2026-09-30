@@ -70,6 +70,10 @@ pub struct Fs {
     pub(crate) aborted: bool,
     /// Metadata blocks that file mappings may never touch.
     pub(crate) zone: zone::SystemZone,
+    /// Byte ranges mapped for kernel (direct) writes whose completion has
+    /// not been reported yet, per inode. Their blocks were zeroed or are
+    /// being written whole, so later mappings must not zero them again.
+    pub(crate) dio_inflight: std::collections::BTreeMap<Ino, Vec<(u64, u64)>>,
     pub(crate) cache: BlockCache,
     pub(crate) bs: u32,
     pub(crate) csum_seed: u32,
@@ -138,7 +142,7 @@ impl Fs {
         if fs.sb.has_compat(compat::HAS_JOURNAL) {
             fs.load_journal()?;
         }
-        fs.build_system_zone();
+        fs.build_system_zone()?;
         if !fs.read_only {
             // needs_recovery must be durable before the first transaction
             fs.mark_mounted()?;
@@ -176,6 +180,7 @@ impl Fs {
             op_depth: 0,
             aborted: false,
             zone: zone::SystemZone::default(),
+            dio_inflight: Default::default(),
             cache: BlockCache::new(bs as usize, opts.cache_blocks),
             bs,
             read_only,
@@ -201,8 +206,10 @@ impl Fs {
     fn recount_free(&mut self) -> Result<()> {
         let mut blocks = 0u64;
         let mut inodes = 0u64;
+        // descriptors count clusters, the superblock counts blocks
+        let ratio = self.sb.cluster_ratio() as u64;
         for (g, gd) in self.groups.iter().enumerate() {
-            let fb = gd.free_blocks_count() as u64;
+            let fb = gd.free_blocks_count() as u64 * ratio;
             let fi = gd.free_inodes_count() as u64;
             if fb > self.blocks_in_group(g as u32) as u64 || fi > self.sb.inodes_per_group() as u64 {
                 return Err(Error::corrupt(format!("group {g}: free counts exceed group size")));

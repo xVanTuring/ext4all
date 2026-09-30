@@ -167,6 +167,13 @@ fn direct_io_rejections() {
 /// Write exactly `data` at `offset` like the kernel would for a sub-block
 /// write: map the range, write only the requested bytes to the device.
 fn kernel_write_exact(fs: &mut Fs, dev: &dyn BlockDevice, ino: u32, offset: u64, data: &[u8]) {
+    kernel_start_exact(fs, dev, ino, offset, data);
+    fs.complete_direct_write(ino, offset, data.len() as u64).unwrap();
+}
+
+/// Map and write exactly `data` at `offset` without reporting completion
+/// (a direct write still in flight).
+fn kernel_start_exact(fs: &mut Fs, dev: &dyn BlockDevice, ino: u32, offset: u64, data: &[u8]) {
     let exts = fs.map_for_io(ino, offset, data.len() as u64, true).unwrap();
     let end = offset + data.len() as u64;
     for e in &exts {
@@ -177,7 +184,6 @@ fn kernel_write_exact(fs: &mut Fs, dev: &dyn BlockDevice, ino: u32, offset: u64,
             dev.write_at(e.physical + (s - e.logical), src).unwrap();
         }
     }
-    fs.complete_direct_write(ino, offset, data.len() as u64).unwrap();
 }
 
 /// Fill most free blocks with `byte` and free them again, so later
@@ -274,5 +280,100 @@ fn completion_without_mapping_is_harmless() {
     fs.read(f, 0, &mut b).unwrap();
     assert_eq!(&b[..10000], &pattern(10000, 4)[..]);
     assert!(b[10000..].iter().all(|&x| x == 0));
+    finish(&img, &dev, fs);
+}
+
+/// Two sub-block direct writes into the same new or unwritten block, the
+/// second mapped before the first completes: the second mapping must not
+/// zero the block again and erase the first write's data.
+#[test]
+fn overlapping_in_flight_writes_keep_each_others_data() {
+    let (img, dev, mut fs) = setup(&["-t", "ext4", "-b", "4096"]);
+    dirty_free_space(&mut fs, 0xA5);
+    // new block (hole) and preallocated (unwritten) block
+    for prealloc in [false, true] {
+        let name = if prealloc { &b"pre"[..] } else { &b"new"[..] };
+        let f = fs.create(2, name, FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+        if prealloc {
+            fs.fallocate(f, 0, 4096, true).unwrap();
+        }
+        kernel_start_exact(&mut fs, &*dev, f, 0, &[1u8; 100]);
+        kernel_start_exact(&mut fs, &*dev, f, 200, &[2u8; 100]);
+        fs.complete_direct_write(f, 0, 100).unwrap();
+        fs.complete_direct_write(f, 200, 100).unwrap();
+        let mut b = vec![0xFFu8; 300];
+        assert_eq!(fs.read(f, 0, &mut b).unwrap(), 300);
+        assert!(
+            b[..100].iter().all(|&x| x == 1),
+            "prealloc {prealloc}: first write lost"
+        );
+        assert!(b[100..200].iter().all(|&x| x == 0), "prealloc {prealloc}");
+        assert!(b[200..].iter().all(|&x| x == 2), "prealloc {prealloc}");
+        // nothing stays tracked after completion: a later sub-block write
+        // into fresh blocks is zeroed again
+        kernel_write_exact(&mut fs, &*dev, f, 3 * 4096 + 10, &[3u8; 5]);
+        let mut t = vec![0xFFu8; 4096];
+        fs.read(f, 3 * 4096, &mut t).unwrap();
+        assert!(t[..10].iter().all(|&x| x == 0) && t[10..15].iter().all(|&x| x == 3));
+    }
+    finish(&img, &dev, fs);
+}
+
+/// Extending a file past a partial last block: bytes between the old end
+/// of file and the write read as zeros even if a failed earlier write left
+/// data on the device there, unless a write still in flight covers them.
+#[test]
+fn extending_direct_writes_zero_the_old_tail() {
+    let (img, dev, mut fs) = setup(&["-t", "ext4", "-b", "4096"]);
+    let f = fs.create(2, b"f", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+    fs.write(f, 0, &[7u8; 100]).unwrap();
+    let pblk = fs.file_extents(f).unwrap()[0].start;
+    // leftovers of a failed direct write past EOF
+    dev.write_at(pblk * 4096 + 100, &[0xEEu8; 3996]).unwrap();
+    // write in the same block, beyond EOF
+    kernel_write_exact(&mut fs, &*dev, f, 1000, &[8u8; 10]);
+    let mut b = vec![0xFFu8; 1010];
+    fs.read(f, 0, &mut b).unwrap();
+    assert!(b[..100].iter().all(|&x| x == 7));
+    assert!(b[100..1000].iter().all(|&x| x == 0), "gap in the same block");
+    assert!(b[1000..].iter().all(|&x| x == 8));
+    // leftovers again, then a write in a later block
+    dev.write_at(pblk * 4096 + 1010, &[0xEEu8; 3086]).unwrap();
+    kernel_write_exact(&mut fs, &*dev, f, 3 * 4096, &[9u8; 4096]);
+    let mut t = vec![0xFFu8; 4096 - 1010];
+    fs.read(f, 1010, &mut t).unwrap();
+    assert!(t.iter().all(|&x| x == 0), "old tail of the last block");
+
+    // an in-flight write filling the tail is not wiped by a later
+    // extending write mapped before it completes
+    let g = fs.create(2, b"g", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+    fs.write(g, 0, &[1u8; 100]).unwrap();
+    kernel_start_exact(&mut fs, &*dev, g, 100, &[2u8; 100]);
+    kernel_start_exact(&mut fs, &*dev, g, 8192, &[3u8; 100]);
+    fs.complete_direct_write(g, 8192, 100).unwrap();
+    fs.complete_direct_write(g, 100, 100).unwrap();
+    let mut c = vec![0xFFu8; 200];
+    fs.read(g, 0, &mut c).unwrap();
+    assert!(c[..100].iter().all(|&x| x == 1));
+    assert!(c[100..].iter().all(|&x| x == 2), "in-flight data erased");
+    finish(&img, &dev, fs);
+}
+
+/// A failed direct write makes nothing visible and is no longer tracked.
+#[test]
+fn aborted_direct_write_stays_invisible() {
+    let (img, dev, mut fs) = setup(&["-t", "ext4", "-b", "4096"]);
+    let f = fs.create(2, b"f", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+    fs.write(f, 0, &[1u8; 4096]).unwrap();
+    kernel_start_exact(&mut fs, &*dev, f, 4096, &[0xEEu8; 8192]);
+    fs.abort_direct_write(f, 4096, 8192);
+    assert_eq!(fs.stat(f).unwrap().size, 4096);
+    let r = kernel_read(&mut fs, &*dev, f, 0, 12288);
+    assert!(r[4096..].iter().all(|&x| x == 0));
+    // the size can still grow over the unwritten blocks: zeros
+    fs.truncate(f, 12288).unwrap();
+    let mut b = vec![0xFFu8; 8192];
+    fs.read(f, 4096, &mut b).unwrap();
+    assert!(b.iter().all(|&x| x == 0));
     finish(&img, &dev, fs);
 }

@@ -246,6 +246,10 @@ final class Ext4BridgeTests: XCTestCase {
         XCTAssertEqual(calls, 1)
         // directories cannot be mapped
         XCTAssertThrowsError(try m.mapForIO(2, offset: 0, length: 4096, write: false) { _ in true })
+        // a failed kernel write makes nothing visible
+        try m.mapForIO(f.ino, offset: 16 * 4096, length: 4096, write: true) { _ in true }
+        try m.abortWrite(f.ino, offset: 16 * 4096, length: 4096)
+        XCTAssertEqual(try m.stat(f.ino).size, UInt64(payload.count))
         try m.unmount()
         try TestImage.assertClean(path)
     }

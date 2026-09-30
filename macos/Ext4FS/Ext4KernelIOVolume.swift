@@ -87,9 +87,16 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
     ) {
         run("completeIO", reply) {
             let i = try ino(file)
-            if flags.contains(.write) && Self.succeeded(status) && offset >= 0 && length > 0 {
-                try mount.completeWrite(i, offset: UInt64(offset), length: UInt64(length))
-            } else if !Self.succeeded(status) {
+            let ok = Self.succeeded(status)
+            if flags.contains(.write) && offset >= 0 && length > 0 {
+                if ok {
+                    try mount.completeWrite(i, offset: UInt64(offset), length: UInt64(length))
+                } else {
+                    // the blocks stay unwritten (read as zeros)
+                    try mount.abortWrite(i, offset: UInt64(offset), length: UInt64(length))
+                }
+            }
+            if !ok {
                 Log.fs.error(
                     "kernel I/O on \(i) at \(offset)+\(length) failed: \(status?.localizedDescription ?? "", privacy: .public)"
                 )
@@ -105,7 +112,7 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
         named name: FSFileName, in directory: FSItem, packer: FSExtentPacker, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSLookupItemKOIOResult?, (any Error)?) -> Void
     ) {
-        run("lookup", reply) {
+        run("lookup", replyUnderLock: true, reply) {
             let (item, attributes) = try lookupParts(named: name, in: directory)
             return try Self.unwrap(FSLookupItemKOIOResult(foundItem: item, itemName: name, itemAttributes: attributes))
         }
@@ -116,7 +123,7 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
         packer: FSExtentPacker, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSCreateFileKOIOResult?, (any Error)?) -> Void
     ) {
-        run("create", reply) {
+        run("create", replyUnderLock: true, reply) {
             let (item, attributes) = try createParts(
                 named: name, type: .file, in: directory, newAttributes, context)
             return try Self.unwrap(

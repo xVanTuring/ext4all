@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::hash::dirhash;
 use crate::ondisk::dirent::{self as de, DX_NODE_ENTRIES_OFF, DX_ROOT_INFO_OFF, DxEntry, DxRootInfo};
 use crate::ondisk::inode::{FileType, Inode, flags};
-use crate::ondisk::superblock::incompat;
+use crate::ondisk::superblock::{hash_version as hv, incompat};
 
 /// Marks directory cookies that are hash positions (htree directories)
 /// rather than byte offsets (linear directories).
@@ -126,8 +126,11 @@ impl Fs {
         }
     }
 
-    /// Move to the next leaf in hash order. Returns false at the end.
-    fn dx_advance(&mut self, ino: Ino, inode: &Inode, frames: &mut [Frame]) -> Result<bool> {
+    /// Move to the next leaf in hash order. Returns the hash of the index
+    /// entry stepped to, at the level where the step happened (its low bit
+    /// flags a collision chain continuing from the previous leaf; entry 0
+    /// of the lower levels carries no hash), or `None` at the end.
+    fn dx_advance(&mut self, ino: Ino, inode: &Inode, frames: &mut [Frame]) -> Result<Option<u32>> {
         let mut p = frames.len() - 1;
         loop {
             if frames[p].at + 1 < frames[p].count() {
@@ -135,10 +138,11 @@ impl Fs {
                 break;
             }
             if p == 0 {
-                return Ok(false);
+                return Ok(None);
             }
             p -= 1;
         }
+        let hash = frames[p].entry(frames[p].at).hash;
         while p + 1 < frames.len() {
             let child = frames[p].entry(frames[p].at).block as u64;
             let mut f = self.dx_read_frame(ino, inode, child, false)?;
@@ -146,14 +150,18 @@ impl Fs {
             frames[p + 1] = f;
             p += 1;
         }
-        Ok(true)
+        Ok(Some(hash))
     }
 
     /// Enumerate an htree directory in hash order with stable cookies:
     /// `HASH_COOKIE | pos`, where pos 0 = ".", 1 = "..", and `key + 2` for
-    /// entries (key = major hash >> 1 << 32 | minor hash). Entries never
+    /// entries (key = major hash >> 1 << 32 | minor hash; for the legacy
+    /// hash, which has no minor part, a CRC32C of the name). Entries never
     /// change their key, so splits and inserts cannot make an enumeration
-    /// skip or repeat unchanged entries.
+    /// skip or repeat unchanged entries. A whole collision chain (leaves
+    /// linked by the continuation bit) is sorted together, so resuming in
+    /// the middle of one is exact. Only two names with identical 63-bit
+    /// keys could be skipped when a resume falls between them.
     pub(crate) fn dx_read_dir(
         &mut self,
         ino: Ino,
@@ -186,9 +194,13 @@ impl Fs {
             }
         }
         let start_key = pos.saturating_sub(2);
+        // the legacy hash has no minor part: order names with the same
+        // major hash by a second, independent hash so their keys differ
+        let legacy = matches!(version, hv::LEGACY | hv::LEGACY_UNSIGNED);
         let key_of = |name: &[u8]| -> Result<u64> {
             let h = dirhash(name, version, &seed).ok_or_else(|| Error::unsupported("hash"))?;
-            Ok((((h.major >> 1) as u64) << 32) | h.minor as u64)
+            let minor = if legacy { crate::csum::crc32c(!0, name) } else { h.minor };
+            Ok((((h.major >> 1) as u64) << 32) | minor as u64)
         };
         let mut frames = self.dx_probe(ino, inode, ((start_key >> 32) as u32) << 1)?;
         let bs = self.bs as usize;
@@ -206,13 +218,13 @@ impl Fs {
                         batch.push((key_of(&name)?, name, d.inode, d.file_type));
                     }
                 }
-                more = self.dx_advance(ino, inode, &mut frames)?;
-                if !more {
-                    break;
-                }
-                let b = frames.last().unwrap();
-                if b.entry(b.at).hash & 1 == 0 {
-                    break;
+                match self.dx_advance(ino, inode, &mut frames)? {
+                    None => {
+                        more = false;
+                        break;
+                    }
+                    Some(hash) if hash & 1 == 0 => break,
+                    Some(_) => {} // the chain continues in the next leaf
                 }
             }
             batch.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));

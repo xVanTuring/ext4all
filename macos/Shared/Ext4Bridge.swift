@@ -387,6 +387,12 @@ public final class Ext4Mount: @unchecked Sendable {
         try ext4Check(ext4_complete_write(handle, ino, offset, length))
     }
 
+    /// The kernel's direct write of `[offset, offset+length)` failed:
+    /// nothing becomes visible.
+    public func abortWrite(_ ino: UInt32, offset: UInt64, length: UInt64) throws {
+        try ext4Check(ext4_abort_write(handle, ino, offset, length))
+    }
+
     /// Byte offset past the last allocated block (physical end of file).
     public func allocatedEnd(_ ino: UInt32) throws -> UInt64 {
         var out: UInt64 = 0

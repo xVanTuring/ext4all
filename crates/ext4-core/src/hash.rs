@@ -131,6 +131,13 @@ fn str2hashbuf(msg: &[u8], out: &mut [u32], signed: bool) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: when nonzero, major hashes take only this many distinct
+    /// values, forcing long hash collision chains (minor hashes are kept).
+    pub(crate) static COLLIDE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Hash `name` with the given (effective) hash version and seed.
 /// Returns `None` for unsupported versions (e.g. siphash for casefold).
 pub fn dirhash(name: &[u8], version: u8, seed: &[u32; 4]) -> Option<DxHash> {
@@ -165,6 +172,11 @@ pub fn dirhash(name: &[u8], version: u8, seed: &[u32; 4]) -> Option<DxHash> {
             (buf[0], buf[1])
         }
         _ => return None,
+    };
+    #[cfg(test)]
+    let major = match COLLIDE.with(|c| c.get()) {
+        0 => major,
+        n => (major % n).wrapping_mul(0x9E37_79B9),
     };
     let mut major = major & !1;
     if major == HTREE_EOF_32BIT << 1 {

@@ -409,6 +409,7 @@ impl Fs {
     }
 
     pub(crate) fn free_inode(&mut self, ino: Ino, is_dir: bool) -> Result<()> {
+        self.dio_inflight.remove(&ino);
         let ipg = self.sb.inodes_per_group();
         let g = (ino - 1) / ipg;
         let bit = (ino - 1) % ipg;

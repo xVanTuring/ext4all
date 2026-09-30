@@ -491,3 +491,87 @@ fn rollback_after_mid_operation_commit() {
     let (code, out) = fsck_clean(&dev);
     assert_eq!(code, 0, "{out}");
 }
+
+/// Resets the hash collision hook when a test ends (also on panic).
+struct CollideGuard;
+impl CollideGuard {
+    fn set(n: u32) -> CollideGuard {
+        crate::hash::COLLIDE.with(|c| c.set(n));
+        CollideGuard
+    }
+}
+impl Drop for CollideGuard {
+    fn drop(&mut self) {
+        crate::hash::COLLIDE.with(|c| c.set(0));
+    }
+}
+
+/// Enumerate `dir` in chunks of `chunk` entries, resuming from the cookie
+/// of the last entry each time (like the FFI and FSKit do).
+fn names_in_chunks(fs: &mut Fs, dir: Ino, chunk: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut cookie = 0u64;
+    loop {
+        let mut got = 0;
+        let mut done = true;
+        fs.read_dir(dir, cookie, |e| {
+            if got == chunk {
+                done = false;
+                return false;
+            }
+            got += 1;
+            cookie = e.next_cookie;
+            out.push(e.name);
+            true
+        })
+        .unwrap();
+        if done {
+            return out;
+        }
+    }
+}
+
+/// Long hash collision chains (continuation leaves, also where the
+/// continuation leaf is the first child of a second-level index node) and,
+/// with the legacy hash, entries whose (major, minor) keys are identical:
+/// resumed enumerations must return every entry exactly once.
+#[test]
+fn htree_readdir_resumes_inside_collision_chains() {
+    for (legacy, opts) in [
+        (false, &["-t", "ext4", "-b", "1024"][..]),
+        (false, &["-t", "ext4", "-b", "1024", "-O", "^metadata_csum"][..]),
+        (true, &["-t", "ext4", "-b", "1024"][..]),
+    ] {
+        let _guard = CollideGuard::set(40);
+        let mut fs = mount(mkfs(64, opts));
+        if legacy {
+            fs.sb
+                .set_def_hash_version(crate::ondisk::superblock::hash_version::LEGACY);
+        }
+        let d = fs.mkdir(2, b"d", 0o755, 0, 0).unwrap().ino;
+        let n = 12_000;
+        let mut want: Vec<Vec<u8>> = (0..n).map(|i| format!("entry-{i:06}-xxxxxxxx").into_bytes()).collect();
+        for name in &want {
+            fs.create(d, name, FileType::Regular, 0o644, 0, 0, 0).unwrap();
+        }
+        fs.check_htree(d).unwrap();
+        let inode = fs.read_live_inode(d).unwrap();
+        let root = fs.dir_block(d, &inode, 0).unwrap().1;
+        assert!(
+            crate::ondisk::dirent::DxRootInfo::parse(&root).indirect_levels >= 1,
+            "test needs a two-level tree"
+        );
+        want.push(b".".to_vec());
+        want.push(b"..".to_vec());
+        want.sort();
+        for chunk in [usize::MAX, 256, 97, 7, 1] {
+            let mut got = names_in_chunks(&mut fs, d, chunk);
+            got.sort();
+            let dups = got.windows(2).filter(|w| w[0] == w[1]).count();
+            got.dedup();
+            let missing = want.iter().filter(|w| got.binary_search(w).is_err()).count();
+            assert_eq!((missing, dups), (0, 0), "legacy {legacy} {opts:?} chunk {chunk}");
+            assert_eq!(got, want);
+        }
+    }
+}

@@ -536,3 +536,93 @@ fn pointers_into_metadata_are_refused() {
         assert_eq!(&before[2048..3072], &after[2048..3072], "{name}: GDT modified");
     }
 }
+
+/// bigalloc descriptors count free clusters; the recount at mount must
+/// convert them to blocks (statfs used to report 1/ratio of the space).
+#[test]
+fn bigalloc_free_counts_are_in_blocks() {
+    for (cluster, bs) in [("16384", "4096"), ("65536", "4096"), ("4096", "1024")] {
+        let img = Image::new(128, &["-t", "ext4", "-O", "bigalloc", "-b", bs, "-C", cluster]);
+        let dump = img.dumpe2fs();
+        let field = |name: &str| -> u64 {
+            dump.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let fs = img.mount_ro();
+        let s = fs.statfs();
+        assert_eq!(s.free_blocks, field("Free blocks:"), "cluster {cluster}");
+        assert_eq!(s.blocks, field("Block count:"));
+        assert!(
+            s.avail_blocks > 0 && s.avail_blocks <= s.free_blocks,
+            "cluster {cluster}: {s:?}"
+        );
+    }
+}
+
+/// Group 0's metadata locations from dumpe2fs: (block bitmap, inode
+/// bitmap, inode table).
+fn group0_metadata(img: &Image) -> (u64, u64, u64) {
+    let out = std::process::Command::new(tool("dumpe2fs"))
+        .arg(&img.path)
+        .output()
+        .unwrap();
+    let dump = String::from_utf8_lossy(&out.stdout).into_owned();
+    let g0 = dump.split("Group 0:").nth(1).unwrap().split("Group 1:").next().unwrap();
+    let at = |label: &str| -> u64 {
+        let rest = g0.split(label).nth(1).unwrap_or_else(|| panic!("{label} missing"));
+        rest.trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    (at("Block bitmap at"), at("Inode bitmap at"), at("Inode table at"))
+}
+
+/// Two structures sharing blocks (a group claiming another group's inode
+/// table or bitmap, a bitmap inside an inode table, a bitmap on the
+/// descriptor table) would let one overwrite the other: mounting must fail
+/// like Linux's system zone check, read-only as well.
+#[test]
+fn overlapping_metadata_is_rejected_at_mount() {
+    for csum in [true, false] {
+        let base: &[&str] = if csum {
+            &["-t", "ext4", "-b", "1024"]
+        } else {
+            &["-t", "ext4", "-b", "1024", "-O", "^metadata_csum,uninit_bg"]
+        };
+        let pristine = Image::new(64, base);
+        let (bb, ib, it) = group0_metadata(&pristine);
+        let cases = [
+            format!("set_bg 1 inode_table {it}"),
+            format!("set_bg 1 block_bitmap {bb}"),
+            format!("set_bg 1 inode_bitmap {ib}"),
+            format!("set_bg 1 block_bitmap {}", it + 3),
+            format!("set_bg 0 inode_bitmap {bb}"),
+            "set_bg 0 block_bitmap 2".to_string(), // the descriptor table
+        ];
+        for cmd in &cases {
+            let img = pristine.copy();
+            let group = cmd.split_whitespace().nth(1).unwrap();
+            img.debugfs_w(&[cmd, &format!("set_bg {group} checksum calc")]);
+            for ro in [false, true] {
+                let opts = MountOptions {
+                    read_only: ro,
+                    ..MountOptions::default()
+                };
+                match Fs::mount(img.device(ro), opts) {
+                    Err(Error::Corrupt(msg)) => assert!(msg.contains("overlaps"), "{cmd}: {msg}"),
+                    Err(e) => panic!("csum {csum} {cmd}: unexpected error {e:?}"),
+                    Ok(_) => panic!("csum {csum} {cmd}: mounted (read-only {ro})"),
+                }
+            }
+        }
+        // the untouched image still mounts
+        pristine.mount().unmount().unwrap();
+    }
+}

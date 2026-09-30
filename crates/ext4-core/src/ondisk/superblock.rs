@@ -269,6 +269,16 @@ impl Superblock {
         1024u32 << self.log_block_size()
     }
 
+    /// Blocks per allocation cluster (1 without bigalloc). Group
+    /// descriptor free block counts are in clusters.
+    pub fn cluster_ratio(&self) -> u32 {
+        if self.has_ro_compat(ro_compat::BIGALLOC) {
+            1 << self.log_cluster_size().saturating_sub(self.log_block_size()).min(16)
+        } else {
+            1
+        }
+    }
+
     pub fn blocks_count(&self) -> u64 {
         if self.is_64bit() {
             lohi(self.blocks_count_lo(), self.blocks_count_hi())

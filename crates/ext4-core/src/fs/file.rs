@@ -8,6 +8,10 @@ use crate::ondisk::inode::{Inode, Timestamp, flags};
 use crate::ondisk::superblock::incompat;
 use crate::ondisk::xattr::{self as xa, INDEX_SYSTEM};
 
+/// Direct writes tracked per inode between mapping and completion (the
+/// kernel keeps far fewer in flight; the cap only bounds lost completions).
+const MAX_INFLIGHT: usize = 4096;
+
 impl Fs {
     /// Largest file size supported for this inode's mapping scheme.
     pub(crate) fn max_file_size(&self, inode: &Inode) -> u64 {
@@ -379,6 +383,7 @@ impl Fs {
         }
         let bs = self.bs as u64;
         if new_size < old {
+            self.dio_inflight_done(ino, new_size, u64::MAX);
             let first_free = new_size.div_ceil(bs);
             self.free_range(ino, inode, first_free, 1 << 32)?;
             self.zero_tail(ino, inode, new_size)?;
@@ -523,6 +528,7 @@ impl Fs {
             inode.set_size(sz);
         }
         let bs = self.bs as u64;
+        self.dio_inflight_done(ino, offset, offset.saturating_add(len));
         let end = offset.saturating_add(len).min(inode.size().max(offset));
         if end <= offset {
             return Ok(());
@@ -643,7 +649,24 @@ impl Fs {
         if end % bs != 0 && !partial.contains(&(last_blk - 1)) {
             partial.push(last_blk - 1);
         }
-        let mut zero: Vec<u64> = Vec::new();
+        // (logical, physical) blocks to zero before the kernel writes
+        let mut zero: Vec<(u64, u64)> = Vec::new();
+        // Extending past a partial last block: the bytes between the old
+        // end of file and the write become file contents, so they must be
+        // zeros even if a failed earlier write left data there (Linux
+        // zeroes the tail the same way).
+        let mut eof_gap: Option<(u64, u64)> = None;
+        if write && offset > size && size % bs != 0 {
+            let eof_blk = size / bs;
+            let gap_end = offset.min((eof_blk + 1) * bs);
+            if let Mapping::Mapped {
+                pblk, unwritten: false, ..
+            } = self.map_block(ino, &inode, eof_blk)?
+                && !self.dio_inflight_overlaps(ino, size, (eof_blk + 1) * bs)
+            {
+                eof_gap = Some((pblk * bs + size % bs, gap_end - size));
+            }
+        }
         let mut lblk = first;
         let mut allocated = false;
         while lblk < last_blk {
@@ -669,7 +692,7 @@ impl Fs {
                             partial
                                 .iter()
                                 .filter(|&&b| b >= lblk && b < lblk + n)
-                                .map(|&b| pblk + (b - lblk)),
+                                .map(|&b| (b, pblk + (b - lblk))),
                         );
                     }
                     push(IoExtent {
@@ -716,7 +739,7 @@ impl Fs {
                         partial
                             .iter()
                             .filter(|&&b| b >= lblk && b < lblk + n)
-                            .map(|&b| start + (b - lblk)),
+                            .map(|&b| (b, start + (b - lblk))),
                     );
                     push(IoExtent {
                         logical: pos,
@@ -728,23 +751,79 @@ impl Fs {
                 }
             }
         }
+        // A block that an earlier, still running direct write touches was
+        // zeroed by that write's mapping or is being written whole: zeroing
+        // it again could erase data that write already put there.
+        zero.retain(|&(l, _)| !self.dio_inflight_overlaps(ino, l * bs, (l + 1) * bs));
         if !zero.is_empty() {
             let zeros = vec![0u8; bs as usize];
-            for pblk in zero {
+            for (_, pblk) in zero {
                 self.dev.write_at(pblk * bs, &zeros)?;
             }
+        }
+        if let Some((at, len)) = eof_gap {
+            self.dev.write_at(at, &vec![0u8; len as usize])?;
         }
         if allocated {
             self.write_inode(ino, &inode)?;
             self.maybe_commit()?;
         }
+        if write {
+            let v = self.dio_inflight.entry(ino).or_default();
+            if v.len() >= MAX_INFLIGHT {
+                // completions went missing; forget the oldest
+                v.remove(0);
+            }
+            v.push((offset, end));
+        }
         Ok(out)
+    }
+
+    /// Whether a direct write of `ino` still in flight overlaps
+    /// `[start, end)`.
+    fn dio_inflight_overlaps(&self, ino: Ino, start: u64, end: u64) -> bool {
+        self.dio_inflight
+            .get(&ino)
+            .is_some_and(|v| v.iter().any(|&(s, e)| s < end && start < e))
+    }
+
+    /// `[start, end)` of `ino` is no longer being written directly
+    /// (completed, failed, truncated or punched out).
+    pub(crate) fn dio_inflight_done(&mut self, ino: Ino, start: u64, end: u64) {
+        let Some(v) = self.dio_inflight.get_mut(&ino) else {
+            return;
+        };
+        let mut rest = Vec::with_capacity(v.len());
+        for &(s, e) in v.iter() {
+            if e <= start || s >= end {
+                rest.push((s, e));
+                continue;
+            }
+            if s < start {
+                rest.push((s, start));
+            }
+            if e > end {
+                rest.push((end, e));
+            }
+        }
+        if rest.is_empty() {
+            self.dio_inflight.remove(&ino);
+        } else {
+            *v = rest;
+        }
+    }
+
+    /// The kernel reports that a direct write of `[offset, offset+len)`
+    /// failed: nothing becomes visible (the blocks stay unwritten).
+    pub fn abort_direct_write(&mut self, ino: Ino, offset: u64, len: u64) {
+        self.dio_inflight_done(ino, offset, offset.saturating_add(len));
     }
 
     /// The kernel finished writing `[offset, offset+len)` directly to the
     /// blocks returned by [`Fs::map_for_io`]: mark them written and grow
     /// the file.
     pub fn complete_direct_write(&mut self, ino: Ino, offset: u64, len: u64) -> Result<()> {
+        self.dio_inflight_done(ino, offset, offset.saturating_add(len));
         self.op(|fs| {
             fs.require_rw()?;
             let mut inode = fs.read_live_inode(ino)?;

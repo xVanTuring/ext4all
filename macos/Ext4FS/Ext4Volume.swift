@@ -55,9 +55,16 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     // MARK: helpers
 
     /// Run `body` under the volume lock and deliver its result (or error)
-    /// to `reply` after releasing the lock.
+    /// to `reply`, normally after releasing the lock. Handlers that hand an
+    /// item to FSKit (lookup, create, activate) pass `replyUnderLock`:
+    /// FSKit counts an item as returned when the reply is sent, and
+    /// `reclaimItem` relies on no lookup reply being in progress while it
+    /// holds the lock (`FSItem.tryReclaim`).
     @inline(__always)
-    func run<T>(_ what: StaticString, _ reply: (T?, (any Error)?) -> Void, _ body: () throws -> T) {
+    func run<T>(
+        _ what: StaticString, replyUnderLock: Bool = false, _ reply: (T?, (any Error)?) -> Void,
+        _ body: () throws -> T
+    ) {
         let result: Result<T, any Error>
         opLock.lock()
         do {
@@ -65,7 +72,9 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
         } catch {
             result = .failure(error)
         }
-        opLock.unlock()
+        if !replyUnderLock {
+            opLock.unlock()
+        }
         switch result {
         case .success(let v):
             reply(v, nil)
@@ -74,6 +83,9 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
                 Log.fs.debug("\(what): \(error.localizedDescription, privacy: .public)")
             }
             reply(nil, error)
+        }
+        if replyUnderLock {
+            opLock.unlock()
         }
     }
 
@@ -175,7 +187,7 @@ extension Ext4Volume: FSVolume.Handler {
     func activateVolume(
         options: FSTaskOptions, replyHandler reply: @escaping @Sendable (FSActivateResult?, (any Error)?) -> Void
     ) {
-        run("activate", reply) {
+        run("activate", replyUnderLock: true, reply) {
             if kernelIO {
                 kernelIO = Ext4FileSystem.wantsKernelIO(options.taskOptions, defaultOn: true)
                 Log.fs.info("kernel offloaded I/O \(self.kernelIO ? "on" : "off (-o nokoio)", privacy: .public)")
@@ -203,19 +215,25 @@ extension Ext4Volume: FSVolume.Handler {
     }
 
     func mount(options: FSTaskOptions, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void) {
+        var failure: (any Error)?
         opLock.lock()
         if finished {
-            // mounted again after an unmount without re-activation
+            // mounted again after an unmount without re-activation; if the
+            // engine cannot become writable again (e.g. after a failed
+            // commit) the mount fails rather than pretending to be writable
             do {
                 try mount.remount()
+                finished = false
             } catch {
                 Log.fs.error("remount: \(error.localizedDescription, privacy: .public)")
+                failure = error
             }
-            finished = false
         }
         opLock.unlock()
-        Log.fs.info("mount \(self.bsdName, privacy: .public)")
-        reply(nil)
+        if failure == nil {
+            Log.fs.info("mount \(self.bsdName, privacy: .public)")
+        }
+        reply(failure)
     }
 
     func unmount(replyHandler reply: @escaping @Sendable () -> Void) {
@@ -246,7 +264,7 @@ extension Ext4Volume: FSVolume.Handler {
         named name: FSFileName, in directory: FSItem, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSLookupItemResult?, (any Error)?) -> Void
     ) {
-        run("lookup", reply) {
+        run("lookup", replyUnderLock: true, reply) {
             let (item, attributes) = try lookupParts(named: name, in: directory)
             return try Self.unwrap(FSLookupItemResult(foundItem: item, itemName: name, itemAttributes: attributes))
         }
@@ -328,7 +346,7 @@ extension Ext4Volume: FSVolume.Handler {
         attributes newAttributes: FSItem.SetAttributesRequest, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSCreateItemResult?, (any Error)?) -> Void
     ) {
-        run("create", reply) {
+        run("create", replyUnderLock: true, reply) {
             let (item, attributes) = try createParts(named: name, type: type, in: directory, newAttributes, context)
             return try Self.unwrap(
                 FSCreateItemResult(
@@ -360,7 +378,7 @@ extension Ext4Volume: FSVolume.Handler {
         linkContents contents: FSFileName, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSCreateSymlinkResult?, (any Error)?) -> Void
     ) {
-        run("symlink", reply) {
+        run("symlink", replyUnderLock: true, reply) {
             let dir = try ino(directory)
             let (uid, gid) = owner(newAttributes, context)
             var a = try mount.symlink(dir, name.data, target: contents.data, uid: uid, gid: gid)

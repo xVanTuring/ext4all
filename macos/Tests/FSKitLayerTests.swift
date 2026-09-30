@@ -236,6 +236,33 @@ final class FSKitLayerTests: XCTestCase {
         // so tryReclaim may decline; either way the table stays consistent.
         XCTAssertLessThanOrEqual(volume.items.count, 2)
 
+        // handlers that hand out items reply while holding the volume lock
+        // (so reclaim cannot run between the table lookup and the reply);
+        // the others reply after releasing it
+        volume.run(
+            "locked", replyUnderLock: true,
+            { (_: Int?, _) in
+                XCTAssertFalse(volume.opLock.try(), "reply must run under the lock")
+            }
+        ) { 1 }
+        volume.run(
+            "unlocked",
+            { (_: Int?, _) in
+                XCTAssertTrue(volume.opLock.try(), "reply must run after unlocking")
+                volume.opLock.unlock()
+            }
+        ) { 1 }
+        volume.run(
+            "failing", replyUnderLock: true,
+            { (v: Int?, e) in
+                XCTAssertNil(v)
+                XCTAssertNotNil(e)
+                XCTAssertFalse(volume.opLock.try())
+            }
+        ) { throw POSIXError(.EIO) }
+        XCTAssertTrue(volume.opLock.try(), "lock released afterwards")
+        volume.opLock.unlock()
+
         let checked = try volume.quickCheck()
         XCTAssertTrue(checked.contains { $0.contains("ext4 volume \"vol\"") }, "\(checked)")
 

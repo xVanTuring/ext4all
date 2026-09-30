@@ -838,6 +838,22 @@ pub unsafe extern "C" fn ext4_complete_write(h: *const Ext4Handle, ino: u32, off
     guard(|| unsafe { handle(h) }?.with(|fs| fs.complete_direct_write(ino, offset, len)))
 }
 
+/// The kernel reports that a direct write of `[offset, offset+len)` of
+/// `ino` failed: nothing becomes visible.
+///
+/// # Safety
+/// `h` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_abort_write(h: *const Ext4Handle, ino: u32, offset: u64, len: u64) -> i32 {
+    // SAFETY: caller contract
+    guard(|| {
+        unsafe { handle(h) }?.with(|fs| {
+            fs.abort_direct_write(ino, offset, len);
+            Ok(())
+        })
+    })
+}
+
 // --- extended attributes (macOS names) --------------------------------------------
 
 /// Read xattr `name` (macOS naming). With `buf == NULL` only the size is

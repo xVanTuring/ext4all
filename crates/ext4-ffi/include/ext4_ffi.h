@@ -568,6 +568,15 @@ int32_t ext4_complete_write(const struct Ext4Handle *h,
                             uint64_t len);
 
 /**
+ * The kernel reports that a direct write of `[offset, offset+len)` of
+ * `ino` failed: nothing becomes visible.
+ *
+ * # Safety
+ * `h` must be a live handle.
+ */
+int32_t ext4_abort_write(const struct Ext4Handle *h, uint32_t ino, uint64_t offset, uint64_t len);
+
+/**
  * Read xattr `name` (macOS naming). With `buf == NULL` only the size is
  * returned in `*len`.
  *

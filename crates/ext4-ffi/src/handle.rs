@@ -128,6 +128,7 @@ fn commit_loop(s: Arc<Shared>, interval: Duration) {
         drop(stop);
         if let Ok(mut g) = s.fs.lock()
             && let Some(fs) = g.as_mut()
+            && !fs.is_read_only()
             && fs.has_pending_changes()
         {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fs.commit()));

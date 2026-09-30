@@ -365,7 +365,7 @@ fn revoke_records_suppress_replay() {
 }
 
 #[test]
-fn corrupted_data_block_is_skipped() {
+fn corrupted_data_block_fails_recovery() {
     let (dev, mut j) = setup(V3);
     let a = block_of(0xA1);
     dev.fail_writes_after(Some(3));
@@ -374,9 +374,89 @@ fn corrupted_data_block_is_skipped() {
     // corrupt the logged data block (journal block 2)
     dev.write_at((JSTART + 2) * BS as u64 + 7, &[0xFF]).unwrap();
     let mut j2 = Journal::load(&dev, j.map.clone(), BS).unwrap();
-    let plan = j2.recover(&dev).unwrap();
-    assert_eq!(plan.bad_blocks, 1);
+    assert!(matches!(j2.recover(&dev), Err(Error::Checksum(_))));
+    // nothing was written and the journal still needs recovery
     assert_eq!(read_home(&dev, 60), vec![0u8; BS]);
+    assert!(Journal::load(&dev, j.map.clone(), BS).unwrap().needs_recovery());
+}
+
+/// The data tag checksum covers the escaped block, as in jbd2 (a block
+/// starting with the journal magic).
+#[test]
+fn escaped_block_checksum_covers_log_contents() {
+    let (dev, mut j) = setup(V3);
+    let mut b = block_of(0x11);
+    set_be32(&mut b, 0, JBD2_MAGIC);
+    dev.fail_writes_after(Some(3));
+    assert!(j.commit(&dev, &[(70, &b)]).is_err());
+    dev.fail_writes_after(None);
+    let mut desc = vec![0u8; BS];
+    dev.read_at((JSTART + 1) * BS as u64, &mut desc).unwrap();
+    let tag = read_tag(&desc[12..28], &j.sb);
+    assert_ne!(tag.flags & JBD2_FLAG_ESCAPE, 0);
+    let mut logged = vec![0u8; BS];
+    dev.read_at((JSTART + 2) * BS as u64, &mut logged).unwrap();
+    assert_eq!(&logged[..4], &[0, 0, 0, 0]);
+    assert_eq!(tag.checksum, tag_checksum(j.sb.csum_seed(), 7, &logged));
+    let mut j2 = Journal::load(&dev, j.map.clone(), BS).unwrap();
+    j2.recover(&dev).unwrap();
+    assert_eq!(read_home(&dev, 70), b);
+}
+
+/// A failed commit never lets its sequence number be reused.
+#[test]
+fn sequence_advances_even_when_commit_fails() {
+    let (dev, mut j) = setup(V3);
+    let a = block_of(1);
+    dev.fail_writes_after(Some(1));
+    assert!(j.commit(&dev, &[(80, &a)]).is_err());
+    dev.fail_writes_after(None);
+    assert_eq!(j.sequence, 8);
+    j.commit(&dev, &[(80, &a)]).unwrap();
+    assert_eq!(j.sequence, 9);
+}
+
+#[test]
+fn blocks_above_4g_need_a_64bit_journal() {
+    let (dev, mut j) = setup(PLAIN32);
+    let a = block_of(1);
+    assert!(matches!(j.commit(&dev, &[(1 << 32, &a)]), Err(Error::Invalid(_))));
+    let (dev, mut j) = setup(PLAIN64);
+    // 64-bit tags encode it (the device is small, so only check encoding)
+    dev.fail_writes_after(Some(3));
+    let _ = j.commit(&dev, &[((1 << 32) + 5, &a)]);
+    dev.fail_writes_after(None);
+    let mut desc = vec![0u8; BS];
+    dev.read_at((JSTART + 1) * BS as u64, &mut desc).unwrap();
+    assert_eq!(read_tag(&desc[12..24], &j.sb).blocknr, (1 << 32) + 5);
+}
+
+#[test]
+fn enable_features_upgrades_empty_journal() {
+    let (dev, mut j) = setup(PLAIN32);
+    j.enable_features(&dev, true, true).unwrap();
+    let j2 = Journal::load(&dev, j.map.clone(), BS).unwrap();
+    assert!(j2.sb.is_64bit());
+    assert!(j2.sb.has_csum_v3());
+    assert_eq!(j2.sb.checksum_type(), JBD2_CRC32C_CHKSUM);
+    // idempotent
+    let before = dev.snapshot();
+    let mut j3 = j2;
+    j3.enable_features(&dev, true, true).unwrap();
+    assert_eq!(before, dev.snapshot());
+}
+
+#[test]
+fn fast_commit_area_is_excluded() {
+    let (_, j) = setup(V3 | JBD2_FEATURE_INCOMPAT_FAST_COMMIT);
+    // JLEN 64 with the default 256 fc blocks leaves the minimum log
+    assert_eq!(j.log_end(), 2);
+    let map = JournalMap {
+        runs: vec![(0, JSTART, 300)],
+    };
+    let (_, j) = setup_with_map(V3 | JBD2_FEATURE_INCOMPAT_FAST_COMMIT, map);
+    assert_eq!(j.log_end(), 300 - 256);
+    assert_eq!(j.capacity(), 300 - 256 - 1);
 }
 
 #[test]

@@ -116,7 +116,7 @@ impl Fs {
         if gd.has_flag(BG_BLOCK_UNINIT) && self.has_group_csums() {
             let init = self.init_block_bitmap(g);
             self.cache.put(loc, &init);
-            self.groups[g as usize].clear_flag(BG_BLOCK_UNINIT);
+            self.group_mut(g).clear_flag(BG_BLOCK_UNINIT);
             self.dirty_group(g);
         } else if !self.cache.is_dirty(loc) {
             let data = self.cache.read(&*self.dev, loc)?;
@@ -159,7 +159,7 @@ impl Fs {
     }
 
     fn adjust_free_blocks(&mut self, g: u32, delta: i64) {
-        let gd = &mut self.groups[g as usize];
+        let gd = self.group_mut(g);
         gd.set_free_blocks_count((gd.free_blocks_count() as i64 + delta) as u32);
         self.dirty_group(g);
         let f = self.sb.free_blocks_count() as i64 + delta;
@@ -309,7 +309,7 @@ impl Fs {
             let mut b = vec![0u8; self.bs as usize];
             mark_end(&mut b, self.sb.inodes_per_group(), self.bs * 8);
             self.cache.put(loc, &b);
-            self.groups[g as usize].clear_flag(BG_INODE_UNINIT);
+            self.group_mut(g).clear_flag(BG_INODE_UNINIT);
             self.dirty_group(g);
         }
         self.dirty_inode_bitmap(g);
@@ -378,7 +378,7 @@ impl Fs {
             let bm = self.inode_bitmap_mut(g)?;
             set_bit(bm, bit);
             let csums = self.has_group_csums();
-            let gd = &mut self.groups[g as usize];
+            let gd = self.group_mut(g);
             gd.set_free_inodes_count(gd.free_inodes_count() - 1);
             if is_dir {
                 gd.set_used_dirs_count(gd.used_dirs_count() + 1);
@@ -406,7 +406,7 @@ impl Fs {
             return Err(Error::corrupt(format!("double free of inode {ino}")));
         }
         clear_bit(bm, bit);
-        let gd = &mut self.groups[g as usize];
+        let gd = self.group_mut(g);
         gd.set_free_inodes_count(gd.free_inodes_count() + 1);
         if is_dir {
             gd.set_used_dirs_count(gd.used_dirs_count().saturating_sub(1));

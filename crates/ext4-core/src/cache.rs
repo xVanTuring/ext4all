@@ -18,6 +18,9 @@ struct Entry {
     stamp: u64,
 }
 
+/// Saved state of a block: contents and dirtiness, or `None` if uncached.
+type SavedBlock = Option<(Box<[u8]>, bool)>;
+
 pub struct BlockCache {
     block_size: usize,
     capacity: usize,
@@ -26,6 +29,10 @@ pub struct BlockCache {
     lru: BTreeMap<u64, u64>,
     clock: u64,
     dirty_count: usize,
+    /// While an operation runs: the state of every block before its first
+    /// modification (None = was not cached), so a failed operation can be
+    /// undone.
+    undo: Option<HashMap<u64, SavedBlock>>,
     pub hits: u64,
     pub misses: u64,
 }
@@ -39,8 +46,45 @@ impl BlockCache {
             lru: BTreeMap::new(),
             clock: 0,
             dirty_count: 0,
+            undo: None,
             hits: 0,
             misses: 0,
+        }
+    }
+
+    /// Start recording block states for [`BlockCache::rollback`].
+    pub fn begin_undo(&mut self) {
+        self.undo = Some(HashMap::new());
+    }
+
+    /// Stop recording (the changes are kept).
+    pub fn end_undo(&mut self) {
+        self.undo = None;
+    }
+
+    pub fn undo_active(&self) -> bool {
+        self.undo.is_some()
+    }
+
+    /// Restore every block modified since [`BlockCache::begin_undo`].
+    pub fn rollback(&mut self) {
+        let Some(undo) = self.undo.take() else {
+            return;
+        };
+        for (blk, prev) in undo {
+            match prev {
+                Some((data, dirty)) => self.insert(blk, data, dirty),
+                None => self.remove_entry(blk),
+            }
+        }
+    }
+
+    fn record(&mut self, blk: u64) {
+        if let Some(u) = &mut self.undo
+            && !u.contains_key(&blk)
+        {
+            let prev = self.entries.get(&blk).map(|e| (e.data.clone(), e.dirty));
+            u.insert(blk, prev);
         }
     }
 
@@ -135,6 +179,7 @@ impl BlockCache {
 
     /// Write access to a block (marks it dirty), loading it on a miss.
     pub fn get_mut(&mut self, dev: &dyn BlockDevice, blk: u64) -> Result<&mut [u8]> {
+        self.record(blk);
         self.load(dev, blk)?;
         self.mark_dirty(blk);
         Ok(&mut self.entries.get_mut(&blk).unwrap().data)
@@ -143,11 +188,13 @@ impl BlockCache {
     /// Replace a block's contents entirely without reading it first.
     pub fn put(&mut self, blk: u64, data: &[u8]) {
         debug_assert_eq!(data.len(), self.block_size);
+        self.record(blk);
         self.insert(blk, data.to_vec().into_boxed_slice(), true);
     }
 
     /// A zero-filled dirty block (for freshly allocated metadata).
     pub fn zeroed(&mut self, blk: u64) -> &mut [u8] {
+        self.record(blk);
         self.insert(blk, vec![0u8; self.block_size].into_boxed_slice(), true);
         &mut self.entries.get_mut(&blk).unwrap().data
     }
@@ -163,6 +210,13 @@ impl BlockCache {
 
     /// Drop a block (e.g. it was freed). Dirty contents are discarded.
     pub fn forget(&mut self, blk: u64) {
+        if self.entries.contains_key(&blk) {
+            self.record(blk);
+        }
+        self.remove_entry(blk);
+    }
+
+    fn remove_entry(&mut self, blk: u64) {
         if let Some(e) = self.entries.remove(&blk) {
             if e.dirty {
                 self.dirty_count -= 1;
@@ -240,6 +294,46 @@ mod tests {
             chunk.fill(i as u8);
         }
         MemDevice::from_vec(v)
+    }
+
+    #[test]
+    fn rollback_restores_every_touched_block() {
+        let d = dev();
+        let mut c = BlockCache::new(1024, 64);
+        c.get_mut(&d, 1).unwrap()[0] = 0xA1; // dirty before the op
+        c.get(&d, 2).unwrap(); // clean before the op
+        c.begin_undo();
+        c.get_mut(&d, 1).unwrap()[0] = 0xB1;
+        c.get_mut(&d, 2).unwrap()[0] = 0xB2;
+        c.get_mut(&d, 3).unwrap()[0] = 0xB3; // not cached before
+        c.put(4, &[0xB4; 1024]);
+        c.zeroed(5);
+        c.forget(1);
+        c.forget(2);
+        assert!(c.undo_active());
+        c.rollback();
+        assert!(!c.undo_active());
+        assert_eq!(c.peek(1).unwrap()[0], 0xA1);
+        assert!(c.is_dirty(1));
+        assert_eq!(c.peek(2).unwrap()[0], 2);
+        assert!(!c.is_dirty(2));
+        assert!(!c.contains(3));
+        assert!(!c.contains(4));
+        assert!(!c.contains(5));
+        assert_eq!(c.dirty_count(), 1);
+        assert_eq!(c.dirty_blocks(), vec![1]);
+    }
+
+    #[test]
+    fn end_undo_keeps_changes() {
+        let d = dev();
+        let mut c = BlockCache::new(1024, 64);
+        c.begin_undo();
+        c.get_mut(&d, 7).unwrap()[0] = 0xCC;
+        c.end_undo();
+        c.rollback(); // no-op without an active undo log
+        assert_eq!(c.peek(7).unwrap()[0], 0xCC);
+        assert!(c.is_dirty(7));
     }
 
     #[test]

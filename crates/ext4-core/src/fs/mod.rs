@@ -33,7 +33,21 @@ use crate::ondisk::inode::{JOURNAL_INO, ROOT_INO, Timestamp};
 use crate::ondisk::superblock::{
     STATE_ERROR, STATE_VALID, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE, Superblock, compat, incompat,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+
+/// In-memory state captured when an operation starts (block contents are
+/// tracked by the cache's undo log).
+pub(crate) struct Savepoint {
+    sb: Box<[u8; SUPERBLOCK_SIZE]>,
+    sb_dirty: bool,
+    /// Original descriptors of groups modified during the operation.
+    groups: HashMap<u32, GroupDesc>,
+    dirty_groups: BTreeSet<u32>,
+    bitmaps_dirty: BTreeSet<(u32, bool)>,
+    deferred_len: usize,
+    open_orphans: BTreeSet<u32>,
+    last_dir_group: u32,
+}
 use std::sync::Arc;
 
 pub struct Fs {
@@ -47,6 +61,12 @@ pub struct Fs {
     /// Inodes unlinked while still referenced (on the orphan list).
     pub(crate) open_orphans: BTreeSet<u32>,
     pub(crate) defer_unlinked: bool,
+    /// State to restore if the running operation fails.
+    pub(crate) savepoint: Option<Savepoint>,
+    pub(crate) op_depth: u32,
+    /// Set after a failed commit: the volume is switched to read-only and
+    /// the journal is left for recovery at the next mount.
+    pub(crate) aborted: bool,
     pub(crate) cache: BlockCache,
     pub(crate) bs: u32,
     pub(crate) csum_seed: u32,
@@ -148,6 +168,9 @@ impl Fs {
             bitmaps_dirty: BTreeSet::new(),
             open_orphans: BTreeSet::new(),
             defer_unlinked: false,
+            savepoint: None,
+            op_depth: 0,
+            aborted: false,
             cache: BlockCache::new(bs as usize, opts.cache_blocks),
             bs,
             read_only,
@@ -376,6 +399,12 @@ impl Fs {
             let f = self.sb.feature_incompat() & !incompat::RECOVER;
             self.sb.set_feature_incompat(f);
         }
+        if !self.read_only {
+            // What the kernel does on a read-write mount: 64-bit block
+            // numbers in tags for 64bit file systems (blocks >= 2^32 would
+            // otherwise be truncated) and checksum v3 with metadata_csum.
+            journal.enable_features(&*self.dev, self.sb.is_64bit(), self.sb.has_metadata_csum())?;
+        }
         self.journal = Some(journal);
         Ok(())
     }
@@ -441,6 +470,76 @@ impl Fs {
         self.sb_dirty = true;
     }
 
+    /// Mutable group descriptor, remembering its original for rollback.
+    pub(crate) fn group_mut(&mut self, g: u32) -> &mut GroupDesc {
+        if let Some(sp) = &mut self.savepoint {
+            sp.groups.entry(g).or_insert_with(|| self.groups[g as usize].clone());
+        }
+        &mut self.groups[g as usize]
+    }
+
+    /// Run a modifying operation atomically in memory: if it fails, every
+    /// metadata change it made is undone before the error is returned.
+    /// (Data already written to newly allocated blocks is simply orphaned
+    /// again; overwritten data blocks cannot be restored, as on Linux.)
+    pub(crate) fn op<T>(&mut self, f: impl FnOnce(&mut Fs) -> Result<T>) -> Result<T> {
+        self.op_depth += 1;
+        if self.op_depth == 1 && !self.read_only {
+            self.savepoint = Some(Savepoint {
+                sb: self.sb.raw.clone(),
+                sb_dirty: self.sb_dirty,
+                groups: HashMap::new(),
+                dirty_groups: self.dirty_groups.clone(),
+                bitmaps_dirty: self.bitmaps_dirty.clone(),
+                deferred_len: self.deferred_free.len(),
+                open_orphans: self.open_orphans.clone(),
+                last_dir_group: self.last_dir_group,
+            });
+            self.cache.begin_undo();
+        }
+        let r = f(self);
+        self.op_depth -= 1;
+        if self.op_depth == 0 {
+            match &r {
+                Ok(_) => {
+                    self.savepoint = None;
+                    self.cache.end_undo();
+                }
+                Err(e) => {
+                    if self.savepoint.is_some() {
+                        log::debug!("rolling back failed operation: {e}");
+                    }
+                    self.rollback_op();
+                }
+            }
+        }
+        r
+    }
+
+    fn rollback_op(&mut self) {
+        let Some(sp) = self.savepoint.take() else {
+            self.cache.end_undo();
+            return;
+        };
+        self.sb.raw = sp.sb;
+        self.sb_dirty = sp.sb_dirty;
+        for (g, gd) in sp.groups {
+            self.groups[g as usize] = gd;
+        }
+        self.dirty_groups = sp.dirty_groups;
+        self.bitmaps_dirty = sp.bitmaps_dirty;
+        self.deferred_free.truncate(sp.deferred_len);
+        self.open_orphans = sp.open_orphans;
+        self.last_dir_group = sp.last_dir_group;
+        self.cache.rollback();
+    }
+
+    /// A commit is a point of no return for the running operation.
+    fn end_savepoint(&mut self) {
+        self.savepoint = None;
+        self.cache.end_undo();
+    }
+
     pub(crate) fn dirty_group(&mut self, g: u32) {
         self.dirty_groups.insert(g);
     }
@@ -478,37 +577,62 @@ impl Fs {
 
     /// Write all pending changes to disk atomically.
     pub fn commit(&mut self) -> Result<()> {
+        if self.aborted {
+            return Err(Error::Device(crate::error::errno::EIO));
+        }
         if self.read_only {
             return Ok(());
         }
+        self.end_savepoint();
+        let r = self.commit_inner();
+        if let Err(e) = &r {
+            // Like a jbd2 abort: stop writing. A committed-but-unwritten
+            // transaction stays in the journal for the next mount.
+            log::error!("commit failed, volume is now read-only: {e}");
+            self.aborted = true;
+            self.read_only = true;
+        }
+        r
+    }
+
+    fn commit_inner(&mut self) -> Result<()> {
         self.release_deferred_frees()?;
-        self.stage_metadata()?;
+        let dirty_estimate = self.cache.dirty_count() + self.dirty_groups.len() + self.bitmaps_dirty.len() + 1;
+        let journal_fits = self.journal.as_ref().is_some_and(|j| j.fits(dirty_estimate));
+        let in_place_with_journal = self.journal.is_some() && !journal_fits;
+        if in_place_with_journal {
+            // Too big for the journal: write in place, but mark the file
+            // system not clean for the duration so a crash forces fsck.
+            log::warn!("transaction of ~{dirty_estimate} blocks exceeds the journal; writing in place");
+            let s = self.sb.state() & !STATE_VALID;
+            self.sb.set_state(s);
+            self.dirty_super();
+            self.stage_metadata()?;
+            self.write_super_direct()?;
+        } else {
+            self.stage_metadata()?;
+        }
         let dirty = self.cache.dirty_blocks();
         if dirty.is_empty() {
             return Ok(());
         }
-        let use_journal = self.journal.as_ref().is_some_and(|j| j.fits(dirty.len()));
-        if use_journal {
+        if !in_place_with_journal && let Some(j) = self.journal.as_mut() {
             let blocks: Vec<(u64, &[u8])> = dirty
                 .iter()
                 .map(|&b| (b, self.cache.peek(b).expect("dirty block cached")))
                 .collect();
-            let res = self.journal.as_mut().unwrap().commit(&*self.dev, &blocks);
-            if let Err(e) = res {
-                log::error!("journal commit failed: {e}");
-                return Err(e);
-            }
+            j.commit(&*self.dev, &blocks)?;
             self.cache.mark_all_clean();
-        } else {
-            if self.journal.is_some() {
-                log::warn!(
-                    "transaction of {} blocks exceeds journal capacity; writing without journal",
-                    dirty.len()
-                );
-            }
-            self.dev.flush()?;
-            self.cache.write_back(&*self.dev)?;
-            self.dev.flush()?;
+            return Ok(());
+        }
+        self.dev.flush()?;
+        self.cache.write_back(&*self.dev)?;
+        self.dev.flush()?;
+        if in_place_with_journal {
+            let s = self.sb.state() | STATE_VALID;
+            self.sb.set_state(s);
+            self.write_super_direct()?;
+            self.dirty_super();
         }
         Ok(())
     }
@@ -545,6 +669,10 @@ impl Fs {
     }
 
     pub fn unmount_in_place(&mut self) -> Result<()> {
+        if self.aborted {
+            // leave needs_recovery set: the journal may hold a transaction
+            return Err(Error::Device(crate::error::errno::EIO));
+        }
         if self.read_only {
             return Ok(());
         }
@@ -596,8 +724,11 @@ impl Fs {
         if label.len() > 16 {
             return Err(Error::NameTooLong);
         }
-        self.sb.set_volume_name(label);
-        self.dirty_super();
+        self.op(|fs| {
+            fs.sb.set_volume_name(label);
+            fs.dirty_super();
+            Ok(())
+        })?;
         self.commit()
     }
 

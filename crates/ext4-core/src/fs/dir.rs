@@ -194,6 +194,13 @@ impl Fs {
             }
             return Ok(None);
         }
+        if name == b"." || name == b".." {
+            // always in the first block (the dx root of an htree directory)
+            if self.dir_nblocks(inode) == 0 {
+                return Ok(None);
+            }
+            return self.find_in_block(ino, inode, 0, name);
+        }
         if inode.has_flag(flags::INDEX) && self.sb.has_compat(compat::DIR_INDEX) {
             match self.dx_find(ino, inode, name) {
                 Ok(r) => return Ok(r),

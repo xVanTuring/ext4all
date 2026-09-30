@@ -92,6 +92,10 @@ impl Fs {
     }
 
     pub fn set_xattr(&mut self, ino: Ino, name: &[u8], value: &[u8], mode: XattrSetMode) -> Result<()> {
+        self.op(|fs| fs.set_xattr_impl(ino, name, value, mode))
+    }
+
+    fn set_xattr_impl(&mut self, ino: Ino, name: &[u8], value: &[u8], mode: XattrSetMode) -> Result<()> {
         self.require_rw()?;
         let (idx, suffix) = xa::split_name(name);
         if idx == 0 {
@@ -108,11 +112,21 @@ impl Fs {
             return Err(Error::NoSpace);
         }
         let mut inode = self.read_live_inode(ino)?;
-        let exists = self.remove_entry_from(ino, &mut inode, idx, suffix, true)?;
+        let l = self.load_xattrs(ino, &inode)?;
+        let matches = |e: &XattrEntry| e.index == idx && e.name == suffix;
+        let in_ibody = l.ibody.iter().any(matches);
+        let in_block = l.block.as_ref().is_some_and(|b| b.2.iter().any(matches));
+        // decide everything before modifying anything
         match mode {
-            XattrSetMode::Create if exists => return Err(Error::Exists),
-            XattrSetMode::Replace if !exists => return Err(Error::NoAttr),
+            XattrSetMode::Create if in_ibody || in_block => return Err(Error::Exists),
+            XattrSetMode::Replace if !in_ibody && !in_block => return Err(Error::NoAttr),
             _ => {}
+        }
+        if l.block
+            .as_ref()
+            .is_some_and(|b| b.2.iter().any(|e| matches(e) && e.value_inum != 0))
+        {
+            return Err(Error::unsupported("modifying EA-inode attributes"));
         }
         let entry = XattrEntry {
             index: idx,
@@ -121,25 +135,34 @@ impl Fs {
             value_inum: 0,
             hash: xa::entry_hash(suffix, value),
         };
-        let l = self.load_xattrs(ino, &inode)?;
-        let mut ibody = l.ibody.clone();
-        let mut placed = false;
+        let mut ibody: Vec<XattrEntry> = l.ibody.iter().filter(|e| !matches(e)).cloned().collect();
+        let mut block: Vec<XattrEntry> = l
+            .block
+            .as_ref()
+            .map(|b| b.2.iter().filter(|e| !matches(e)).cloned().collect())
+            .unwrap_or_default();
+        let mut into_ibody = false;
         if let Some(r) = inode.xattr_area() {
             let mut candidate = ibody.clone();
             candidate.push(entry.clone());
             if xa::space_needed(&candidate) + 4 <= r.len() {
                 ibody = candidate;
-                xa::write_ibody(&mut inode.raw[r], &ibody)?;
-                placed = true;
+                into_ibody = true;
             }
         }
-        if !placed {
-            let mut entries = l.block.as_ref().map(|b| b.2.clone()).unwrap_or_default();
-            entries.push(entry);
-            if xa::space_needed(&entries) + xa::BLOCK_HEADER_SIZE > self.bs as usize {
+        if !into_ibody {
+            block.push(entry);
+            if xa::space_needed(&block) + xa::BLOCK_HEADER_SIZE > self.bs as usize {
                 return Err(Error::NoSpace);
             }
-            self.store_xattr_block(ino, &mut inode, l.block.as_ref().map(|b| (b.0, b.1)), entries)?;
+        }
+        if (into_ibody || in_ibody)
+            && let Some(r) = inode.xattr_area()
+        {
+            xa::write_ibody(&mut inode.raw[r], &ibody)?;
+        }
+        if !into_ibody || in_block {
+            self.store_xattr_block(ino, &mut inode, l.block.as_ref().map(|b| (b.0, b.1)), block)?;
         }
         inode.set_ctime(Timestamp::now());
         self.write_inode(ino, &inode)?;
@@ -147,6 +170,10 @@ impl Fs {
     }
 
     pub fn remove_xattr(&mut self, ino: Ino, name: &[u8]) -> Result<()> {
+        self.op(|fs| fs.remove_xattr_impl(ino, name))
+    }
+
+    fn remove_xattr_impl(&mut self, ino: Ino, name: &[u8]) -> Result<()> {
         self.require_rw()?;
         let (idx, suffix) = xa::split_name(name);
         if idx == 0 {

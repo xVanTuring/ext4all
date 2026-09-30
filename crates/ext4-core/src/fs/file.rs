@@ -13,8 +13,9 @@ impl Fs {
     pub(crate) fn max_file_size(&self, inode: &Inode) -> u64 {
         let bs = self.bs as u64;
         if inode.has_flag(flags::EXTENTS) {
-            // 2^32 logical blocks
-            (1u64 << 32) * bs - 1
+            // logical blocks 0..2^32-2: Linux rejects an extent reaching
+            // block 0xFFFFFFFF (its end would wrap in 32 bits)
+            ((1u64 << 32) - 1) * bs
         } else {
             let per = bs / 4;
             let map = (12 + per + per * per + per * per * per) * bs;
@@ -156,6 +157,10 @@ impl Fs {
 
     /// Write `data` at `offset`, growing the file as needed.
     pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<usize> {
+        self.op(|fs| fs.write_impl(ino, offset, data))
+    }
+
+    fn write_impl(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<usize> {
         self.require_rw()?;
         let mut inode = self.read_live_inode(ino)?;
         if inode.is_dir() {
@@ -431,6 +436,10 @@ impl Fs {
     /// Allocate (unwritten) blocks for `[offset, offset+len)` without
     /// changing the size unless `keep_size` is false.
     pub fn fallocate(&mut self, ino: Ino, offset: u64, len: u64, keep_size: bool) -> Result<()> {
+        self.op(|fs| fs.fallocate_impl(ino, offset, len, keep_size))
+    }
+
+    fn fallocate_impl(&mut self, ino: Ino, offset: u64, len: u64, keep_size: bool) -> Result<()> {
         self.require_rw()?;
         let mut inode = self.read_live_inode(ino)?;
         if !inode.is_reg() {
@@ -493,6 +502,10 @@ impl Fs {
 
     /// Deallocate `[offset, offset+len)` (keeps the size).
     pub fn punch_hole(&mut self, ino: Ino, offset: u64, len: u64) -> Result<()> {
+        self.op(|fs| fs.punch_hole_impl(ino, offset, len))
+    }
+
+    fn punch_hole_impl(&mut self, ino: Ino, offset: u64, len: u64) -> Result<()> {
         self.require_rw()?;
         let mut inode = self.read_live_inode(ino)?;
         if !inode.is_reg() {

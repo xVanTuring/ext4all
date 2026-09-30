@@ -69,6 +69,10 @@ impl Fs {
 
     /// Called when the last kernel reference to an inode goes away.
     pub fn reclaim(&mut self, ino: Ino) -> Result<()> {
+        self.op(|fs| fs.reclaim_impl(ino))
+    }
+
+    fn reclaim_impl(&mut self, ino: Ino) -> Result<()> {
         if self.read_only || !self.open_orphans.contains(&ino) {
             return Ok(());
         }
@@ -108,6 +112,11 @@ impl Fs {
             self.finish_orphan(cur, &mut inode)?;
             count += 1;
             cur = next;
+            // Keep the list consistent at every commit so large orphan sets
+            // are split across several transactions.
+            self.sb.set_last_orphan(next);
+            self.dirty_super();
+            self.maybe_commit()?;
         }
         if self.sb.last_orphan() != 0 {
             self.sb.set_last_orphan(0);
@@ -177,13 +186,21 @@ impl Fs {
             }
             if changed {
                 if self.sb.has_metadata_csum() {
-                    let c = crc32c(seed, &(lblk as u32).to_le_bytes());
-                    let c = crc32c(c, &data[..per * 4]);
+                    let c = orphan_block_csum(seed, pblk, &data);
                     set_le32(&mut data, per * 4 + 4, c);
                 }
                 self.cache.put(pblk, &data);
+                self.maybe_commit()?;
             }
         }
         Ok(count)
     }
+}
+
+/// Orphan file block checksum: crc32c(orphan inode seed, physical block
+/// number as le64, entries) — `ext4_orphan_file_block_csum`.
+pub(crate) fn orphan_block_csum(inode_seed: u32, pblk: u64, block: &[u8]) -> u32 {
+    let per = (block.len() - 8) / 4;
+    let c = crc32c(inode_seed, &pblk.to_le_bytes());
+    crc32c(c, &block[..per * 4])
 }

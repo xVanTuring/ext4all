@@ -162,6 +162,19 @@ impl Fs {
         gid: u32,
         rdev: u32,
     ) -> Result<Attr> {
+        self.op(|fs| fs.create_impl(dir, name, ft, perm, uid, gid, rdev))
+    }
+
+    fn create_impl(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        ft: FileType,
+        perm: u16,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Result<Attr> {
         self.require_rw()?;
         if matches!(ft, FileType::Directory | FileType::Symlink | FileType::Unknown) {
             return Err(Error::invalid("use mkdir/symlink"));
@@ -184,6 +197,10 @@ impl Fs {
     }
 
     pub fn mkdir(&mut self, dir: Ino, name: &[u8], perm: u16, uid: u32, gid: u32) -> Result<Attr> {
+        self.op(|fs| fs.mkdir_impl(dir, name, perm, uid, gid))
+    }
+
+    fn mkdir_impl(&mut self, dir: Ino, name: &[u8], perm: u16, uid: u32, gid: u32) -> Result<Attr> {
         self.require_rw()?;
         let mut dinode = self.parent_dir(dir)?;
         self.check_new_name(dir, &dinode, name)?;
@@ -215,6 +232,10 @@ impl Fs {
     }
 
     pub fn symlink(&mut self, dir: Ino, name: &[u8], target: &[u8], uid: u32, gid: u32) -> Result<Attr> {
+        self.op(|fs| fs.symlink_impl(dir, name, target, uid, gid))
+    }
+
+    fn symlink_impl(&mut self, dir: Ino, name: &[u8], target: &[u8], uid: u32, gid: u32) -> Result<Attr> {
         self.require_rw()?;
         if target.is_empty() {
             return Err(Error::invalid("empty symlink target"));
@@ -302,6 +323,10 @@ impl Fs {
 
     /// Add a hard link to `ino` as `dir/name`.
     pub fn link(&mut self, ino: Ino, dir: Ino, name: &[u8]) -> Result<Attr> {
+        self.op(|fs| fs.link_impl(ino, dir, name))
+    }
+
+    fn link_impl(&mut self, ino: Ino, dir: Ino, name: &[u8]) -> Result<Attr> {
         self.require_rw()?;
         let mut inode = self.read_live_inode(ino)?;
         if inode.is_dir() {
@@ -352,6 +377,10 @@ impl Fs {
     }
 
     pub fn unlink(&mut self, dir: Ino, name: &[u8]) -> Result<()> {
+        self.op(|fs| fs.unlink_impl(dir, name))
+    }
+
+    fn unlink_impl(&mut self, dir: Ino, name: &[u8]) -> Result<()> {
         self.require_rw()?;
         reject_dots(name)?;
         let mut dinode = self.parent_dir(dir)?;
@@ -371,6 +400,10 @@ impl Fs {
     }
 
     pub fn rmdir(&mut self, dir: Ino, name: &[u8]) -> Result<()> {
+        self.op(|fs| fs.rmdir_impl(dir, name))
+    }
+
+    fn rmdir_impl(&mut self, dir: Ino, name: &[u8]) -> Result<()> {
         self.require_rw()?;
         if name == b"." {
             return Err(Error::invalid("rmdir ."));
@@ -429,6 +462,10 @@ impl Fs {
     }
 
     pub fn rename(&mut self, sdir: Ino, sname: &[u8], ddir: Ino, dname: &[u8], fl: RenameFlags) -> Result<()> {
+        self.op(|fs| fs.rename_impl(sdir, sname, ddir, dname, fl))
+    }
+
+    fn rename_impl(&mut self, sdir: Ino, sname: &[u8], ddir: Ino, dname: &[u8], fl: RenameFlags) -> Result<()> {
         self.require_rw()?;
         reject_dots(sname)?;
         reject_dots(dname)?;
@@ -597,6 +634,10 @@ impl Fs {
     }
 
     pub fn set_attr(&mut self, ino: Ino, a: &SetAttr) -> Result<Attr> {
+        self.op(|fs| fs.set_attr_impl(ino, a))
+    }
+
+    fn set_attr_impl(&mut self, ino: Ino, a: &SetAttr) -> Result<Attr> {
         self.require_rw()?;
         let mut inode = self.read_live_inode(ino)?;
         let now = Timestamp::now();

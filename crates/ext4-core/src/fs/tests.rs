@@ -359,3 +359,106 @@ fn pending_changes_tracking() {
     assert!(!fs.has_pending_changes());
     fs.unmount().unwrap();
 }
+
+fn fsck_clean(dev: &MemDevice) -> (i32, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("img");
+    std::fs::write(&p, dev.snapshot()).unwrap();
+    let sbin = std::env::var("E2FSPROGS_SBIN").unwrap_or_else(|_| "/opt/homebrew/opt/e2fsprogs/sbin".into());
+    let out = Command::new(format!("{sbin}/e2fsck"))
+        .arg("-fn")
+        .arg(&p)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// Shrink the in-memory journal so every commit is too large for it and
+/// takes the in-place path.
+fn shrink_journal(fs: &mut Fs) {
+    let j = fs.journal.as_mut().unwrap();
+    let first = j.sb.first();
+    j.sb.set_max_len(first + 3);
+}
+
+#[test]
+fn oversized_commits_write_in_place_consistently() {
+    let dev = mkfs(32, &["-t", "ext4", "-b", "1024"]);
+    let mut fs = mount(dev.clone());
+    shrink_journal(&mut fs);
+    let root = fs.root();
+    for i in 0..30 {
+        let a = fs
+            .create(root, format!("f{i}").as_bytes(), FileType::Regular, 0o644, 0, 0, 0)
+            .unwrap();
+        fs.write(a.ino, 0, &[i as u8; 5000]).unwrap();
+    }
+    assert_eq!(fs.journal_commits(), 0, "nothing may go through the journal");
+    fs.unmount().unwrap();
+    let (code, out) = fsck_clean(&dev);
+    assert_eq!(code, 0, "{out}");
+    let sb = Fs::probe(&*dev).unwrap();
+    assert_ne!(sb.state() & crate::ondisk::superblock::STATE_VALID, 0);
+}
+
+#[test]
+fn crash_during_in_place_commit_leaves_fs_not_clean() {
+    let dev = mkfs(32, &["-t", "ext4", "-b", "1024"]);
+    let mut fs = Fs::mount(
+        dev.clone(),
+        MountOptions {
+            commit_threshold: usize::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    shrink_journal(&mut fs);
+    let root = fs.root();
+    // with the tiny journal every operation commits in place right away;
+    // the superblock "not clean" write goes first, then the metadata
+    dev.fail_writes_after(Some(2));
+    let r = fs.create(root, b"f", FileType::Regular, 0o644, 0, 0, 0);
+    assert!(r.is_err(), "{r:?}");
+    assert!(fs.is_read_only(), "failed commit aborts the volume");
+    std::mem::forget(fs);
+    dev.fail_writes_after(None);
+    let sb = Fs::probe(&*dev).unwrap();
+    assert_eq!(
+        sb.state() & crate::ondisk::superblock::STATE_VALID,
+        0,
+        "crash must force fsck"
+    );
+}
+
+#[test]
+fn rollback_restores_group_counters_and_bitmaps() {
+    let dev = mkfs(32, &["-t", "ext4"]);
+    let mut fs = Fs::mount(
+        dev,
+        MountOptions {
+            commit_threshold: usize::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let root = fs.root();
+    let before_sb = fs.sb.raw.clone();
+    let before_groups: Vec<_> = fs.groups.clone();
+    let dirty_before = fs.cache.dirty_count();
+    let r: Result<()> = fs.op(|fs| {
+        let a = fs.create(root, b"x", FileType::Regular, 0o644, 0, 0, 0)?;
+        fs.write(a.ino, 0, &[7u8; 100_000])?;
+        fs.mkdir(root, b"d", 0o755, 0, 0)?;
+        Err(Error::NoSpace)
+    });
+    assert!(r.is_err());
+    assert_eq!(fs.sb.raw, before_sb);
+    assert_eq!(fs.groups, before_groups);
+    assert_eq!(fs.cache.dirty_count(), dirty_before);
+    assert!(fs.lookup(root, b"x").is_err());
+    assert!(fs.lookup(root, b"d").is_err());
+    fs.unmount().unwrap();
+}

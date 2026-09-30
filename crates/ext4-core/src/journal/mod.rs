@@ -128,9 +128,56 @@ impl Journal {
         dev.flush()
     }
 
+    /// One past the last block of the regular log. With fast commits the
+    /// tail of the journal (`s_num_fc_blks`, default 256) is reserved.
+    pub fn log_end(&self) -> u32 {
+        if self.sb.has_incompat(JBD2_FEATURE_INCOMPAT_FAST_COMMIT) {
+            let fc = match self.sb.num_fc_blocks() {
+                0 => 256,
+                n => n,
+            };
+            self.sb.max_len().saturating_sub(fc).max(self.sb.first() + 1)
+        } else {
+            self.sb.max_len()
+        }
+    }
+
     /// Usable log blocks per transaction.
     pub fn capacity(&self) -> u32 {
-        self.sb.max_len() - self.sb.first()
+        self.log_end() - self.sb.first()
+    }
+
+    /// Turn on journal features the Linux kernel enables when mounting
+    /// this file system read-write (64-bit block numbers for 64bit file
+    /// systems, checksum v3 with metadata_csum). Only valid while the
+    /// journal is empty.
+    pub fn enable_features(&mut self, dev: &dyn BlockDevice, bit64: bool, csum_v3: bool) -> Result<()> {
+        if self.needs_recovery() {
+            return Err(Error::Busy);
+        }
+        let mut inc = self.sb.feature_incompat();
+        let mut compat = self.sb.feature_compat();
+        if bit64 {
+            inc |= JBD2_FEATURE_INCOMPAT_64BIT;
+        }
+        if csum_v3 {
+            inc = (inc & !JBD2_FEATURE_INCOMPAT_CSUM_V2) | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+            compat &= !JBD2_FEATURE_COMPAT_CHECKSUM;
+        }
+        if inc == self.sb.feature_incompat() && compat == self.sb.feature_compat() {
+            return Ok(());
+        }
+        if self.sb.blocktype() == JBD2_SUPERBLOCK_V1 {
+            // v1 superblocks have no feature fields
+            return Ok(());
+        }
+        self.sb.set_feature_incompat(inc);
+        self.sb.set_feature_compat(compat);
+        if self.sb.has_csum_v2v3() {
+            self.sb.raw[0x50] = JBD2_CRC32C_CHKSUM;
+        }
+        self.write_sb(dev)?;
+        dev.flush()
     }
 
     fn tags_per_descriptor(&self) -> usize {
@@ -157,8 +204,14 @@ impl Journal {
         if !self.fits(blocks.len()) {
             return Err(Error::TooBig);
         }
+        if !self.sb.is_64bit() && blocks.iter().any(|(h, _)| *h > u32::MAX as u64) {
+            return Err(Error::invalid("block number needs a 64-bit journal"));
+        }
         let bs = self.block_size;
+        // A sequence number is never reused, even if this commit fails part
+        // way: a retry must not be confused with an earlier durable one.
         let seq = self.sequence;
+        self.sequence = seq.wrapping_add(1);
         let csum = self.sb.has_csum_v2v3();
         let v3 = self.sb.has_csum_v3();
         let seed = self.sb.csum_seed();
@@ -187,8 +240,9 @@ impl Journal {
                     flags |= JBD2_FLAG_LAST_TAG;
                 }
                 let tag_csum = if csum {
-                    // checksum over the *original* contents
-                    tag_checksum(seed, seq, data)
+                    // like jbd2: checksum the block as stored in the log
+                    // (after escaping)
+                    tag_checksum(seed, seq, &d)
                 } else {
                     0
                 };
@@ -240,7 +294,6 @@ impl Journal {
         }
         dev.flush()?;
         // 6. journal empty again
-        self.sequence = seq.wrapping_add(1);
         self.sb.set_start(0);
         self.sb.set_sequence(self.sequence);
         self.write_sb(dev)?;

@@ -3,7 +3,7 @@
 use super::Journal;
 use super::format::*;
 use crate::device::BlockDevice;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 
 /// Outcome of scanning the log.
@@ -31,7 +31,7 @@ struct PendingTxn {
 impl Journal {
     fn next_log_block(&self, b: u32) -> u32 {
         let n = b + 1;
-        if n >= self.sb.max_len() { self.sb.first() } else { n }
+        if n >= self.log_end() { self.sb.first() } else { n }
     }
 
     /// Scan the log and compute the blocks to replay without writing.
@@ -128,15 +128,24 @@ impl Journal {
                 }
                 let mut data = vec![0u8; bs];
                 self.read_block(dev, jblk, &mut data)?;
-                if tag.flags & JBD2_FLAG_ESCAPE != 0 {
-                    crate::bytes::set_be32(&mut data, 0, JBD2_MAGIC);
-                }
+                // the checksum covers the block as stored (still escaped)
                 if !tag_checksum_matches(&self.sb, t.seq, &data, tag.checksum) {
                     plan.bad_blocks += 1;
                     continue;
                 }
+                if tag.flags & JBD2_FLAG_ESCAPE != 0 {
+                    crate::bytes::set_be32(&mut data, 0, JBD2_MAGIC);
+                }
                 plan.blocks.insert(home, data);
             }
+        }
+        if plan.bad_blocks > 0 {
+            // Like the kernel (-EFSBADCRC): refuse to continue with a
+            // journal whose committed data is damaged; fsck must decide.
+            return Err(Error::Checksum(format!(
+                "{} journal data blocks failed their checksum",
+                plan.bad_blocks
+            )));
         }
         plan.transactions = committed.len() as u32;
         plan.next_sequence = seq.wrapping_add(1);

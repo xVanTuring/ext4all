@@ -403,3 +403,98 @@ proptest! {
         run_case(&["-t", "ext2"], &ops);
     }
 }
+
+/// Enumerations interrupted at random points while other entries are
+/// created and deleted: every entry that exists for the whole enumeration
+/// is returned exactly once (linear and htree directories).
+#[test]
+fn readdir_consistency_under_concurrent_changes() {
+    use std::collections::{BTreeMap, BTreeSet};
+    for (opts, seed) in [
+        (&["-t", "ext4", "-b", "1024"][..], 11u64),
+        (&["-t", "ext4", "-b", "4096"][..], 12),
+        (&["-t", "ext4", "-O", "^dir_index"][..], 13),
+    ] {
+        let img = Image::new(64, opts);
+        let mut fs = img.mount();
+        let d = fs.mkdir(2, b"d", 0o755, 0, 0).unwrap().ino;
+        let mut rng = seed | 1;
+        let mut next = |m: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % m
+        };
+        let mut live: BTreeSet<String> = BTreeSet::new();
+        let mut counter = 0u64;
+        for _ in 0..200 {
+            let n = format!("init-{counter:05}-{}", "x".repeat(next(30) as usize));
+            counter += 1;
+            fs.create(d, n.as_bytes(), FileType::Regular, 0o644, 0, 0, 0).unwrap();
+            live.insert(n);
+        }
+        for round in 0..30 {
+            let stable_candidates: BTreeSet<String> = live.clone();
+            let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+            let mut deleted_during: BTreeSet<String> = BTreeSet::new();
+            let mut cookie = 0u64;
+            loop {
+                let chunk = 1 + next(80) as usize;
+                let mut got = 0;
+                let mut last = cookie;
+                let mut done = true;
+                fs.read_dir(d, cookie, |e| {
+                    if got == chunk {
+                        done = false;
+                        return false;
+                    }
+                    got += 1;
+                    last = e.next_cookie;
+                    *seen.entry(String::from_utf8(e.name).unwrap()).or_default() += 1;
+                    true
+                })
+                .unwrap();
+                cookie = last;
+                if done {
+                    break;
+                }
+                // concurrent changes between chunks
+                for _ in 0..next(40) {
+                    // keep the directory between a few hundred and ~2500
+                    // entries so the image never runs out of inodes
+                    if (next(3) == 0 || live.len() > 2500) && !live.is_empty() {
+                        let victim = live.iter().nth(next(live.len() as u64) as usize).unwrap().clone();
+                        fs.unlink(d, victim.as_bytes()).unwrap();
+                        live.remove(&victim);
+                        deleted_during.insert(victim);
+                    } else {
+                        let n = format!("r{round}-{counter:05}-{}", "y".repeat(next(40) as usize));
+                        counter += 1;
+                        if let Err(e) = fs.create(d, n.as_bytes(), FileType::Regular, 0o644, 0, 0, 0) {
+                            let s = fs.statfs();
+                            panic!(
+                                "{opts:?} round {round}: create #{counter} failed: {e:?}; live {} free blocks {} free inodes {}",
+                                live.len(),
+                                s.free_blocks,
+                                s.free_files
+                            );
+                        }
+                        live.insert(n);
+                    }
+                }
+            }
+            for name in stable_candidates.difference(&deleted_during) {
+                assert_eq!(seen.get(name).copied().unwrap_or(0), 1, "round {round}: {name}");
+            }
+            for (name, c) in &seen {
+                assert!(
+                    *c <= 1 || name == "." || name == "..",
+                    "round {round}: {name} seen {c} times"
+                );
+            }
+        }
+        fs.check_htree(d).unwrap();
+        fs.unmount().unwrap();
+        img.assert_clean();
+    }
+}

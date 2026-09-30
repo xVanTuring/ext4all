@@ -233,6 +233,14 @@ impl Superblock {
         if self.blocks_count() <= self.first_data_block() as u64 {
             return Err(Error::corrupt("block count smaller than first data block"));
         }
+        // ext4 addresses at most 2^48 blocks; also keeps byte sizes in u64
+        if self.blocks_count() > 1 << 48 {
+            return Err(Error::corrupt("block count too large"));
+        }
+        let groups64 = (self.blocks_count() - self.first_data_block() as u64).div_ceil(self.blocks_per_group() as u64);
+        if groups64 > u32::MAX as u64 {
+            return Err(Error::corrupt("too many block groups"));
+        }
         let groups = self.group_count();
         if groups as u64 * self.inodes_per_group() as u64 != self.inodes_count() as u64 {
             return Err(Error::corrupt(format!(

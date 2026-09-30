@@ -382,3 +382,42 @@ fn damaged_file_system_writes_do_not_panic() {
     targeted_rw_fuzz(&["-t", "ext4", "-b", "1024"], 200..350);
     targeted_rw_fuzz(&["-t", "ext3", "-b", "1024"], 400..500);
 }
+
+/// Random values in random superblock fields (checksum kept valid) must
+/// be rejected or handled without panicking (debug build: overflow checks).
+#[test]
+fn random_superblock_fields() {
+    let base = populated_image(&["-t", "ext4", "-b", "4096"]);
+    let mut rng = Rng(0x5EED);
+    for case in 0..600 {
+        let mut img = base.clone();
+        for _ in 0..1 + rng.next(3) {
+            let field = (rng.next(0x3FC / 2) * 2) as usize; // 16-bit aligned
+            let width = if rng.next(2) == 0 { 2 } else { 4 };
+            if field + width > 0x3FC {
+                continue;
+            }
+            for b in 0..width {
+                img[1024 + field + b] = rng.next(256) as u8;
+            }
+        }
+        let mut sb = ext4_core::ondisk::superblock::Superblock {
+            raw: Box::new(img[1024..2048].try_into().unwrap()),
+        };
+        sb.update_checksum();
+        img[1024..2048].copy_from_slice(&sb.raw[..]);
+        with_timeout(format!("superblock case {case}"), move || {
+            let dev = Arc::new(MemDevice::from_vec(img));
+            if let Ok(mut fs) = Fs::mount(
+                dev,
+                MountOptions {
+                    read_only: true,
+                    strict_checksums: false,
+                    ..Default::default()
+                },
+            ) {
+                walk(&mut fs);
+            }
+        });
+    }
+}

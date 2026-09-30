@@ -150,8 +150,8 @@ impl Fs {
         let desc_size = sb.desc_size();
         let desc_per_block = bs / desc_size;
         let gdt_blocks = groups.div_ceil(desc_per_block);
-        let itb_per_group = (sb.inodes_per_group() * sb.inode_size() as u32).div_ceil(bs);
-        if sb.blocks_count() * bs as u64 > dev.size() {
+        let itb_per_group = (sb.inodes_per_group() as u64 * sb.inode_size() as u64).div_ceil(bs as u64) as u32;
+        if sb.blocks_count().checked_mul(bs as u64).is_none_or(|n| n > dev.size()) {
             return Err(Error::corrupt(format!(
                 "file system ({} blocks) larger than device ({} bytes)",
                 sb.blocks_count(),

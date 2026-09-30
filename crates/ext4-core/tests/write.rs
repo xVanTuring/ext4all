@@ -763,6 +763,33 @@ fn set_attr_fields() {
     assert!(out.contains("User: 70000"), "{out}");
 }
 
+/// Everything written must be readable before it is committed (the cache
+/// holds metadata, data goes straight to the device).
+#[test]
+fn uncommitted_changes_are_visible() {
+    let img = Image::new(32, &["-t", "ext4", "-b", "4096"]);
+    let mut fs = img.mount_opts(MountOptions {
+        commit_threshold: usize::MAX,
+        ..Default::default()
+    });
+    let root = fs.root();
+    let long = "t".repeat(3000);
+    let s = fs.symlink(root, b"slow", long.as_bytes(), 0, 0).unwrap().ino;
+    assert_eq!(fs.read_link(s).unwrap(), long.as_bytes());
+    let short = fs.symlink(root, b"fast", b"target", 0, 0).unwrap().ino;
+    assert_eq!(fs.read_link(short).unwrap(), b"target");
+    let d = fs.mkdir(root, b"dir", 0o755, 0, 0).unwrap().ino;
+    let f = mkfile(&mut fs, d, "f", &pattern(70_000, 1));
+    assert_eq!(read_all(&mut fs, f), pattern(70_000, 1));
+    fs.set_xattr(f, b"user.k", &pattern(700, 2), XattrSetMode::Any).unwrap();
+    assert_eq!(fs.get_xattr(f, b"user.k").unwrap(), pattern(700, 2));
+    assert_eq!(fs.lookup(d, b"f").unwrap(), f);
+    assert!(fs.has_pending_changes());
+    fs.unmount().unwrap();
+    img.assert_clean();
+    assert_eq!(img.debugfs_cat("/dir/f"), pattern(70_000, 1));
+}
+
 #[test]
 fn write_clears_setuid() {
     let img = Image::new(32, &["-t", "ext4"]);

@@ -278,10 +278,26 @@ impl Fs {
         if self.is_fast_symlink(&inode) {
             return Ok(inode.block_area()[..size].to_vec());
         }
-        let mut v = vec![0u8; size];
-        let n = self.read_inode_data(ino, &inode, 0, &mut v)?;
-        v.truncate(n);
-        Ok(v)
+        if inode.has_flag(flags::INLINE_DATA) {
+            let mut v = vec![0u8; size];
+            let n = self.read_inode_data(ino, &inode, 0, &mut v)?;
+            v.truncate(n);
+            return Ok(v);
+        }
+        // Slow symlink targets are metadata (written through the cache and
+        // the journal), so read them through the cache too.
+        if size > self.bs as usize {
+            return Err(Error::corrupt("symlink longer than a block"));
+        }
+        match self.map_block(ino, &inode, 0)? {
+            super::extent::Mapping::Mapped {
+                pblk, unwritten: false, ..
+            } => {
+                let b = self.cache.get(&*self.dev, pblk)?;
+                Ok(b[..size].to_vec())
+            }
+            _ => Err(Error::corrupt(format!("symlink {ino} has no data block"))),
+        }
     }
 
     /// Add a hard link to `ino` as `dir/name`.

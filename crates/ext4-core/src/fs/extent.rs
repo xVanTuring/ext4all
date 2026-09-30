@@ -143,7 +143,9 @@ impl Fs {
     }
 
     fn ext_read_node(&mut self, ino: Ino, inode: &Inode, blk: u64, depth: u16) -> Result<Node> {
-        if blk < self.sb.first_data_block() as u64 || blk >= self.sb.blocks_count() {
+        if ino != self.sb.journal_inum() {
+            self.check_meta_block("extent node", blk)?;
+        } else if blk < self.sb.first_data_block() as u64 || blk >= self.sb.blocks_count() {
             return Err(Error::corrupt(format!("inode {ino}: extent node at bad block {blk}")));
         }
         let data = self.cache.read(&*self.dev, blk)?;

@@ -19,11 +19,14 @@ impl Fs {
         } else {
             let per = bs / 4;
             let map = (12 + per + per * per + per * per * per) * bs;
-            // without huge_file, i_blocks (512-byte units) is 32 bits
+            // without huge_file, i_blocks (512-byte units, data plus
+            // indirect blocks) is 32 bits: indirect blocks add at most
+            // 1/(per-1) on top of the data blocks
             let blocks = if self.huge_file() {
                 u64::MAX
             } else {
-                (1u64 << 32) * 512 - 4 * bs
+                let total = ((1u64 << 32) - 1) / (bs / 512);
+                (total * (per - 1) / per).saturating_sub(4) * bs
             };
             map.min(blocks)
         }

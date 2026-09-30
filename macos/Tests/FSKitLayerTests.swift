@@ -12,6 +12,10 @@ final class FSKitLayerTests: XCTestCase {
         XCTAssertFalse(Ext4FileSystem.wantsReadOnly(["-o", "rw"]))
         XCTAssertFalse(Ext4FileSystem.wantsReadOnly(["-o"]))
         XCTAssertFalse(Ext4FileSystem.wantsReadOnly([]))
+        // the option FSKit itself passes for read-only loads
+        XCTAssertTrue(Ext4FileSystem.wantsReadOnly(["--rdonly"]))
+        XCTAssertTrue(Ext4FileSystem.wantsReadOnly(["-f", "--rdonly"]))
+        XCTAssertFalse(Ext4FileSystem.wantsReadOnly(["-f"]))
     }
 
     func testItemTypeMapping() {
@@ -137,11 +141,28 @@ final class FSKitLayerTests: XCTestCase {
             reclaimed.fulfill()
         }
         wait(for: [reclaimed], timeout: 5)
-        XCTAssertEqual(volume.items.count, 1)
+        // Outside the FSKit daemon the item was never handed to the kernel,
+        // so tryReclaim may decline; either way the table stays consistent.
+        XCTAssertLessThanOrEqual(volume.items.count, 2)
+
+        let checked = try volume.quickCheck()
+        XCTAssertTrue(checked.contains { $0.contains("ext4 volume \"vol\"") }, "\(checked)")
 
         let unmounted = expectation(description: "unmount")
         volume.unmount { unmounted.fulfill() }
         wait(for: [unmounted], timeout: 10)
+        // clean on disk right after unmount, before deactivation
+        try TestImage.assertClean(path)
+        // FSKit reclaims items after unmount: must still succeed
+        let late = volume.items.item(for: 2, parent: 2)
+        let lateReclaim = expectation(description: "late reclaim")
+        volume.reclaimItem(late) { error in
+            XCTAssertNil(error)
+            lateReclaim.fulfill()
+        }
+        wait(for: [lateReclaim], timeout: 5)
+        XCTAssertTrue(volume.mount.isCurrentlyReadOnly)
+        XCTAssertGreaterThan(volume.volumeStatistics.totalBlocks, 0)
         let deactivated = expectation(description: "deactivate")
         volume.deactivateVolume(options: []) { error in
             XCTAssertNil(error)

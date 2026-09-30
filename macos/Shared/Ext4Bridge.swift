@@ -85,6 +85,9 @@ public struct Ext4VolumeInfo: Equatable, Sendable {
     public var blocks: UInt64
     public var support: Support
     public var needsRecovery: Bool
+    public var hasJournal: Bool
+    /// 0 = ext2, 1 = ext3, 2 = ext4.
+    public var subtype: Int
 
     init(_ p: Ext4ProbeInfo) {
         var labelBytes = withUnsafeBytes(of: p.label) { Array($0) }
@@ -103,6 +106,8 @@ public struct Ext4VolumeInfo: Equatable, Sendable {
         default: support = .unsupported
         }
         needsRecovery = p.needs_recovery
+        hasJournal = p.has_journal
+        subtype = Int(p.subtype)
     }
 }
 
@@ -176,6 +181,23 @@ public final class Ext4Mount: @unchecked Sendable {
     /// Commit everything and mark the volume clean.
     public func unmount() throws {
         try ext4Check(ext4_unmount(handle))
+    }
+
+    /// Commit and mark clean, but keep the volume open read-only so late
+    /// reclaims and attribute requests still work (FSKit unmount).
+    public func finish() throws {
+        try ext4Check(ext4_finish(handle))
+    }
+
+    /// Make a finished volume writable again.
+    public func remount() throws {
+        try ext4Check(ext4_remount(handle))
+    }
+
+    /// Whether the volume currently refuses writes (read-only mount, a
+    /// failed commit, or after `finish`).
+    public var isCurrentlyReadOnly: Bool {
+        ext4_is_read_only(handle)
     }
 
     public func setLabel(_ label: String) throws {
@@ -322,6 +344,13 @@ public final class Ext4Mount: @unchecked Sendable {
 
     public func punchHole(_ ino: UInt32, offset: UInt64, length: UInt64) throws {
         try ext4Check(ext4_punch_hole(handle, ino, offset, length))
+    }
+
+    /// Byte offset past the last allocated block (physical end of file).
+    public func allocatedEnd(_ ino: UInt32) throws -> UInt64 {
+        var out: UInt64 = 0
+        try ext4Check(ext4_allocated_end(handle, ino, &out))
+        return out
     }
 
     /// SEEK_DATA (`data == true`) or SEEK_HOLE.

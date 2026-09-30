@@ -218,6 +218,10 @@ pub struct Ext4ProbeInfo {
     pub support: i32,
     /// Whether the journal needs recovery (volume was not cleanly unmounted).
     pub needs_recovery: bool,
+    /// Whether the file system has an internal journal.
+    pub has_journal: bool,
+    /// 0 = ext2, 1 = ext3, 2 = ext4 (by feature set).
+    pub subtype: u8,
 }
 
 impl Default for Ext4ProbeInfo {
@@ -229,6 +233,8 @@ impl Default for Ext4ProbeInfo {
             blocks: 0,
             support: EXT4_SUPPORT_UNSUPPORTED,
             needs_recovery: false,
+            has_journal: false,
+            subtype: 2,
         }
     }
 }

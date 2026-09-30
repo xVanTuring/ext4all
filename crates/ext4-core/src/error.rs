@@ -27,6 +27,7 @@ pub mod errno {
     pub const ERANGE: i32 = 34;
     pub const ENOTSUP: i32 = 45;
     pub const ELOOP: i32 = 62;
+    pub const ESTALE: i32 = 70;
     pub const ENAMETOOLONG: i32 = 63;
     pub const ENOTEMPTY: i32 = 66;
     pub const EFTYPE: i32 = 79;
@@ -77,6 +78,8 @@ pub enum Error {
     Busy,
     #[error("no data or hole past the given offset")]
     NoSuchOffset,
+    #[error("directory cookie no longer valid")]
+    StaleCookie,
 }
 
 impl Error {
@@ -116,6 +119,7 @@ impl Error {
             Error::NotPermitted => EPERM,
             Error::Busy => EBUSY,
             Error::NoSuchOffset => ENXIO,
+            Error::StaleCookie => ESTALE,
         }
     }
 }

@@ -19,9 +19,7 @@ impl Fs {
         };
         let blk = inode.file_acl();
         let block = if blk != 0 {
-            if blk >= self.sb.blocks_count() || blk < self.sb.first_data_block() as u64 {
-                return Err(Error::corrupt(format!("inode {ino}: xattr block {blk} out of range")));
-            }
+            self.check_meta_block(&format!("inode {ino}: xattr block"), blk)?;
             let data = self.cache.read(&*self.dev, blk)?;
             if self.sb.has_metadata_csum() && !xa::verify_block_csum(&data, self.csum_seed, blk) {
                 self.checksum_error(format!("xattr block {blk}"))?;

@@ -8,6 +8,10 @@ use crate::ondisk::dirent::{self as de, DX_NODE_ENTRIES_OFF, DX_ROOT_INFO_OFF, D
 use crate::ondisk::inode::{FileType, Inode, flags};
 use crate::ondisk::superblock::incompat;
 
+/// Marks directory cookies that are hash positions (htree directories)
+/// rather than byte offsets (linear directories).
+pub(crate) const HASH_COOKIE: u64 = 1 << 63;
+
 #[derive(Clone, Debug)]
 struct Frame {
     pblk: u64,
@@ -120,6 +124,114 @@ impl Fs {
             }
             f = self.dx_read_frame(ino, inode, child, false)?;
         }
+    }
+
+    /// Move to the next leaf in hash order. Returns false at the end.
+    fn dx_advance(&mut self, ino: Ino, inode: &Inode, frames: &mut [Frame]) -> Result<bool> {
+        let mut p = frames.len() - 1;
+        loop {
+            if frames[p].at + 1 < frames[p].count() {
+                frames[p].at += 1;
+                break;
+            }
+            if p == 0 {
+                return Ok(false);
+            }
+            p -= 1;
+        }
+        while p + 1 < frames.len() {
+            let child = frames[p].entry(frames[p].at).block as u64;
+            let mut f = self.dx_read_frame(ino, inode, child, false)?;
+            f.at = 0;
+            frames[p + 1] = f;
+            p += 1;
+        }
+        Ok(true)
+    }
+
+    /// Enumerate an htree directory in hash order with stable cookies:
+    /// `HASH_COOKIE | pos`, where pos 0 = ".", 1 = "..", and `key + 2` for
+    /// entries (key = major hash >> 1 << 32 | minor hash). Entries never
+    /// change their key, so splits and inserts cannot make an enumeration
+    /// skip or repeat unchanged entries.
+    pub(crate) fn dx_read_dir(
+        &mut self,
+        ino: Ino,
+        inode: &Inode,
+        cookie: u64,
+        f: &mut dyn FnMut(super::DirEntryInfo) -> bool,
+    ) -> Result<()> {
+        let pos = if cookie == 0 {
+            0
+        } else if cookie & HASH_COOKIE != 0 {
+            cookie & !HASH_COOKIE
+        } else {
+            return Err(Error::StaleCookie);
+        };
+        let root = self.dir_block(ino, inode, 0)?.1;
+        let (version, seed) = self.dx_hash_params(inode, &root)?;
+        let root_entries = self.block_entries(&root, super::dir::DirBlockKind::DxRoot)?;
+        for (i, d) in root_entries.iter().enumerate().take(2) {
+            if (i as u64) < pos || d.inode == 0 {
+                continue;
+            }
+            let info = super::DirEntryInfo {
+                name: d.name(&root).to_vec(),
+                ino: d.inode,
+                file_type: self.dirent_file_type(d.inode, d.file_type)?,
+                next_cookie: HASH_COOKIE | (i as u64 + 1),
+            };
+            if !f(info) {
+                return Ok(());
+            }
+        }
+        let start_key = pos.saturating_sub(2);
+        let key_of = |name: &[u8]| -> Result<u64> {
+            let h = dirhash(name, version, &seed).ok_or_else(|| Error::unsupported("hash"))?;
+            Ok((((h.major >> 1) as u64) << 32) | h.minor as u64)
+        };
+        let mut frames = self.dx_probe(ino, inode, ((start_key >> 32) as u32) << 1)?;
+        let bs = self.bs as usize;
+        let mut more = true;
+        while more {
+            // gather a leaf plus any leaves continuing its last hash
+            let mut batch: Vec<(u64, Vec<u8>, Ino, u8)> = Vec::new();
+            loop {
+                let b = frames.last().unwrap();
+                let leaf = b.entry(b.at).block as u64;
+                let (_, data) = self.dir_block(ino, inode, leaf)?;
+                for d in de::parse_block(&data, self.leaf_limit(&data), bs)? {
+                    if d.inode != 0 {
+                        let name = d.name(&data).to_vec();
+                        batch.push((key_of(&name)?, name, d.inode, d.file_type));
+                    }
+                }
+                more = self.dx_advance(ino, inode, &mut frames)?;
+                if !more {
+                    break;
+                }
+                let b = frames.last().unwrap();
+                if b.entry(b.at).hash & 1 == 0 {
+                    break;
+                }
+            }
+            batch.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            for (key, name, child, ft) in batch {
+                if key < start_key {
+                    continue;
+                }
+                let info = super::DirEntryInfo {
+                    name,
+                    ino: child,
+                    file_type: self.dirent_file_type(child, ft)?,
+                    next_cookie: HASH_COOKIE | (key + 3),
+                };
+                if !f(info) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Advance to the next leaf if it may contain entries with `hash`

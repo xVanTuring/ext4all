@@ -124,7 +124,21 @@ fn fill_probe(sb: &ext4_core::ondisk::superblock::Superblock) -> Ext4ProbeInfo {
     info.uuid = sb.uuid();
     info.block_size = sb.block_size();
     info.blocks = sb.blocks_count();
-    info.needs_recovery = sb.has_incompat(ext4_core::ondisk::superblock::incompat::RECOVER);
+    {
+        use ext4_core::ondisk::superblock::{compat, incompat, ro_compat};
+        info.needs_recovery = sb.has_incompat(incompat::RECOVER);
+        info.has_journal = sb.has_compat(compat::HAS_JOURNAL);
+        let ext4_only = incompat::EXTENTS | incompat::BIT64 | incompat::FLEX_BG | incompat::INLINE_DATA;
+        info.subtype = if sb.feature_incompat() & ext4_only != 0
+            || sb.has_ro_compat(ro_compat::HUGE_FILE | ro_compat::DIR_NLINK | ro_compat::METADATA_CSUM)
+        {
+            2
+        } else if info.has_journal {
+            1
+        } else {
+            0
+        };
+    }
     info.support = match ext4_core::features::check(sb) {
         ext4_core::features::Support::ReadWrite => EXT4_SUPPORT_READ_WRITE,
         ext4_core::features::Support::ReadOnly(_) => EXT4_SUPPORT_READ_ONLY,
@@ -203,6 +217,27 @@ pub unsafe extern "C" fn ext4_mount(
         unsafe { *out = Box::into_raw(h) };
         Ok(())
     })
+}
+
+/// Commit and mark the file system clean, keeping the volume open
+/// read-only (for FSKit's unmount, which is followed by reclaims).
+///
+/// # Safety
+/// `h` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_finish(h: *const Ext4Handle) -> i32 {
+    // SAFETY: caller contract
+    guard(|| unsafe { handle(h) }?.finish())
+}
+
+/// Make a volume closed with [`ext4_finish`] writable again.
+///
+/// # Safety
+/// `h` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_remount(h: *const Ext4Handle) -> i32 {
+    // SAFETY: caller contract
+    guard(|| unsafe { handle(h) }?.remount())
 }
 
 /// Flush everything and mark the file system clean. The handle stays
@@ -379,8 +414,14 @@ pub unsafe extern "C" fn ext4_readdir(
                     let attr = if want_attrs {
                         match fs.stat(e.ino) {
                             Ok(a) => Some(Ext4Attr::from(&a)),
-                            Err(Error::NotFound) => continue,
-                            Err(err) => return Err(err),
+                            Err(err) => {
+                                // one damaged inode must not make the whole
+                                // directory unlistable
+                                if !matches!(err, Error::NotFound) {
+                                    log::warn!("skipping entry with unreadable inode {}: {err}", e.ino);
+                                }
+                                continue;
+                            }
                         }
                     } else {
                         None
@@ -716,6 +757,25 @@ pub unsafe extern "C" fn ext4_fallocate(h: *const Ext4Handle, ino: u32, offset: 
 pub unsafe extern "C" fn ext4_punch_hole(h: *const Ext4Handle, ino: u32, offset: u64, len: u64) -> i32 {
     // SAFETY: caller contract
     guard(|| unsafe { handle(h) }?.with(|fs| fs.punch_hole(ino, offset, len)))
+}
+
+/// Byte offset just past the last allocated block of a file (its
+/// "physical end of file", including preallocated blocks past EOF).
+///
+/// # Safety
+/// `h` must be a live handle; `out` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_allocated_end(h: *const Ext4Handle, ino: u32, out: *mut u64) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        let end = unsafe { handle(h) }?.with(|fs| {
+            let bs = fs.block_size() as u64;
+            Ok(fs.file_extents(ino)?.last().map_or(0, |e| e.end() * bs))
+        })?;
+        // SAFETY: caller contract
+        unsafe { put(out, end) };
+        Ok(())
+    })
 }
 
 /// SEEK_DATA (`data = true`) / SEEK_HOLE from `offset`.

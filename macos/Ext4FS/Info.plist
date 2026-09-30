@@ -26,6 +26,11 @@
 			<key>shortOptions</key>
 			<string>o:r</string>
 		</dict>
+		<key>FSCheckOptionSyntax</key>
+		<dict>
+			<key>shortOptions</key>
+			<string>fnpqy</string>
+		</dict>
 		<key>FSPersonalities</key>
 		<dict>
 			<key>ext2</key>

@@ -8,19 +8,28 @@ final class Ext4Volume: FSVolume, @unchecked Sendable {
     let mount: Ext4Mount
     let items = ItemTable()
     let bsdName: String
+    let info: Ext4VolumeInfo
     private let capabilities: FSVolume.SupportedCapabilities
     private var blockSize: UInt64
+    /// Serializes handlers so that attributes and free space are sampled
+    /// and handed to FSKit in the same critical section as the operation
+    /// that produced them, and so reclaim can exclude lookups
+    /// (`FSItem.tryReclaim`).
+    let opLock = NSLock()
+    /// Set by `unmount`; a later `mount` makes the volume writable again.
+    private var finished = false
 
     init(mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String) {
         self.mount = mount
         self.bsdName = bsdName
+        self.info = info
         self.blockSize = UInt64(info.blockSize)
         let caps = FSVolume.SupportedCapabilities()
         caps.supportsPersistentObjectIDs = true
         caps.supportsSymbolicLinks = true
         caps.supportsHardLinks = true
-        caps.supportsJournal = true
-        caps.supportsActiveJournal = !mount.isReadOnly
+        caps.supportsJournal = info.hasJournal
+        caps.supportsActiveJournal = info.hasJournal && !mount.isReadOnly
         caps.supportsSparseFiles = true
         caps.supportsZeroRuns = true
         caps.supportsFastStatFS = true
@@ -39,12 +48,22 @@ final class Ext4Volume: FSVolume, @unchecked Sendable {
 
     // MARK: helpers
 
-    /// Run `body` and deliver its result (or error) to `reply`.
+    /// Run `body` under the volume lock and deliver its result (or error)
+    /// to `reply` after releasing the lock.
     @inline(__always)
     func run<T>(_ what: StaticString, _ reply: (T?, (any Error)?) -> Void, _ body: () throws -> T) {
+        let result: Result<T, any Error>
+        opLock.lock()
         do {
-            reply(try body(), nil)
+            result = .success(try body())
         } catch {
+            result = .failure(error)
+        }
+        opLock.unlock()
+        switch result {
+        case .success(let v):
+            reply(v, nil)
+        case .failure(let error):
             if (error as? POSIXError)?.code != .ENOENT {
                 Log.fs.debug("\(what): \(error.localizedDescription, privacy: .public)")
             }
@@ -66,10 +85,12 @@ final class Ext4Volume: FSVolume, @unchecked Sendable {
         FSItem.Attributes(try mount.stat(ino), parent: parent)
     }
 
+    /// Current free space; call with `opLock` held.
     func freeSpace() -> FSFreeSpace {
         guard let s = try? mount.statfs() else { return .noUpdate }
         let f = FSFreeSpace()
-        f.populate(bytes: s.avail_blocks * UInt64(s.block_size))
+        let (bytes, overflow) = s.avail_blocks.multipliedReportingOverflow(by: UInt64(s.block_size))
+        f.populate(bytes: overflow ? UInt64.max : bytes)
         return f
     }
 
@@ -85,22 +106,32 @@ extension Ext4Volume: FSVolume.Handler {
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities { capabilities }
 
     var volumeStatistics: FSStatFSResult {
-        let r = FSStatFSResult(fileSystemTypeName: "ext4")
-        guard let s = try? mount.statfs() else { return r }
-        let bs = UInt64(s.block_size)
+        let typeName = ["ext2", "ext3", "ext4"][min(max(info.subtype, 0), 2)]
+        let r = FSStatFSResult(fileSystemTypeName: typeName)
+        opLock.lock()
+        let stat = try? mount.statfs()
+        opLock.unlock()
+        guard let s = stat else { return r }
+        // saturating arithmetic: the values come from disk
+        func bytes(_ blocks: UInt64) -> UInt64 {
+            let (v, o) = blocks.multipliedReportingOverflow(by: UInt64(s.block_size))
+            return o ? UInt64.max : v
+        }
+        let free = min(s.free_blocks, s.blocks)
+        let avail = min(s.avail_blocks, free)
         r.blockSize = Int(s.block_size)
         r.ioSize = 1 << 20
         r.totalBlocks = s.blocks
-        r.freeBlocks = s.free_blocks
-        r.availableBlocks = s.avail_blocks
-        r.usedBlocks = s.blocks - s.free_blocks
-        r.totalBytes = s.blocks * bs
-        r.freeBytes = s.free_blocks * bs
-        r.availableBytes = s.avail_blocks * bs
-        r.usedBytes = (s.blocks - s.free_blocks) * bs
+        r.freeBlocks = free
+        r.availableBlocks = avail
+        r.usedBlocks = s.blocks - free
+        r.totalBytes = bytes(s.blocks)
+        r.freeBytes = bytes(free)
+        r.availableBytes = bytes(avail)
+        r.usedBytes = bytes(s.blocks - free)
         r.totalFiles = s.files
-        r.freeFiles = s.free_files
-        r.fileSystemSubType = 2
+        r.freeFiles = min(s.free_files, s.files)
+        r.fileSystemSubType = info.subtype
         return r
     }
 
@@ -110,7 +141,8 @@ extension Ext4Volume: FSVolume.Handler {
     var restrictsOwnershipChanges: Bool { true }
     var truncatesLongNames: Bool { false }
     var maximumXattrSize: Int { Int(blockSize) - 64 }
-    var maximumFileSize: UInt64 { (UInt64(1) << 32) * blockSize - 1 }
+    /// Logical blocks 0 ..< 2^32-1 with extents.
+    var maximumFileSize: UInt64 { ((UInt64(1) << 32) - 1) * blockSize }
 
     var enableOpenUnlinkEmulation: Bool { false }
 
@@ -131,28 +163,47 @@ extension Ext4Volume: FSVolume.Handler {
     func deactivateVolume(
         options: FSDeactivateOptions = [], replyHandler reply: @escaping @Sendable ((any Error)?) -> Void
     ) {
-        // normally unmount() already committed; this is a safety net
+        // unmount() already committed and marked the volume clean; release
+        // the engine and the device now (a safety net if unmount was skipped)
+        opLock.lock()
         do {
             try mount.unmount()
         } catch {
             Log.fs.error("deactivate: \(error.localizedDescription, privacy: .public)")
         }
         items.removeAll()
+        opLock.unlock()
         reply(nil)
     }
 
     func mount(options: FSTaskOptions, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void) {
+        opLock.lock()
+        if finished {
+            // mounted again after an unmount without re-activation
+            do {
+                try mount.remount()
+            } catch {
+                Log.fs.error("remount: \(error.localizedDescription, privacy: .public)")
+            }
+            finished = false
+        }
+        opLock.unlock()
         Log.fs.info("mount \(self.bsdName, privacy: .public)")
         reply(nil)
     }
 
     func unmount(replyHandler reply: @escaping @Sendable () -> Void) {
+        // FSKit reclaims all items after unmount, so keep the engine open
+        // (read-only) until deactivation.
+        opLock.lock()
         do {
-            try mount.unmount()
+            try mount.finish()
             Log.fs.info("unmounted \(self.bsdName, privacy: .public) cleanly")
         } catch {
             Log.fs.error("unmount \(self.bsdName, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
+        finished = true
+        opLock.unlock()
         reply()
     }
 
@@ -190,13 +241,24 @@ extension Ext4Volume: FSVolume.Handler {
             reply(nil)
             return
         }
-        items.remove(it.ino)
-        do {
-            try mount.reclaim(it.ino)
+        var failure: (any Error)?
+        // Under the volume lock no lookup can hand this item out while
+        // FSKit decides whether it is really unreferenced.
+        opLock.lock()
+        let reclaimed = it.tryReclaim { [self] in
+            items.remove(it)
+            do {
+                try mount.reclaim(it.ino)
+            } catch {
+                failure = error
+            }
+        }
+        opLock.unlock()
+        if reclaimed, let failure {
+            Log.fs.error("reclaim \(it.ino): \(failure.localizedDescription, privacy: .public)")
+            reply(failure)
+        } else {
             reply(nil)
-        } catch {
-            Log.fs.error("reclaim \(it.ino): \(error.localizedDescription, privacy: .public)")
-            reply(error)
         }
     }
 
@@ -403,14 +465,20 @@ extension Ext4Volume: FSVolume.Handler {
             let dir = try ino(directory)
             let version = try mount.stat(dir).directoryVersion
             let wantAttrs = attributes != nil
-            try mount.readDir(dir, cookie: cookie.rawValue, skipDots: wantAttrs, wantAttrs: wantAttrs) { e in
-                let attrs = e.attr.map { FSItem.Attributes($0, parent: dir) }
-                return packer.packEntry(
-                    name: FSFileName(data: e.name),
-                    itemType: FSItem.ItemType(ext4Type: e.fileType),
-                    itemID: FSItem.Identifier(rawValue: UInt64(e.ino)) ?? .invalid,
-                    nextCookie: FSDirectoryCookie(e.nextCookie),
-                    attributes: attrs)
+            do {
+                try mount.readDir(dir, cookie: cookie.rawValue, skipDots: wantAttrs, wantAttrs: wantAttrs) { e in
+                    let attrs = e.attr.map { FSItem.Attributes($0, parent: dir) }
+                    return packer.packEntry(
+                        name: FSFileName(data: e.name),
+                        itemType: FSItem.ItemType(ext4Type: e.fileType),
+                        itemID: FSItem.Identifier(rawValue: UInt64(e.ino)) ?? .invalid,
+                        nextCookie: FSDirectoryCookie(e.nextCookie),
+                        attributes: attrs)
+                }
+            } catch let e as POSIXError where e.code == .ESTALE {
+                // the directory changed format (became an htree) since the
+                // cookie was handed out: the enumeration must restart
+                throw FSError(.invalidDirectoryCookie)
             }
             return try Self.unwrap(FSEnumerateDirectoryResult(verifier: version))
         }
@@ -525,21 +593,64 @@ extension Ext4Volume: FSVolume.RenameHandler {
 }
 
 extension Ext4Volume: FSVolume.PreallocateHandler {
+    /// Block-mapped (ext2/ext3) volumes cannot express preallocated blocks.
+    var isPreallocateInhibited: Bool { info.subtype < 2 }
+
     func preallocateSpace(
         for item: FSItem, at offset: off_t, length: Int, flags: FSVolume.PreallocateFlags, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSPreallocateResult?, (any Error)?) -> Void
     ) {
         run("preallocate", reply) {
             let i = try ino(item)
-            var start = UInt64(max(offset, 0))
-            if flags.contains(.fromEOF) {
-                start += try mount.stat(i).size
+            guard length > 0 else {
+                return try Self.unwrap(
+                    FSPreallocateResult(bytesAllocated: 0, itemAttributes: try attributes(item), freeSpace: .noUpdate))
             }
+            // F_PREALLOCATE semantics: FSKit always sets `.fromEOF` and the
+            // offset is ignored; space is added after the physical end of
+            // the file (its allocated size), without changing its size.
+            let before = try mount.stat(i)
+            let logicalEnd = (before.size + blockSize - 1) / blockSize * blockSize
+            let start = max(try mount.allocatedEnd(i), logicalEnd)
             try mount.fallocate(i, offset: start, length: UInt64(length), keepSize: true)
+            let after = try mount.stat(i)
+            let allocated = Int(clamping: after.allocated &- before.allocated)
             return try Self.unwrap(
                 FSPreallocateResult(
-                    bytesAllocated: length, itemAttributes: try attributes(item), freeSpace: freeSpace()))
+                    bytesAllocated: allocated, itemAttributes: FSItem.Attributes(after, parent: parentOf(item)),
+                    freeSpace: freeSpace()))
         }
+    }
+}
+
+extension Ext4Volume {
+    func parentOf(_ item: FSItem) -> UInt32 {
+        (item as? Ext4Item)?.parentIno ?? Ext4Mount.rootIno
+    }
+
+    /// Consistency check run before mounting: the journal has already been
+    /// replayed and orphans processed by the engine at load; verify the
+    /// volume is readable and summarize it.
+    func quickCheck() throws -> [String] {
+        opLock.lock()
+        defer { opLock.unlock() }
+        let v = try mount.volumeInfo()
+        guard v.support != .unsupported else { throw POSIXError(.ENOTSUP) }
+        let s = try mount.statfs()
+        let root = try mount.stat(Ext4Mount.rootIno)
+        guard root.isDirectory else { throw POSIXError(.EIO) }
+        var entries = 0
+        try mount.readDir(Ext4Mount.rootIno, cookie: 0, skipDots: true, wantAttrs: false) { _ in
+            entries += 1
+            return entries < 100_000
+        }
+        let kind = ["ext2", "ext3", "ext4"][min(max(v.subtype, 0), 2)]
+        return [
+            "\(kind) volume \"\(v.label)\" \(v.uuid.uuidString)",
+            "\(s.blocks) blocks of \(s.block_size) bytes, \(s.free_blocks) free; \(s.files) inodes, \(s.free_files) free",
+            "root directory readable (\(entries) entries)",
+            mount.isReadOnly ? "mounting read-only" : "mounting read-write",
+        ]
     }
 }
 

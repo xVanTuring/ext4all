@@ -17,6 +17,7 @@ mod orphan;
 pub mod overlay;
 pub mod types;
 mod xattr;
+mod zone;
 
 #[cfg(test)]
 mod tests;
@@ -67,6 +68,8 @@ pub struct Fs {
     /// Set after a failed commit: the volume is switched to read-only and
     /// the journal is left for recovery at the next mount.
     pub(crate) aborted: bool,
+    /// Metadata blocks that file mappings may never touch.
+    pub(crate) zone: zone::SystemZone,
     pub(crate) cache: BlockCache,
     pub(crate) bs: u32,
     pub(crate) csum_seed: u32,
@@ -135,6 +138,7 @@ impl Fs {
         if fs.sb.has_compat(compat::HAS_JOURNAL) {
             fs.load_journal()?;
         }
+        fs.build_system_zone();
         if !fs.read_only {
             // needs_recovery must be durable before the first transaction
             fs.mark_mounted()?;
@@ -171,6 +175,7 @@ impl Fs {
             savepoint: None,
             op_depth: 0,
             aborted: false,
+            zone: zone::SystemZone::default(),
             cache: BlockCache::new(bs as usize, opts.cache_blocks),
             bs,
             read_only,
@@ -187,7 +192,35 @@ impl Fs {
             checksum_errors: 0,
         };
         fs.load_group_descs()?;
+        fs.recount_free()?;
         Ok(fs)
+    }
+
+    /// The superblock's free counters are only hints (Linux recomputes
+    /// them from the group descriptors at mount); do the same.
+    fn recount_free(&mut self) -> Result<()> {
+        let mut blocks = 0u64;
+        let mut inodes = 0u64;
+        for (g, gd) in self.groups.iter().enumerate() {
+            let fb = gd.free_blocks_count() as u64;
+            let fi = gd.free_inodes_count() as u64;
+            if fb > self.blocks_in_group(g as u32) as u64 || fi > self.sb.inodes_per_group() as u64 {
+                return Err(Error::corrupt(format!("group {g}: free counts exceed group size")));
+            }
+            blocks += fb;
+            inodes += fi;
+        }
+        if blocks != self.sb.free_blocks_count() || inodes != self.sb.free_inodes_count() as u64 {
+            log::info!(
+                "superblock free counts ({}, {}) differ from groups ({blocks}, {inodes}); using the groups",
+                self.sb.free_blocks_count(),
+                self.sb.free_inodes_count()
+            );
+            self.sb.set_free_blocks_count(blocks);
+            self.sb.set_free_inodes_count(inodes as u32);
+            self.dirty_super();
+        }
+        Ok(())
     }
 
     fn load_group_descs(&mut self) -> Result<()> {
@@ -414,7 +447,8 @@ impl Fs {
         let sb = Self::probe(&*self.dev)?;
         self.csum_seed = sb.csum_seed();
         self.sb = sb;
-        self.load_group_descs()
+        self.load_group_descs()?;
+        self.recount_free()
     }
 
     /// Record on disk that the file system is mounted read-write.
@@ -485,17 +519,7 @@ impl Fs {
     pub(crate) fn op<T>(&mut self, f: impl FnOnce(&mut Fs) -> Result<T>) -> Result<T> {
         self.op_depth += 1;
         if self.op_depth == 1 && !self.read_only {
-            self.savepoint = Some(Savepoint {
-                sb: self.sb.raw.clone(),
-                sb_dirty: self.sb_dirty,
-                groups: HashMap::new(),
-                dirty_groups: self.dirty_groups.clone(),
-                bitmaps_dirty: self.bitmaps_dirty.clone(),
-                deferred_len: self.deferred_free.len(),
-                open_orphans: self.open_orphans.clone(),
-                last_dir_group: self.last_dir_group,
-            });
-            self.cache.begin_undo();
+            self.start_savepoint();
         }
         let r = f(self);
         self.op_depth -= 1;
@@ -514,6 +538,20 @@ impl Fs {
             }
         }
         r
+    }
+
+    fn start_savepoint(&mut self) {
+        self.savepoint = Some(Savepoint {
+            sb: self.sb.raw.clone(),
+            sb_dirty: self.sb_dirty,
+            groups: HashMap::new(),
+            dirty_groups: self.dirty_groups.clone(),
+            bitmaps_dirty: self.bitmaps_dirty.clone(),
+            deferred_len: self.deferred_free.len(),
+            open_orphans: self.open_orphans.clone(),
+            last_dir_group: self.last_dir_group,
+        });
+        self.cache.begin_undo();
     }
 
     fn rollback_op(&mut self) {
@@ -591,6 +629,10 @@ impl Fs {
             log::error!("commit failed, volume is now read-only: {e}");
             self.aborted = true;
             self.read_only = true;
+        } else if self.op_depth > 0 {
+            // committed in the middle of an operation (e.g. to reclaim
+            // pending frees): the rest of it must still be undoable
+            self.start_savepoint();
         }
         r
     }
@@ -668,6 +710,23 @@ impl Fs {
         self.unmount_in_place()
     }
 
+    /// Make a volume that was unmounted in place writable again (FSKit may
+    /// mount a volume again without re-activating it).
+    pub fn remount_rw(&mut self) -> Result<()> {
+        if !self.read_only {
+            return Ok(());
+        }
+        if self.aborted || self.opts.read_only || self.dev.is_read_only() || !self.report.read_only_reasons.is_empty() {
+            return Err(Error::ReadOnly);
+        }
+        self.read_only = false;
+        if let Err(e) = self.mark_mounted() {
+            self.read_only = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     pub fn unmount_in_place(&mut self) -> Result<()> {
         if self.aborted {
             // leave needs_recovery set: the journal may hold a transaction
@@ -694,17 +753,18 @@ impl Fs {
     }
 
     pub fn statfs(&self) -> StatFs {
-        let free = self.sb.free_blocks_count();
+        let blocks = self.sb.blocks_count();
         let pending: u64 = self.deferred_free.iter().map(|&(_, n)| n).sum();
-        let free = free + pending;
+        let free = self.sb.free_blocks_count().saturating_add(pending).min(blocks);
         let reserved = self.sb.r_blocks_count();
+        let files = self.sb.inodes_count() as u64;
         StatFs {
             block_size: self.bs,
-            blocks: self.sb.blocks_count(),
+            blocks,
             free_blocks: free,
             avail_blocks: free.saturating_sub(reserved),
-            files: self.sb.inodes_count() as u64,
-            free_files: self.sb.free_inodes_count() as u64,
+            files,
+            free_files: (self.sb.free_inodes_count() as u64).min(files),
             name_max: 255,
         }
     }
@@ -739,6 +799,13 @@ impl Fs {
 
     pub fn journal_commits(&self) -> u64 {
         self.journal.as_ref().map_or(0, |j| j.commits)
+    }
+
+    /// Drop the mount without writing anything (after an internal error):
+    /// the on-disk state, including needs_recovery, is left as is.
+    pub fn abandon(mut self) {
+        self.read_only = true;
+        self.mounted_rw = false;
     }
 }
 

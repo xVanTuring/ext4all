@@ -46,6 +46,16 @@ final class ItemTable: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Remove `item` only if it is still the live object for its inode (a
+    /// newer lookup may already have replaced it).
+    func remove(_ item: Ext4Item) {
+        lock.lock()
+        if items[item.ino] === item {
+            items.removeValue(forKey: item.ino)
+        }
+        lock.unlock()
+    }
+
     func removeAll() {
         lock.lock()
         items.removeAll()

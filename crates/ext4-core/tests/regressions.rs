@@ -370,3 +370,169 @@ fn large_unlink_with_tiny_journal_is_consistent() {
     clean(&img, "after oversized transaction");
     assert!(img.dumpe2fs().contains("Filesystem state:         clean"));
 }
+
+fn collect_from(fs: &mut Fs, dir: u32, cookie: u64, limit: usize) -> (Vec<Vec<u8>>, u64) {
+    let mut names = Vec::new();
+    let mut last = cookie;
+    fs.read_dir(dir, cookie, |e| {
+        if names.len() >= limit {
+            return false;
+        }
+        last = e.next_cookie;
+        names.push(e.name);
+        true
+    })
+    .unwrap();
+    (names, last)
+}
+
+/// Unchanged entries are returned exactly once even when htree leaves
+/// split while a directory is being enumerated.
+#[test]
+fn readdir_stable_across_htree_splits() {
+    let img = Image::new(64, &["-t", "ext4", "-b", "1024"]);
+    let mut fs = img.mount();
+    let d = fs.mkdir(2, b"d", 0o755, 0, 0).unwrap().ino;
+    let orig: Vec<Vec<u8>> = (0..300)
+        .map(|i| format!("original-entry-{i:04}").into_bytes())
+        .collect();
+    for n in &orig {
+        fs.create(d, n, FileType::Regular, 0o644, 0, 0, 0).unwrap();
+    }
+    for stop in [1usize, 50, 100, 250] {
+        let (mut seen, cookie) = collect_from(&mut fs, d, 0, stop);
+        // another client adds many entries, splitting leaves
+        for i in 0..200 {
+            fs.create(
+                d,
+                format!("new-{stop}-{i:04}").as_bytes(),
+                FileType::Regular,
+                0o644,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        let (rest, _) = collect_from(&mut fs, d, cookie, usize::MAX);
+        seen.extend(rest);
+        for n in &orig {
+            let c = seen.iter().filter(|s| *s == n).count();
+            assert_eq!(c, 1, "stop {stop}: {} seen {c} times", String::from_utf8_lossy(n));
+        }
+        let mut sorted = seen.clone();
+        sorted.sort();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "stop {stop}: duplicates");
+    }
+    // complete listing equals the directory contents
+    let all = fs.list_dir(d).unwrap();
+    assert_eq!(all.len(), 2 + 300 + 4 * 200);
+    fs.unmount().unwrap();
+    clean(&img, "readdir stability");
+}
+
+/// A byte-offset cookie from before a directory became an htree is
+/// reported as stale instead of producing skips or duplicates.
+#[test]
+fn stale_linear_cookie_after_conversion() {
+    let img = Image::new(32, &["-t", "ext4", "-b", "1024"]);
+    let mut fs = img.mount();
+    let d = fs.mkdir(2, b"d", 0o755, 0, 0).unwrap().ino;
+    for i in 0..5 {
+        fs.create(d, format!("f{i}").as_bytes(), FileType::Regular, 0o644, 0, 0, 0)
+            .unwrap();
+    }
+    let (_, cookie) = collect_from(&mut fs, d, 0, 4);
+    assert!(cookie < 1 << 63);
+    for i in 0..200 {
+        fs.create(
+            d,
+            format!("grow-{i:04}-padding-padding").as_bytes(),
+            FileType::Regular,
+            0o644,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+    }
+    let r = fs.read_dir(d, cookie, |_| true);
+    assert!(matches!(r, Err(Error::StaleCookie)), "{r:?}");
+    assert_eq!(Error::StaleCookie.errno(), 70);
+    fs.unmount().unwrap();
+}
+
+/// Superblock free counts are recomputed from the group descriptors.
+#[test]
+fn bogus_superblock_free_count_is_recomputed() {
+    let img = Image::new(8, &["-t", "ext4"]);
+    img.debugfs_w(&["ssv free_blocks_count 9999999999", "ssv free_inodes_count 999999"]);
+    let fs = img.mount_opts(MountOptions {
+        read_only: true,
+        ..Default::default()
+    });
+    let s = fs.statfs();
+    assert!(s.free_blocks <= s.blocks && s.free_files <= s.files, "{s:?}");
+    drop(fs);
+    let fs = img.mount();
+    fs.unmount().unwrap();
+    clean(&img, "recomputed counts written back");
+}
+
+/// Block pointers into metadata are rejected instead of being written to
+/// or freed.
+#[test]
+fn pointers_into_metadata_are_refused() {
+    for (fsopts, name) in [
+        (&["-t", "ext3", "-b", "1024"][..], "ext3"),
+        (&["-t", "ext4", "-b", "1024"][..], "ext4"),
+    ] {
+        let img = Image::new(16, fsopts);
+        let data = img.dir.path().join("data");
+        std::fs::write(&data, pattern(3000, 1)).unwrap();
+        img.debugfs_w(&[&format!("write {} victim", data.display())]);
+        let out = img.debugfs(&["stat /victim"]);
+        let ino: u32 = out
+            .split("Inode: ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        if name == "ext3" {
+            // direct pointer 0 -> group descriptor block
+            img.debugfs_w(&[&format!("sif <{ino}> block[0] 2")]);
+        } else {
+            // first extent -> group descriptor block (i_block[3..] holds
+            // the extent: ee_block, ee_len|hi, ee_start_lo)
+            img.debugfs_w(&[&format!("sif <{ino}> block[5] 2")]);
+        }
+        let before = std::fs::read(&img.path).unwrap();
+        {
+            let mut fs = img.mount_opts(MountOptions {
+                strict_checksums: false,
+                ..Default::default()
+            });
+            let f = fs.lookup(2, b"victim").unwrap();
+            let mut b = vec![0u8; 100];
+            assert!(matches!(fs.read(f, 0, &mut b), Err(Error::Corrupt(_))), "{name}: read");
+            assert!(
+                matches!(fs.write(f, 0, b"overwrite"), Err(Error::Corrupt(_))),
+                "{name}: write"
+            );
+            assert!(matches!(fs.truncate(f, 0), Err(Error::Corrupt(_))), "{name}: truncate");
+            assert!(
+                fs.unlink(2, b"victim").is_err(),
+                "{name}: unlink must not free metadata"
+            );
+            fs.unmount().unwrap();
+        }
+        // the group descriptor block itself was never touched
+        let after = std::fs::read(&img.path).unwrap();
+        assert_eq!(&before[2048..3072], &after[2048..3072], "{name}: GDT modified");
+    }
+}

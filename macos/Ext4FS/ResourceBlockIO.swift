@@ -16,19 +16,30 @@ final class ResourceBlockIO: BlockIO, @unchecked Sendable {
     }
 
     func read(at offset: UInt64, into buffer: UnsafeMutableRawBufferPointer) throws {
-        let n = try resource.read(into: buffer, startingAt: off_t(offset), length: buffer.count)
-        if n != buffer.count {
-            Log.fs.error("short read at \(offset): \(n) of \(buffer.count)")
-            throw POSIXError(.EIO)
+        // transfers may be partial: continue until done
+        var done = 0
+        while done < buffer.count {
+            let rest = UnsafeMutableRawBufferPointer(rebasing: buffer[done...])
+            let n = try resource.read(into: rest, startingAt: off_t(offset) + off_t(done), length: rest.count)
+            if n <= 0 {
+                Log.fs.error("read at \(offset + UInt64(done)) returned \(n) of \(rest.count)")
+                throw POSIXError(.EIO)
+            }
+            done += n
         }
     }
 
     func write(at offset: UInt64, from buffer: UnsafeRawBufferPointer) throws {
         if isReadOnly { throw POSIXError(.EROFS) }
-        let n = try resource.write(from: buffer, startingAt: off_t(offset), length: buffer.count)
-        if n != buffer.count {
-            Log.fs.error("short write at \(offset): \(n) of \(buffer.count)")
-            throw POSIXError(.EIO)
+        var done = 0
+        while done < buffer.count {
+            let rest = UnsafeRawBufferPointer(rebasing: buffer[done...])
+            let n = try resource.write(from: rest, startingAt: off_t(offset) + off_t(done), length: rest.count)
+            if n <= 0 {
+                Log.fs.error("write at \(offset + UInt64(done)) returned \(n) of \(rest.count)")
+                throw POSIXError(.EIO)
+            }
+            done += n
         }
     }
 

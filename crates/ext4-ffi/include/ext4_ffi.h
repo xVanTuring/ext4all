@@ -124,6 +124,14 @@ typedef struct Ext4ProbeInfo {
    * Whether the journal needs recovery (volume was not cleanly unmounted).
    */
   bool needs_recovery;
+  /**
+   * Whether the file system has an internal journal.
+   */
+  bool has_journal;
+  /**
+   * 0 = ext2, 1 = ext3, 2 = ext4 (by feature set).
+   */
+  uint8_t subtype;
 } Ext4ProbeInfo;
 
 typedef struct Ext4MountOptions {
@@ -265,6 +273,23 @@ int32_t ext4_probe(const struct Ext4DeviceOps *ops, struct Ext4ProbeInfo *out);
 int32_t ext4_mount(const struct Ext4DeviceOps *ops,
                    const struct Ext4MountOptions *opts,
                    struct Ext4Handle **out);
+
+/**
+ * Commit and mark the file system clean, keeping the volume open
+ * read-only (for FSKit's unmount, which is followed by reclaims).
+ *
+ * # Safety
+ * `h` must be a live handle.
+ */
+int32_t ext4_finish(const struct Ext4Handle *h);
+
+/**
+ * Make a volume closed with [`ext4_finish`] writable again.
+ *
+ * # Safety
+ * `h` must be a live handle.
+ */
+int32_t ext4_remount(const struct Ext4Handle *h);
 
 /**
  * Flush everything and mark the file system clean. The handle stays
@@ -485,6 +510,15 @@ int32_t ext4_fallocate(const struct Ext4Handle *h,
  * `h` must be a live handle.
  */
 int32_t ext4_punch_hole(const struct Ext4Handle *h, uint32_t ino, uint64_t offset, uint64_t len);
+
+/**
+ * Byte offset just past the last allocated block of a file (its
+ * "physical end of file", including preallocated blocks past EOF).
+ *
+ * # Safety
+ * `h` must be a live handle; `out` valid for writes.
+ */
+int32_t ext4_allocated_end(const struct Ext4Handle *h, uint32_t ino, uint64_t *out);
 
 /**
  * SEEK_DATA (`data = true`) / SEEK_HOLE from `offset`.

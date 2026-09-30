@@ -1,8 +1,25 @@
 import FSKit
 import Foundation
 
+/// A value guarded by a lock.
+final class Locked<T>: @unchecked Sendable {
+    private var value: T
+    private let lock = NSLock()
+    init(_ value: T) { self.value = value }
+    func withLock<R>(_ body: (inout T) throws -> R) rethrows -> R {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body(&value)
+    }
+}
+
 /// The FSKit module: probes block devices for ext2/3/4 and loads volumes.
-final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
+final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSManageableResourceMaintenanceOperations,
+    @unchecked Sendable
+{
+    /// The volume created by `loadResource` (a unary file system has one).
+    let loaded = Locked<Ext4Volume?>(nil)
+
     override init() {
         _ = Log.installEngineLogger
         super.init()
@@ -49,6 +66,7 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             let mount = try Ext4Mount(io, readOnly: readOnly)
             let info = try mount.volumeInfo()
             let volume = Ext4Volume(mount: mount, info: info, bsdName: device.bsdName)
+            loaded.withLock { $0 = volume }
             containerStatus = .ready
             Log.fs.info(
                 "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)"
@@ -65,6 +83,7 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
     func unloadResource(
         resource: FSResource, options: FSTaskOptions, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void
     ) {
+        loaded.withLock { $0 = nil }
         containerStatus = .notReady(status: POSIXError(.ENODEV))
         reply(nil)
     }
@@ -73,14 +92,45 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         Log.fs.debug("didFinishLoading")
     }
 
-    /// `mount -r`, `-o ro` / `-o rdonly` request a read-only mount.
+    // MARK: maintenance (the system checks block device volumes before
+    // mounting them)
+
+    func startCheck(task: FSTask, options: FSTaskOptions) throws -> Progress {
+        let progress = Progress(totalUnitCount: 1)
+        let volume = loaded.withLock { $0 }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var failure: (any Error)?
+            if let volume {
+                do {
+                    for line in try volume.quickCheck() {
+                        task.logMessage(line)
+                    }
+                } catch {
+                    task.logMessage("ext4: check failed: \(error.localizedDescription)")
+                    failure = error
+                }
+            } else {
+                task.logMessage("ext4: no volume loaded")
+            }
+            progress.completedUnitCount = 1
+            task.didComplete(error: failure)
+        }
+        return progress
+    }
+
+    func startFormat(task: FSTask, options: FSTaskOptions) throws -> Progress {
+        throw fs_errorForPOSIXError(ENOTSUP)
+    }
+
+    /// FSKit passes `--rdonly` for read-only loads; `mount -r` and
+    /// `-o ro` / `-o rdonly` are accepted as well.
     static func wantsReadOnly(_ options: FSTaskOptions) -> Bool {
         wantsReadOnly(options.taskOptions)
     }
 
     static func wantsReadOnly(_ opts: [String]) -> Bool {
         for (i, o) in opts.enumerated() {
-            if o == "-r" || o == "--read-only" { return true }
+            if o == "--rdonly" || o == "-r" || o == "--read-only" { return true }
             if o == "-o", i + 1 < opts.count {
                 let parts = opts[i + 1].split(separator: ",")
                 if parts.contains("ro") || parts.contains("rdonly") { return true }

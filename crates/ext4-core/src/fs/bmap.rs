@@ -16,17 +16,24 @@ impl Fs {
         if lblk >= 1 << 32 {
             return Ok(Mapping::Hole { len: u64::MAX });
         }
-        if inode.has_flag(flags::EXTENTS) {
-            self.ext_map(ino, inode, lblk as u32)
+        let m = if inode.has_flag(flags::EXTENTS) {
+            self.ext_map(ino, inode, lblk as u32)?
         } else {
-            self.ind_map(inode, lblk)
+            self.ind_map(inode, lblk)?
+        };
+        if let Mapping::Mapped { pblk, len, .. } = m {
+            if pblk.checked_add(len).is_none_or(|e| e > self.sb.blocks_count()) {
+                return Err(Error::corrupt(format!(
+                    "inode {ino}: block {pblk}+{len} beyond the device"
+                )));
+            }
+            self.check_data_blocks(ino, pblk, len)?;
         }
+        Ok(m)
     }
 
     pub(crate) fn ind_ptr(&mut self, blk: u64, i: u64) -> Result<u32> {
-        if blk >= self.sb.blocks_count() {
-            return Err(Error::corrupt(format!("indirect block {blk} out of range")));
-        }
+        self.check_meta_block("indirect block", blk)?;
         let b = self.cache.get(&*self.dev, blk)?;
         Ok(le32(b, (i * 4) as usize))
     }

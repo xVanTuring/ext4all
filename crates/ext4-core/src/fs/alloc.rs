@@ -197,6 +197,12 @@ impl Fs {
                     }
                     self.adjust_free_blocks(g, -(len as i64));
                     let start = self.group_first_block(g) + bit as u64;
+                    if self.zone.overlaps(start, len as u64) {
+                        // the bitmap claims metadata is free: it is corrupt
+                        return Err(Error::corrupt(format!(
+                            "block bitmap of group {g} marks metadata blocks {start}+{len} free"
+                        )));
+                    }
                     // a freshly allocated block must not carry stale cache
                     for b in start..start + len as u64 {
                         self.cache.forget(b);
@@ -236,8 +242,13 @@ impl Fs {
             return Ok(());
         }
         let first = self.sb.first_data_block() as u64;
-        if start < first || start + count > self.sb.blocks_count() {
+        if start < first || start.checked_add(count).is_none_or(|e| e > self.sb.blocks_count()) {
             return Err(Error::corrupt(format!("freeing blocks {start}+{count} out of range")));
+        }
+        if self.zone.overlaps(start, count) {
+            return Err(Error::corrupt(format!(
+                "refusing to free metadata blocks {start}+{count}"
+            )));
         }
         for b in start..start + count {
             self.cache.forget(b);

@@ -48,8 +48,10 @@ impl Ext4Handle {
         }
     }
 
+    /// Current state (a failed commit or `finish` makes a volume
+    /// read-only).
     pub fn is_read_only(&self) -> bool {
-        self.read_only
+        self.read_only || self.with(|fs| Ok(fs.is_read_only())).unwrap_or(true)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Option<Fs>>> {
@@ -85,6 +87,17 @@ impl Ext4Handle {
         }
     }
 
+    /// Commit and mark the file system clean but keep it open (read-only)
+    /// so late reclaims and attribute requests still succeed.
+    pub fn finish(&self) -> Result<()> {
+        self.with(|fs| fs.unmount_in_place())
+    }
+
+    /// Undo [`Ext4Handle::finish`] when the volume is mounted again.
+    pub fn remount(&self) -> Result<()> {
+        self.with(|fs| fs.remount_rw())
+    }
+
     /// Commit, restore the clean on-disk state and release the device.
     pub fn unmount(&self) -> Result<()> {
         self.stop_committer();
@@ -94,7 +107,7 @@ impl Ext4Handle {
         };
         if self.shared.broken.load(Ordering::SeqCst) {
             // do not write possibly inconsistent state; leave needs_recovery
-            std::mem::forget(fs);
+            fs.abandon();
             return Err(Error::Device(ext4_core::error::errno::EIO));
         }
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fs.unmount_in_place()));

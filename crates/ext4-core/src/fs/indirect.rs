@@ -163,9 +163,7 @@ impl Fs {
         from: u64,
         to: u64,
     ) -> Result<bool> {
-        if blk >= self.sb.blocks_count() {
-            return Err(Error::corrupt(format!("indirect block {blk} out of range")));
-        }
+        self.check_meta_block("indirect block", blk)?;
         let per = self.ptrs_per_block();
         let mut data = self.cache.read(&*self.dev, blk)?;
         let mut changed = false;

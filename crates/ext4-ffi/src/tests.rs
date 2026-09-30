@@ -617,3 +617,51 @@ fn direct_io_mapping_through_c_abi() {
     unsafe { ext4_close(h) };
     fsck_clean(&p);
 }
+
+#[test]
+fn finish_keeps_volume_usable_for_reclaims() {
+    let d = tempfile::tempdir().unwrap();
+    let p = mkfs(d.path(), &["-t", "ext4"]);
+    let o = ops(&p, false, 512);
+    let h = mount(&o, None);
+    let f = create(h, 2, "gone", EXT4_FT_REG);
+    unsafe { ext4_write(h, f.ino, 0, [3u8; 5000].as_ptr(), 5000, std::ptr::null_mut()) };
+    assert_eq!(unsafe { ext4_remove(h, 2, b"gone".as_ptr(), 4) }, 0);
+    assert_eq!(unsafe { ext4_finish(h) }, 0);
+    // FSKit reclaims items after unmount: must succeed, not EBUSY
+    assert_eq!(unsafe { ext4_reclaim(h, f.ino) }, 0);
+    assert_eq!(unsafe { ext4_sync(h) }, 0);
+    let mut a = Ext4Attr::default();
+    assert_eq!(unsafe { ext4_stat(h, 2, &mut a) }, 0);
+    assert!(unsafe { ext4_is_read_only(h) }, "finished volumes are read-only");
+    // the image is clean right after finish
+    fsck_clean(&p);
+    // mount again without re-activation
+    assert_eq!(unsafe { ext4_remount(h) }, 0);
+    create(h, 2, "again", EXT4_FT_REG);
+    unsafe { ext4_close(h) };
+    fsck_clean(&p);
+    let o = ops(&p, true, 512);
+    let mut info = Ext4ProbeInfo::default();
+    assert_eq!(unsafe { ext4_probe(&o, &mut info) }, 0);
+    assert!(info.has_journal);
+    assert_eq!(info.subtype, 2);
+    unsafe { cb_release(o.ctx) };
+}
+
+#[test]
+fn probe_subtypes() {
+    for (opts, sub, journal) in [
+        (&["-t", "ext2"][..], 0u8, false),
+        (&["-t", "ext3"][..], 1, true),
+        (&["-t", "ext4", "-O", "^has_journal"][..], 2, false),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let p = mkfs(d.path(), opts);
+        let o = ops(&p, true, 512);
+        let mut info = Ext4ProbeInfo::default();
+        assert_eq!(unsafe { ext4_probe(&o, &mut info) }, 0);
+        assert_eq!((info.subtype, info.has_journal), (sub, journal), "{opts:?}");
+        unsafe { cb_release(o.ctx) };
+    }
+}

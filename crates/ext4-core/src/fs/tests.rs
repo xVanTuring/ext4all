@@ -462,3 +462,32 @@ fn rollback_restores_group_counters_and_bitmaps() {
     assert!(fs.lookup(root, b"d").is_err());
     fs.unmount().unwrap();
 }
+
+/// A commit in the middle of an operation (ensure_space) must not switch
+/// off rollback for the rest of the operation.
+#[test]
+fn rollback_after_mid_operation_commit() {
+    let dev = mkfs(32, &["-t", "ext4"]);
+    let mut fs = Fs::mount(
+        dev.clone(),
+        MountOptions {
+            commit_threshold: usize::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let root = fs.root();
+    let r: Result<()> = fs.op(|fs| {
+        fs.create(root, b"before", FileType::Regular, 0o644, 0, 0, 0)?;
+        fs.commit()?; // what ensure_space does when space is tight
+        let a = fs.create(root, b"after", FileType::Regular, 0o644, 0, 0, 0)?;
+        fs.write(a.ino, 0, &[9u8; 50_000])?;
+        Err(Error::NoSpace)
+    });
+    assert!(r.is_err());
+    assert!(fs.lookup(root, b"before").is_ok(), "committed part stays");
+    assert!(fs.lookup(root, b"after").is_err(), "uncommitted part is rolled back");
+    fs.unmount().unwrap();
+    let (code, out) = fsck_clean(&dev);
+    assert_eq!(code, 0, "{out}");
+}

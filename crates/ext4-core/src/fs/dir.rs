@@ -307,7 +307,7 @@ impl Fs {
                     continue;
                 }
                 let info = DirEntryInfo {
-                    file_type: self.entry_file_type(ino, ft)?,
+                    file_type: self.dirent_file_type(ino, ft)?,
                     name,
                     ino,
                     next_cookie: i as u64 + 1,
@@ -317,6 +317,16 @@ impl Fs {
                 }
             }
             return Ok(());
+        }
+        if inode.has_flag(flags::INDEX)
+            && self.sb.has_compat(compat::DIR_INDEX)
+            && !inode.has_flag(flags::CASEFOLD)
+            && !inode.has_flag(flags::ENCRYPT)
+        {
+            return self.dx_read_dir(dir, &inode, cookie, &mut f);
+        }
+        if cookie & super::htree::HASH_COOKIE != 0 {
+            return Err(Error::StaleCookie);
         }
         let bs = self.bs as u64;
         let nblocks = self.dir_nblocks(&inode);
@@ -333,7 +343,7 @@ impl Fs {
                 let info = DirEntryInfo {
                     name: d.name(&data).to_vec(),
                     ino: d.inode,
-                    file_type: self.entry_file_type(d.inode, d.file_type)?,
+                    file_type: self.dirent_file_type(d.inode, d.file_type)?,
                     next_cookie: lblk * bs + (d.offset + d.rec_len) as u64,
                 };
                 if !f(info) {
@@ -346,7 +356,7 @@ impl Fs {
         Ok(())
     }
 
-    fn entry_file_type(&mut self, ino: Ino, ft: u8) -> Result<FileType> {
+    pub(crate) fn dirent_file_type(&mut self, ino: Ino, ft: u8) -> Result<FileType> {
         let t = FileType::from_dirent(ft);
         if t != FileType::Unknown {
             return Ok(t);

@@ -16,6 +16,97 @@ final class FSKitLayerTests: XCTestCase {
         XCTAssertTrue(Ext4FileSystem.wantsReadOnly(["--rdonly"]))
         XCTAssertTrue(Ext4FileSystem.wantsReadOnly(["-f", "--rdonly"]))
         XCTAssertFalse(Ext4FileSystem.wantsReadOnly(["-f"]))
+
+        XCTAssertEqual(Ext4FileSystem.mountOptions(["-o", "a,b", "-oc", "-r"]), ["a", "b", "c"])
+        XCTAssertTrue(Ext4FileSystem.wantsKernelIO([], defaultOn: true))
+        XCTAssertFalse(Ext4FileSystem.wantsKernelIO([], defaultOn: false))
+        XCTAssertFalse(Ext4FileSystem.wantsKernelIO(["-o", "noowners,nokoio"], defaultOn: true))
+        XCTAssertTrue(Ext4FileSystem.wantsKernelIO(["-okoio"], defaultOn: false))
+        XCTAssertFalse(Ext4FileSystem.wantsKernelIO(["-o", "koio,nokoio"], defaultOn: true), "nokoio wins")
+    }
+
+    func testKernelIOAttributeDecision() {
+        var a = Ext4Attr()
+        a.ino = 20
+        a.file_type = UInt8(EXT4_FT_REG)
+        a.flags = UInt32(EXT4_FL_EXTENTS)
+        XCTAssertTrue(a.supportsKernelIO)
+        XCTAssertTrue(FSItem.Attributes(a, parent: 2).inhibitKernelOffloadedIO, "off unless the volume opts in")
+        XCTAssertFalse(FSItem.Attributes(a, parent: 2, kernelIO: true).inhibitKernelOffloadedIO)
+        var inline = a
+        inline.flags |= UInt32(EXT4_FL_INLINE_DATA)
+        XCTAssertFalse(inline.supportsKernelIO)
+        XCTAssertTrue(FSItem.Attributes(inline, parent: 2, kernelIO: true).inhibitKernelOffloadedIO)
+        var blockMapped = a
+        blockMapped.flags = 0
+        XCTAssertTrue(FSItem.Attributes(blockMapped, parent: 2, kernelIO: true).inhibitKernelOffloadedIO)
+        var dir = a
+        dir.file_type = UInt8(EXT4_FT_DIR)
+        XCTAssertTrue(FSItem.Attributes(dir, parent: 2, kernelIO: true).inhibitKernelOffloadedIO)
+    }
+
+    func testExtentPackingSplitsAtLimit() {
+        var packed: [(FSExtentType, UInt64, UInt64, UInt64)] = []
+        let e = Ext4IOExtent(logical: 8192, physical: 1 << 20, length: 10000, zeroFill: false)
+        XCTAssertTrue(
+            Ext4KernelIOVolume.pack(e, maxLength: 4096) { t, l, p, n in
+                packed.append((t, l, p, n))
+                return true
+            })
+        XCTAssertEqual(packed.map { $0.3 }, [4096, 4096, 1808])
+        XCTAssertEqual(packed.map { $0.1 }, [8192, 12288, 16384])
+        XCTAssertEqual(packed.map { $0.2 }, [1 << 20, (1 << 20) + 4096, (1 << 20) + 8192])
+        XCTAssertTrue(packed.allSatisfy { $0.0 == .data })
+
+        packed.removeAll()
+        let hole = Ext4IOExtent(logical: 0, physical: 999, length: 8192, zeroFill: true)
+        XCTAssertFalse(
+            Ext4KernelIOVolume.pack(hole, maxLength: 4096) { t, l, p, n in
+                packed.append((t, l, p, n))
+                return false  // packer full after the first extent
+            })
+        XCTAssertEqual(packed.count, 1)
+        XCTAssertEqual(packed[0].0, .zeroFill)
+        XCTAssertEqual(packed[0].2, 0, "zero-fill extents carry no device offset")
+
+        XCTAssertTrue(Ext4KernelIOVolume.succeeded(nil))
+        XCTAssertFalse(Ext4KernelIOVolume.succeeded(POSIXError(.EIO)))
+    }
+
+    /// The I/O path of a live item never changes, even when an inline data
+    /// file grows into extents.
+    func testKernelIOPathIsStablePerItem() throws {
+        try XCTSkipUnless(TestImage.available, "e2fsprogs not installed")
+        // mke2fs -d stores small files as inline data
+        let src = FileManager.default.temporaryDirectory.appendingPathComponent("inline-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: src) }
+        try Data("tiny".utf8).write(to: src.appendingPathComponent("small"))
+        let path = try TestImage.make(
+            options: ["-t", "ext4", "-b", "4096", "-O", "inline_data", "-I", "256", "-d", src.path])
+        let mount = try Ext4Mount(FileBlockIO(path: path, readOnly: false), readOnly: false)
+        let volume = Ext4Volume(mount: mount, info: try mount.volumeInfo(), bsdName: "disk99s1", kernelIO: true)
+        XCTAssertTrue(volume.kernelIO)
+
+        let small = try mount.lookup(2, Data("small".utf8))
+        XCTAssertFalse(small.supportsKernelIO, "inline data file")
+        let item = volume.items.item(for: small.ino, parent: 2)
+        XCTAssertTrue(try volume.attributes(item).inhibitKernelOffloadedIO)
+        // grow past the inline capacity: the engine converts to extents
+        _ = try mount.write(small.ino, offset: 0, data: Data(count: 100_000))
+        XCTAssertTrue(try mount.stat(small.ino).supportsKernelIO)
+        XCTAssertTrue(try volume.attributes(item).inhibitKernelOffloadedIO, "decided once per item")
+        // a fresh item for the same inode decides again
+        volume.items.remove(item)
+        let again = volume.items.item(for: small.ino, parent: 2)
+        XCTAssertFalse(try volume.attributes(again).inhibitKernelOffloadedIO)
+
+        // a volume without kernel I/O inhibits everything
+        let plain = Ext4Volume(mount: mount, info: try mount.volumeInfo(), bsdName: "disk99s1")
+        let p = plain.items.item(for: small.ino, parent: 2)
+        XCTAssertTrue(try plain.attributes(p).inhibitKernelOffloadedIO)
+        try mount.unmount()
+        try TestImage.assertClean(path)
     }
 
     func testItemTypeMapping() {

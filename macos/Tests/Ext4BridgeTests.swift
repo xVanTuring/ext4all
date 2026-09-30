@@ -202,6 +202,54 @@ final class Ext4BridgeTests: XCTestCase {
         try TestImage.assertClean(path)
     }
 
+    /// Kernel offloaded I/O through the bridge: map for write, write the
+    /// device directly at the mapped offsets (as the kernel would),
+    /// complete, then read back through the engine and a read mapping.
+    func testKernelIOMapping() throws {
+        let path = try TestImage.make(options: ["-t", "ext4", "-b", "4096"])
+        let m = try Ext4Mount(FileBlockIO(path: path, readOnly: false), readOnly: false)
+        let f = try m.create(2, Data("koio".utf8), type: UInt8(EXT4_FT_REG), perm: 0o644, uid: 0, gid: 0)
+        var writeMap: [Ext4IOExtent] = []
+        try m.mapForIO(f.ino, offset: 0, length: 3 * 4096 + 100, write: true) { e in
+            writeMap.append(e)
+            return true
+        }
+        XCTAssertEqual(writeMap.reduce(0) { $0 + $1.length }, 4 * 4096)
+        XCTAssertTrue(writeMap.allSatisfy { !$0.zeroFill })
+        let payload = Data((0..<(3 * 4096 + 100)).map { UInt8(truncatingIfNeeded: $0 * 7) })
+        let dev = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        for e in writeMap {
+            let s = Int(e.logical)
+            let t = min(s + Int(e.length), payload.count)
+            try dev.seek(toOffset: e.physical)
+            try dev.write(contentsOf: payload[s..<t])
+        }
+        try dev.close()
+        // nothing is visible before completion
+        XCTAssertEqual(try m.stat(f.ino).size, 0)
+        try m.completeWrite(f.ino, offset: 0, length: UInt64(payload.count))
+        XCTAssertEqual(try m.stat(f.ino).size, UInt64(payload.count))
+        XCTAssertEqual(try m.read(f.ino, offset: 0, length: payload.count + 10), payload)
+        var readMap: [Ext4IOExtent] = []
+        try m.mapForIO(f.ino, offset: 0, length: 8 * 4096, write: false) { e in
+            readMap.append(e)
+            return true
+        }
+        XCTAssertEqual(readMap.filter { !$0.zeroFill }.reduce(0) { $0 + $1.length }, 4 * 4096)
+        XCTAssertEqual(readMap.filter { $0.zeroFill }.reduce(0) { $0 + $1.length }, 4 * 4096)
+        // stopping early is honoured
+        var calls = 0
+        try m.mapForIO(f.ino, offset: 0, length: 8 * 4096, write: false) { _ in
+            calls += 1
+            return false
+        }
+        XCTAssertEqual(calls, 1)
+        // directories cannot be mapped
+        XCTAssertThrowsError(try m.mapForIO(2, offset: 0, length: 4096, write: false) { _ in true })
+        try m.unmount()
+        try TestImage.assertClean(path)
+    }
+
     func testTimespecConversion() {
         let t = Ext4Time(sec: -5, nsec: 123)
         let ts = t.timespecValue

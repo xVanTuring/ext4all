@@ -4,7 +4,7 @@ import Foundation
 
 /// One mounted ext4 volume, implementing FSKit's handler protocols on top
 /// of the Rust engine.
-final class Ext4Volume: FSVolume, @unchecked Sendable {
+class Ext4Volume: FSVolume, @unchecked Sendable {
     let mount: Ext4Mount
     let items = ItemTable()
     let bsdName: String
@@ -18,11 +18,17 @@ final class Ext4Volume: FSVolume, @unchecked Sendable {
     let opLock = NSLock()
     /// Set by `unmount`; a later `mount` makes the volume writable again.
     private var finished = false
+    /// Regular extent-mapped files use kernel offloaded I/O
+    /// (`Ext4KernelIOVolume`); all others go through read/write. Can only
+    /// be switched off, at activation (`-o nokoio`), before any item is
+    /// handed out.
+    private(set) var kernelIO: Bool
 
-    init(mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String) {
+    init(mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false) {
         self.mount = mount
         self.bsdName = bsdName
         self.info = info
+        self.kernelIO = kernelIO
         self.blockSize = UInt64(info.blockSize)
         let caps = FSVolume.SupportedCapabilities()
         caps.supportsPersistentObjectIDs = true
@@ -78,11 +84,27 @@ final class Ext4Volume: FSVolume, @unchecked Sendable {
 
     func attributes(_ item: FSItem) throws -> FSItem.Attributes {
         guard let it = item as? Ext4Item else { throw POSIXError(.EINVAL) }
-        return FSItem.Attributes(try mount.stat(it.ino), parent: it.parentIno)
+        return attrs(try mount.stat(it.ino), parent: it.parentIno)
     }
 
     func attributes(ino: UInt32, parent: UInt32) throws -> FSItem.Attributes {
-        FSItem.Attributes(try mount.stat(ino), parent: parent)
+        attrs(try mount.stat(ino), parent: parent)
+    }
+
+    /// FSKit attributes for an inode, honouring the volume's I/O mode. The
+    /// I/O path of a live item is decided once (an inline data file that
+    /// grows into extents keeps using read/write until it is reclaimed).
+    func attrs(_ a: Ext4Attr, parent: UInt32) -> FSItem.Attributes {
+        guard kernelIO else { return FSItem.Attributes(a, parent: parent) }
+        var useKernelIO = a.supportsKernelIO
+        if let item = items.existing(a.ino) {
+            if let decided = item.kernelIO {
+                useKernelIO = decided
+            } else {
+                item.kernelIO = useKernelIO
+            }
+        }
+        return FSItem.Attributes(a, parent: parent, kernelIO: useKernelIO)
     }
 
     /// Current free space; call with `opLock` held.
@@ -154,6 +176,10 @@ extension Ext4Volume: FSVolume.Handler {
         options: FSTaskOptions, replyHandler reply: @escaping @Sendable (FSActivateResult?, (any Error)?) -> Void
     ) {
         run("activate", reply) {
+            if kernelIO {
+                kernelIO = Ext4FileSystem.wantsKernelIO(options.taskOptions, defaultOn: true)
+                Log.fs.info("kernel offloaded I/O \(self.kernelIO ? "on" : "off (-o nokoio)", privacy: .public)")
+            }
             let root = items.item(for: Ext4Mount.rootIno, parent: Ext4Mount.rootIno)
             _ = try mount.stat(Ext4Mount.rootIno)
             return try Self.unwrap(FSActivateResult(rootItem: root))
@@ -221,19 +247,23 @@ extension Ext4Volume: FSVolume.Handler {
         replyHandler reply: @escaping @Sendable (FSLookupItemResult?, (any Error)?) -> Void
     ) {
         run("lookup", reply) {
-            let dir = try ino(directory)
-            let a = try mount.lookup(dir, name.data)
-            var parent = dir
-            if name.data == Data("..".utf8) {
-                parent = (try? mount.lookup(a.ino, Data("..".utf8)).ino) ?? a.ino
-            } else if name.data == Data(".".utf8) {
-                parent = (directory as? Ext4Item)?.parentIno ?? dir
-            }
-            let item = items.item(for: a.ino, parent: parent)
-            return try Self.unwrap(
-                FSLookupItemResult(
-                    foundItem: item, itemName: name, itemAttributes: FSItem.Attributes(a, parent: parent)))
+            let (item, attributes) = try lookupParts(named: name, in: directory)
+            return try Self.unwrap(FSLookupItemResult(foundItem: item, itemName: name, itemAttributes: attributes))
         }
+    }
+
+    /// Lookup shared by the plain and kernel offloaded I/O handlers; call
+    /// with `opLock` held.
+    func lookupParts(named name: FSFileName, in directory: FSItem) throws -> (Ext4Item, FSItem.Attributes) {
+        let dir = try ino(directory)
+        let a = try mount.lookup(dir, name.data)
+        var parent = dir
+        if name.data == Data("..".utf8) {
+            parent = (try? mount.lookup(a.ino, Data("..".utf8)).ino) ?? a.ino
+        } else if name.data == Data(".".utf8) {
+            parent = (directory as? Ext4Item)?.parentIno ?? dir
+        }
+        return (items.item(for: a.ino, parent: parent), attrs(a, parent: parent))
     }
 
     func reclaimItem(_ item: FSItem, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void) {
@@ -299,21 +329,30 @@ extension Ext4Volume: FSVolume.Handler {
         replyHandler reply: @escaping @Sendable (FSCreateItemResult?, (any Error)?) -> Void
     ) {
         run("create", reply) {
-            let dir = try ino(directory)
-            guard let t = type.ext4Type, type != .symlink else { throw POSIXError(.EINVAL) }
-            let defaultPerm: UInt16 = type == .directory ? 0o755 : 0o644
-            let perm = newAttributes.isValid(.mode) ? UInt16(newAttributes.mode & 0o7777) : defaultPerm
-            let (uid, gid) = owner(newAttributes, context)
-            var a = try mount.create(dir, name.data, type: t, perm: perm, uid: uid, gid: gid)
-            try applyCreationExtras(a.ino, newAttributes)
-            a = try mount.stat(a.ino)
-            newAttributes.consumedAttributes = [.type, .mode, .uid, .gid, .accessTime, .modifyTime, .birthTime, .flags]
-            let item = items.item(for: a.ino, parent: dir)
+            let (item, attributes) = try createParts(named: name, type: type, in: directory, newAttributes, context)
             return try Self.unwrap(
                 FSCreateItemResult(
-                    newItem: item, newItemName: name, newItemAttributes: FSItem.Attributes(a, parent: dir),
-                    directoryAttributes: try attributes(directory), freeSpace: freeSpace()))
+                    newItem: item, newItemName: name, newItemAttributes: attributes,
+                    directoryAttributes: try self.attributes(directory), freeSpace: freeSpace()))
         }
+    }
+
+    /// Creation shared by the plain and kernel offloaded I/O handlers; call
+    /// with `opLock` held.
+    func createParts(
+        named name: FSFileName, type: FSItem.ItemType, in directory: FSItem,
+        _ newAttributes: FSItem.SetAttributesRequest, _ context: FSContext
+    ) throws -> (Ext4Item, FSItem.Attributes) {
+        let dir = try ino(directory)
+        guard let t = type.ext4Type, type != .symlink else { throw POSIXError(.EINVAL) }
+        let defaultPerm: UInt16 = type == .directory ? 0o755 : 0o644
+        let perm = newAttributes.isValid(.mode) ? UInt16(newAttributes.mode & 0o7777) : defaultPerm
+        let (uid, gid) = owner(newAttributes, context)
+        var a = try mount.create(dir, name.data, type: t, perm: perm, uid: uid, gid: gid)
+        try applyCreationExtras(a.ino, newAttributes)
+        a = try mount.stat(a.ino)
+        newAttributes.consumedAttributes = [.type, .mode, .uid, .gid, .accessTime, .modifyTime, .birthTime, .flags]
+        return (items.item(for: a.ino, parent: dir), attrs(a, parent: dir))
     }
 
     func createSymbolicLink(
@@ -331,7 +370,7 @@ extension Ext4Volume: FSVolume.Handler {
             let item = items.item(for: a.ino, parent: dir)
             return try Self.unwrap(
                 FSCreateSymlinkResult(
-                    newItem: item, newItemName: name, newItemAttributes: FSItem.Attributes(a, parent: dir),
+                    newItem: item, newItemName: name, newItemAttributes: attrs(a, parent: dir),
                     directoryAttributes: try attributes(directory), freeSpace: freeSpace()))
         }
     }
@@ -346,7 +385,7 @@ extension Ext4Volume: FSVolume.Handler {
             let a = try mount.link(target, to: dir, name: name.data)
             return try Self.unwrap(
                 FSCreateLinkResult(
-                    linkName: name, linkAttributes: FSItem.Attributes(a, parent: dir),
+                    linkName: name, linkAttributes: attrs(a, parent: dir),
                     directoryAttributes: try attributes(directory), freeSpace: freeSpace()))
         }
     }
@@ -452,7 +491,7 @@ extension Ext4Volume: FSVolume.Handler {
             newAttributes.consumedAttributes = consumed
             let parent = (item as? Ext4Item)?.parentIno ?? i
             return try Self.unwrap(
-                FSSetAttributesResult(attributes: FSItem.Attributes(a, parent: parent), freeSpace: freeSpace()))
+                FSSetAttributesResult(attributes: attrs(a, parent: parent), freeSpace: freeSpace()))
         }
     }
 
@@ -467,13 +506,13 @@ extension Ext4Volume: FSVolume.Handler {
             let wantAttrs = attributes != nil
             do {
                 try mount.readDir(dir, cookie: cookie.rawValue, skipDots: wantAttrs, wantAttrs: wantAttrs) { e in
-                    let attrs = e.attr.map { FSItem.Attributes($0, parent: dir) }
+                    let entryAttrs = e.attr.map { self.attrs($0, parent: dir) }
                     return packer.packEntry(
                         name: FSFileName(data: e.name),
                         itemType: FSItem.ItemType(ext4Type: e.fileType),
                         itemID: FSItem.Identifier(rawValue: UInt64(e.ino)) ?? .invalid,
                         nextCookie: FSDirectoryCookie(e.nextCookie),
-                        attributes: attrs)
+                        attributes: entryAttrs)
                 }
             } catch let e as POSIXError where e.code == .ESTALE {
                 // the directory changed format (became an htree) since the
@@ -601,25 +640,29 @@ extension Ext4Volume: FSVolume.PreallocateHandler {
         replyHandler reply: @escaping @Sendable (FSPreallocateResult?, (any Error)?) -> Void
     ) {
         run("preallocate", reply) {
-            let i = try ino(item)
-            guard length > 0 else {
-                return try Self.unwrap(
-                    FSPreallocateResult(bytesAllocated: 0, itemAttributes: try attributes(item), freeSpace: .noUpdate))
-            }
-            // F_PREALLOCATE semantics: FSKit always sets `.fromEOF` and the
-            // offset is ignored; space is added after the physical end of
-            // the file (its allocated size), without changing its size.
-            let before = try mount.stat(i)
-            let logicalEnd = (before.size + blockSize - 1) / blockSize * blockSize
-            let start = max(try mount.allocatedEnd(i), logicalEnd)
-            try mount.fallocate(i, offset: start, length: UInt64(length), keepSize: true)
-            let after = try mount.stat(i)
-            let allocated = Int(clamping: after.allocated &- before.allocated)
+            let (allocated, attributes) = try preallocateParts(item, length: length)
             return try Self.unwrap(
                 FSPreallocateResult(
-                    bytesAllocated: allocated, itemAttributes: FSItem.Attributes(after, parent: parentOf(item)),
-                    freeSpace: freeSpace()))
+                    bytesAllocated: allocated, itemAttributes: attributes,
+                    freeSpace: allocated > 0 ? freeSpace() : .noUpdate))
         }
+    }
+
+    /// Preallocation shared by the plain and kernel offloaded I/O
+    /// handlers; call with `opLock` held. Returns the bytes allocated.
+    func preallocateParts(_ item: FSItem, length: Int) throws -> (Int, FSItem.Attributes) {
+        let i = try ino(item)
+        guard length > 0 else { return (0, try attributes(item)) }
+        // F_PREALLOCATE semantics: FSKit always sets `.fromEOF` and the
+        // offset is ignored; space is added after the physical end of the
+        // file (its allocated size), without changing its size.
+        let before = try mount.stat(i)
+        let logicalEnd = (before.size + blockSize - 1) / blockSize * blockSize
+        let start = max(try mount.allocatedEnd(i), logicalEnd)
+        try mount.fallocate(i, offset: start, length: UInt64(length), keepSize: true)
+        let after = try mount.stat(i)
+        let allocated = Int(clamping: after.allocated &- before.allocated)
+        return (allocated, attrs(after, parent: parentOf(item)))
     }
 }
 

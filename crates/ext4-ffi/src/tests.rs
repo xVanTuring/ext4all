@@ -665,3 +665,35 @@ fn probe_subtypes() {
         unsafe { cb_release(o.ctx) };
     }
 }
+
+#[test]
+fn allocated_end_reports_physical_eof() {
+    let d = tempfile::tempdir().unwrap();
+    let p = mkfs(d.path(), &["-t", "ext4", "-b", "4096"]);
+    let o = ops(&p, false, 4096);
+    let h = mount(&o, None);
+    let f = create(h, 2, "prealloc", EXT4_FT_REG);
+    let mut end = u64::MAX;
+    assert_eq!(unsafe { ext4_allocated_end(h, f.ino, &mut end) }, 0);
+    assert_eq!(end, 0, "empty file");
+    let data = [1u8; 100];
+    let mut n = 0;
+    assert_eq!(unsafe { ext4_write(h, f.ino, 0, data.as_ptr(), data.len(), &mut n) }, 0);
+    assert_eq!(unsafe { ext4_allocated_end(h, f.ino, &mut end) }, 0);
+    assert_eq!(end, 4096);
+    // preallocation past EOF keeps the size but moves the physical end
+    assert_eq!(unsafe { ext4_fallocate(h, f.ino, 4096, 3 * 4096, true) }, 0);
+    assert_eq!(unsafe { ext4_allocated_end(h, f.ino, &mut end) }, 0);
+    assert_eq!(end, 4 * 4096);
+    let mut a = Ext4Attr::default();
+    assert_eq!(unsafe { ext4_stat(h, f.ino, &mut a) }, 0);
+    assert_eq!(a.size, 100);
+    assert_ne!(a.flags & EXT4_FL_EXTENTS, 0);
+    assert_eq!(a.flags & EXT4_FL_INLINE_DATA, 0);
+    assert_ne!(unsafe { ext4_allocated_end(h, 999_999, &mut end) }, 0);
+    // like the other queries, a null output pointer is simply not written
+    assert_eq!(unsafe { ext4_allocated_end(h, f.ino, std::ptr::null_mut()) }, 0);
+    assert_eq!(unsafe { ext4_unmount(h) }, 0);
+    unsafe { ext4_close(h) };
+    fsck_clean(&p);
+}

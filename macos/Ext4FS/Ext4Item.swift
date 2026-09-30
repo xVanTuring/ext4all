@@ -8,6 +8,10 @@ final class Ext4Item: FSItem {
     let ino: UInt32
     /// Directory the item was last reached through (for `parentID`).
     var parentIno: UInt32
+    /// I/O path reported to FSKit the first time (kernel offloaded or
+    /// read/write); kept for the item's lifetime so the kernel never sees
+    /// a file switch paths while it may hold cached data or mappings.
+    var kernelIO: Bool?
 
     init(ino: UInt32, parent: UInt32) {
         self.ino = ino
@@ -38,6 +42,13 @@ final class ItemTable: @unchecked Sendable {
         let it = Ext4Item(ino: ino, parent: parent)
         items[ino] = it
         return it
+    }
+
+    /// The live item for `ino`, if any (never creates one).
+    func existing(_ ino: UInt32) -> Ext4Item? {
+        lock.lock()
+        defer { lock.unlock() }
+        return items[ino]
     }
 
     func remove(_ ino: UInt32) {
@@ -97,9 +108,20 @@ extension FSItem.ItemType {
     }
 }
 
+extension Ext4Attr {
+    /// The file's data can be mapped for kernel offloaded I/O: a regular
+    /// extent-mapped file without inline data (block-mapped ext2/ext3 files
+    /// cannot hold unwritten blocks; inline data has no device location).
+    var supportsKernelIO: Bool {
+        file_type == UInt8(EXT4_FT_REG) && flags & UInt32(EXT4_FL_EXTENTS) != 0
+            && flags & UInt32(EXT4_FL_INLINE_DATA) == 0
+    }
+}
+
 extension FSItem.Attributes {
-    /// Populate every attribute from an ext4 inode.
-    convenience init(_ a: Ext4Attr, parent: UInt32) {
+    /// Populate every attribute from an ext4 inode. With `kernelIO`, files
+    /// that support it use kernel offloaded I/O instead of read/write.
+    convenience init(_ a: Ext4Attr, parent: UInt32, kernelIO: Bool = false) {
         self.init()
         type = FSItem.ItemType(ext4Type: a.file_type)
         mode = UInt32(a.mode)
@@ -117,6 +139,6 @@ extension FSItem.Attributes {
         changeTime = a.ctime.timespecValue
         birthTime = a.has_crtime ? a.crtime.timespecValue : a.ctime.timespecValue
         supportsLimitedXAttrs = false
-        inhibitKernelOffloadedIO = true
+        inhibitKernelOffloadedIO = !(kernelIO && a.supportsKernelIO)
     }
 }

@@ -15,6 +15,7 @@ Finder / 应用
 FSKit ──XPC──▶ Ext4FS.appex (Swift, macOS/Ext4FS)
                   │  Ext4FileSystem  : FSUnaryFileSystem（探测 / 加载）
                   │  Ext4Volume      : FSVolume.Handler 及读写、xattr、改卷标、预分配、SEEK_DATA/HOLE
+                  │  Ext4KernelIOVolume : 可选的内核直通 I/O（KernelOffloadedIOHandler）
                   │  ResourceBlockIO : FSBlockDeviceResource 读写
                   ▼  C ABI（crates/ext4-ffi，cbindgen 生成头文件，静态库）
                ext4-core（纯 Rust，crates/ext4-core）
@@ -65,6 +66,21 @@ mount -F -t ext4 -o ro disk4s1 /tmp/ext4        # 只读挂载
 hdiutil attach -nomount linux.img               # 挂载镜像文件前先接成块设备
 ```
 
+### 可选：内核直通 I/O
+
+默认情况下文件数据经扩展进程转发。打开内核直通 I/O 后，普通 ext4 文件（extent 映射、非内联数据）的数据由内核直接读写磁盘，扩展只提供块映射，吞吐量更高。该模式需要签名后在真实设备上验证，因此默认关闭：
+
+```bash
+# 打开（写入扩展沙盒容器内的偏好设置；之后新挂载的卷生效）
+defaults write ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs KernelOffloadedIO -bool YES
+# 关闭
+defaults delete ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs KernelOffloadedIO
+# 打开后仍可对单次挂载关闭
+mount -F -t ext4 -o nokoio disk4s1 /tmp/ext4
+```
+
+目录、符号链接、内联数据文件和 ext2/ext3 的块映射文件始终走普通读写路径；同一个文件在被系统回收前不会切换路径。
+
 发布给他人使用时需 Developer ID 签名 + 公证。
 
 ## 测试
@@ -107,6 +123,6 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 
 - 无日志的 ext4 卷在断电后可能需要 `fsck`（与 Linux 相同，挂载期间会标记为未干净卸载）。
 - 单个操作修改的元数据超过日志容量（极大且极碎片化的文件删除）时，会在标记"未干净"的前提下直接写入原位置。
-- FSKit 内核直通 I/O：引擎和 C ABI 已支持（`map_for_io` 写入先分配未写入 extent，完成后再转换，断电不会暴露旧数据），Swift 层尚未启用，需签名后实测再打开；目前数据读写经扩展进程转发。
+- 内核直通 I/O 默认关闭（见上文）。引擎侧写映射先分配未写入 extent、部分覆盖的新块先清零，完成后才转换并增长文件大小，断电不会暴露旧数据；这部分有单元测试，但内核一侧的行为只能在签名后实测。
 - ext2/ext3 的文件不支持预分配（`fallocate`，与 Linux 相同，块映射无法表示未写入块）。
 - 只读支持：`bigalloc`、`quota`、`encrypt`、`casefold`、`verity`、`ea_inode`、`mmp` 等特性的卷可以读取，但不写入。

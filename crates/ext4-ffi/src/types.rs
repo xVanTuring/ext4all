@@ -30,6 +30,11 @@ pub const EXT4_FT_FIFO: u8 = 5;
 pub const EXT4_FT_SOCK: u8 = 6;
 pub const EXT4_FT_LNK: u8 = 7;
 
+/// ext4 inode flags reported in [`Ext4Attr::flags`] that decide whether a
+/// file's data can be mapped for kernel offloaded I/O.
+pub const EXT4_FL_EXTENTS: u32 = 0x0008_0000;
+pub const EXT4_FL_INLINE_DATA: u32 = 0x1000_0000;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ext4Time {

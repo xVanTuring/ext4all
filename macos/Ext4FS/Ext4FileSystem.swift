@@ -65,11 +65,17 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
             let io = ResourceBlockIO(device, readOnly: readOnly)
             let mount = try Ext4Mount(io, readOnly: readOnly)
             let info = try mount.volumeInfo()
-            let volume = Ext4Volume(mount: mount, info: info, bsdName: device.bsdName)
+            // opt-in; read-only mounts benefit as well (reads bypass the
+            // extension)
+            let kernelIO = UserDefaults.standard.bool(forKey: Ext4FileSystem.kernelIODefaultsKey)
+            let volume: Ext4Volume =
+                kernelIO
+                ? Ext4KernelIOVolume(mount: mount, info: info, resource: device)
+                : Ext4Volume(mount: mount, info: info, bsdName: device.bsdName)
             loaded.withLock { $0 = volume }
             containerStatus = .ready
             Log.fs.info(
-                "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)"
+                "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)\(kernelIO ? ", kernel offloaded I/O" : "", privacy: .public)"
             )
             reply(volume, nil)
         } catch {
@@ -129,17 +135,40 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     }
 
     static func wantsReadOnly(_ opts: [String]) -> Bool {
+        if opts.contains(where: { $0 == "--rdonly" || $0 == "-r" || $0 == "--read-only" }) { return true }
+        let o = mountOptions(opts)
+        return o.contains("ro") || o.contains("rdonly")
+    }
+
+    /// Defaults key (in the extension's container) that opts volumes into
+    /// kernel offloaded I/O. It is read when a volume is loaded, because
+    /// the volume's class decides which FSKit protocols it implements and
+    /// `-o` mount options only arrive later, at activation.
+    static let kernelIODefaultsKey = "KernelOffloadedIO"
+
+    /// With kernel offloaded I/O available, `-o nokoio` switches it off for
+    /// one mount (and `-o koio` on); otherwise `defaultOn` decides.
+    static func wantsKernelIO(_ opts: [String], defaultOn: Bool) -> Bool {
+        let o = mountOptions(opts)
+        if o.contains("nokoio") { return false }
+        if o.contains("koio") { return true }
+        return defaultOn
+    }
+
+    /// The comma separated words of every `-o` option (`-o a,b` or `-oa,b`).
+    static func mountOptions(_ opts: [String]) -> Set<String> {
+        var out = Set<String>()
         for (i, o) in opts.enumerated() {
-            if o == "--rdonly" || o == "-r" || o == "--read-only" { return true }
+            var list: Substring?
             if o == "-o", i + 1 < opts.count {
-                let parts = opts[i + 1].split(separator: ",")
-                if parts.contains("ro") || parts.contains("rdonly") { return true }
+                list = Substring(opts[i + 1])
+            } else if o.hasPrefix("-o") && o.count > 2 {
+                list = o.dropFirst(2)
             }
-            if o.hasPrefix("-o") && o.count > 2 {
-                let parts = o.dropFirst(2).split(separator: ",")
-                if parts.contains("ro") || parts.contains("rdonly") { return true }
+            for part in list?.split(separator: ",") ?? [] {
+                out.insert(String(part))
             }
         }
-        return false
+        return out
     }
 }

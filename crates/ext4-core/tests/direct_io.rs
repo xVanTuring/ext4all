@@ -163,3 +163,116 @@ fn direct_io_rejections() {
         Err(ext4_core::Error::ReadOnly)
     ));
 }
+
+/// Write exactly `data` at `offset` like the kernel would for a sub-block
+/// write: map the range, write only the requested bytes to the device.
+fn kernel_write_exact(fs: &mut Fs, dev: &dyn BlockDevice, ino: u32, offset: u64, data: &[u8]) {
+    let exts = fs.map_for_io(ino, offset, data.len() as u64, true).unwrap();
+    let end = offset + data.len() as u64;
+    for e in &exts {
+        let s = e.logical.max(offset);
+        let t = (e.logical + e.length).min(end);
+        if s < t {
+            let src = &data[(s - offset) as usize..(t - offset) as usize];
+            dev.write_at(e.physical + (s - e.logical), src).unwrap();
+        }
+    }
+    fs.complete_direct_write(ino, offset, data.len() as u64).unwrap();
+}
+
+/// Fill most free blocks with `byte` and free them again, so later
+/// allocations get blocks with stale contents.
+fn dirty_free_space(fs: &mut Fs, byte: u8) {
+    let junk = fs.create(2, b"junk", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+    let free = fs.statfs().free_blocks * fs.block_size() as u64;
+    let chunk = vec![byte; 1 << 20];
+    let mut off = 0;
+    while off + (chunk.len() as u64) < free * 8 / 10 {
+        fs.write(junk, off, &chunk).unwrap();
+        off += chunk.len() as u64;
+    }
+    fs.sync().unwrap();
+    fs.unlink(2, b"junk").unwrap();
+    fs.sync().unwrap();
+}
+
+#[test]
+fn partial_block_direct_writes_never_expose_stale_data() {
+    for bs in ["1024", "4096"] {
+        let (img, dev, mut fs) = setup(&["-t", "ext4", "-b", bs]);
+        dirty_free_space(&mut fs, 0xA5);
+        let b = fs.block_size() as u64;
+        // sub-block write into a hole of a new file
+        let f = fs.create(2, b"f", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+        kernel_write_exact(&mut fs, &*dev, f, 100, &[7u8; 10]);
+        let mut back = vec![0xFFu8; b as usize];
+        assert_eq!(fs.read(f, 0, &mut back).unwrap(), 110);
+        assert!(
+            back[..100].iter().all(|&x| x == 0),
+            "head of new block must read as zeros"
+        );
+        assert!(back[100..110].iter().all(|&x| x == 7));
+        // the whole block on disk is clean beyond the data as well (it can
+        // be exposed by a later extension of the file)
+        fs.truncate(f, b).unwrap();
+        let mut whole = vec![0xFFu8; b as usize];
+        fs.read(f, 0, &mut whole).unwrap();
+        assert!(
+            whole[110..].iter().all(|&x| x == 0),
+            "tail of new block must read as zeros"
+        );
+
+        // write straddling two new blocks in the middle of a sparse file
+        let g = fs.create(2, b"g", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+        fs.truncate(g, 10 * b).unwrap();
+        kernel_write_exact(&mut fs, &*dev, g, 3 * b - 5, &[9u8; 10]);
+        let mut two = vec![0xFFu8; 2 * b as usize];
+        fs.read(g, 2 * b, &mut two).unwrap();
+        let split = b as usize - 5;
+        assert!(two[..split].iter().all(|&x| x == 0));
+        assert!(two[split..split + 10].iter().all(|&x| x == 9));
+        assert!(two[split + 10..].iter().all(|&x| x == 0));
+
+        // sub-block write into preallocated (unwritten) blocks whose device
+        // contents are stale
+        let h = fs.create(2, b"h", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+        fs.fallocate(h, 0, 4 * b, false).unwrap();
+        for e in fs.map_for_io(h, 0, 4 * b, false).unwrap() {
+            assert!(e.zero_fill);
+        }
+        for e in fs.file_extents(h).unwrap() {
+            let mut junk = vec![0x5Au8; (e.len as u64 * b) as usize];
+            junk[0] = 1;
+            dev.write_at(e.start * b, &junk).unwrap();
+        }
+        kernel_write_exact(&mut fs, &*dev, h, b + 1, &[3u8; 2]);
+        let mut all = vec![0xFFu8; 4 * b as usize];
+        assert_eq!(fs.read(h, 0, &mut all).unwrap(), 4 * b as usize);
+        for (i, &x) in all.iter().enumerate() {
+            let want = if i == b as usize + 1 || i == b as usize + 2 {
+                3
+            } else {
+                0
+            };
+            assert_eq!(x, want, "byte {i}");
+        }
+        finish(&img, &dev, fs);
+    }
+}
+
+#[test]
+fn completion_without_mapping_is_harmless() {
+    let (img, dev, mut fs) = setup(&["-t", "ext4", "-b", "4096"]);
+    let f = fs.create(2, b"f", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+    fs.write(f, 0, &pattern(10000, 4)).unwrap();
+    // FSKit may complete I/O it never mapped (operation ID unspecified):
+    // written blocks stay, holes stay holes, the size grows as reported
+    fs.complete_direct_write(f, 0, 10000).unwrap();
+    fs.complete_direct_write(f, 40000, 100).unwrap();
+    assert_eq!(fs.stat(f).unwrap().size, 40100);
+    let mut b = vec![0xFFu8; 40100];
+    fs.read(f, 0, &mut b).unwrap();
+    assert_eq!(&b[..10000], &pattern(10000, 4)[..]);
+    assert!(b[10000..].iter().all(|&x| x == 0));
+    finish(&img, &dev, fs);
+}

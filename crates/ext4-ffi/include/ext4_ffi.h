@@ -26,6 +26,14 @@
 
 #define EXT4_FT_LNK 7
 
+/**
+ * ext4 inode flags reported in [`Ext4Attr::flags`] that decide whether a
+ * file's data can be mapped for kernel offloaded I/O.
+ */
+#define EXT4_FL_EXTENTS 524288
+
+#define EXT4_FL_INLINE_DATA 268435456
+
 #define UF_NODUMP 1
 
 #define UF_IMMUTABLE 2

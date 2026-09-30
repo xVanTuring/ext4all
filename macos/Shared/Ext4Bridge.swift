@@ -120,6 +120,16 @@ public struct Ext4DirEntry {
     public var attr: Ext4Attr?
 }
 
+/// A byte range of a file mapped for kernel offloaded I/O.
+public struct Ext4IOExtent: Equatable {
+    public var logical: UInt64
+    /// Offset on the device; meaningless when `zeroFill` is set.
+    public var physical: UInt64
+    public var length: UInt64
+    /// Reads must return zeros (hole, unwritten block or beyond EOF).
+    public var zeroFill: Bool
+}
+
 /// A mounted ext4 volume. All methods are thread safe (the engine
 /// serializes operations internally).
 public final class Ext4Mount: @unchecked Sendable {
@@ -344,6 +354,37 @@ public final class Ext4Mount: @unchecked Sendable {
 
     public func punchHole(_ ino: UInt32, offset: UInt64, length: UInt64) throws {
         try ext4Check(ext4_punch_hole(handle, ino, offset, length))
+    }
+
+    private final class ExtentContext {
+        let body: (Ext4IOExtent) -> Bool
+        init(_ body: @escaping (Ext4IOExtent) -> Bool) { self.body = body }
+    }
+
+    /// Map `[offset, offset+length)` for kernel offloaded I/O; `body`
+    /// returns false to stop. For writes, missing blocks are allocated as
+    /// unwritten and every extent is a data extent; report the finished
+    /// I/O with `completeWrite`. `body` runs after the engine lock is
+    /// released but must not call back into this mount.
+    public func mapForIO(
+        _ ino: UInt32, offset: UInt64, length: UInt64, write: Bool, _ body: @escaping (Ext4IOExtent) -> Bool
+    ) throws {
+        let ctx = ExtentContext(body)
+        let raw = Unmanaged.passUnretained(ctx).toOpaque()
+        let rc = ext4_map_for_io(
+            handle, ino, offset, length, write,
+            { ctx, logical, physical, length, zeroFill in
+                let c = Unmanaged<ExtentContext>.fromOpaque(ctx!).takeUnretainedValue()
+                return c.body(Ext4IOExtent(logical: logical, physical: physical, length: length, zeroFill: zeroFill))
+            }, raw)
+        withExtendedLifetime(ctx) {}
+        try ext4Check(rc)
+    }
+
+    /// The kernel finished writing `[offset, offset+length)` directly:
+    /// make the data visible and grow the file.
+    public func completeWrite(_ ino: UInt32, offset: UInt64, length: UInt64) throws {
+        try ext4Check(ext4_complete_write(handle, ino, offset, length))
     }
 
     /// Byte offset past the last allocated block (physical end of file).

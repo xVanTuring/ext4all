@@ -632,6 +632,18 @@ impl Fs {
         };
         let first = offset / bs;
         let last_blk = end.div_ceil(bs);
+        // Blocks only partly covered by the write that hold no data yet
+        // (new or unwritten): the kernel writes just its part, and the
+        // completion marks the whole block written, so the rest must not
+        // be stale device contents.
+        let mut partial = Vec::with_capacity(2);
+        if offset % bs != 0 {
+            partial.push(first);
+        }
+        if end % bs != 0 && !partial.contains(&(last_blk - 1)) {
+            partial.push(last_blk - 1);
+        }
+        let mut zero: Vec<u64> = Vec::new();
         let mut lblk = first;
         let mut allocated = false;
         while lblk < last_blk {
@@ -652,6 +664,14 @@ impl Fs {
                     unwritten,
                 } => {
                     let n = run.min(last_blk - lblk);
+                    if write && unwritten {
+                        zero.extend(
+                            partial
+                                .iter()
+                                .filter(|&&b| b >= lblk && b < lblk + n)
+                                .map(|&b| pblk + (b - lblk)),
+                        );
+                    }
                     push(IoExtent {
                         logical: pos,
                         physical: pblk * bs,
@@ -691,14 +711,27 @@ impl Fs {
                     let cur = inode.sectors(self.bs, self.huge_file()) as i64;
                     inode.set_sectors((cur + got as i64 * per) as u64);
                     allocated = true;
+                    let n = got as u64;
+                    zero.extend(
+                        partial
+                            .iter()
+                            .filter(|&&b| b >= lblk && b < lblk + n)
+                            .map(|&b| start + (b - lblk)),
+                    );
                     push(IoExtent {
                         logical: pos,
                         physical: start * bs,
-                        length: got as u64 * bs,
+                        length: n * bs,
                         zero_fill: false,
                     });
-                    lblk += got as u64;
+                    lblk += n;
                 }
+            }
+        }
+        if !zero.is_empty() {
+            let zeros = vec![0u8; bs as usize];
+            for pblk in zero {
+                self.dev.write_at(pblk * bs, &zeros)?;
             }
         }
         if allocated {

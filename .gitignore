@@ -1,0 +1,8 @@
+/target
+*.img
+.DS_Store
+xcuserdata/
+DerivedData/
+/macos/build/
+/macos/Vendor/
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/

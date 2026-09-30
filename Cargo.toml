@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/ext4-core", "crates/ext4-ffi", "crates/ext4-tool"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["xvan"]
+
+[workspace.lints.clippy]
+# `x % n == 0` reads naturally next to the on-disk format arithmetic
+manual_is_multiple_of = "allow"
+too_many_arguments = "allow"
+inconsistent_digit_grouping = "allow"
+unusual_byte_groupings = "allow"
+identity_op = "allow"
+
+[workspace.dependencies]
+ext4-core = { path = "crates/ext4-core" }
+
+[profile.release]
+debug = 1
+lto = "thin"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.test]
+opt-level = 2

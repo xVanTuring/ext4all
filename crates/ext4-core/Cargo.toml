@@ -1,0 +1,20 @@
+[package]
+name = "ext4-core"
+description = "Pure Rust ext4 file system implementation (read/write, jbd2 journal)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crc32c = "0.6.8"
+log = "0.4.34"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+proptest = "1.11.0"
+rand = "0.10.3"
+tempfile = "3.27.0"

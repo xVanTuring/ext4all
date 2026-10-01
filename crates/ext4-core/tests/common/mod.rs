@@ -75,6 +75,26 @@ impl Image {
         Self::create(size_mb, opts, None)
     }
 
+    /// An image of `bytes` bytes without a file system, filled with
+    /// `fill` (sparse zeros when `fill` is 0).
+    pub fn blank(bytes: u64, fill: u8) -> Image {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fs.img");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(bytes).unwrap();
+        if fill != 0 {
+            use std::os::unix::fs::FileExt;
+            let chunk = vec![fill; 1 << 20];
+            let mut off = 0;
+            while off < bytes {
+                let n = chunk.len().min((bytes - off) as usize);
+                f.write_all_at(&chunk[..n], off).unwrap();
+                off += n as u64;
+            }
+        }
+        Image { dir, path }
+    }
+
     pub fn device(&self, read_only: bool) -> Arc<FileDevice> {
         Arc::new(FileDevice::open(&self.path, read_only).unwrap())
     }

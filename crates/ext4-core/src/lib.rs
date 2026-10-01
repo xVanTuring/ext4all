@@ -13,6 +13,7 @@ pub mod error;
 pub mod features;
 pub mod hash;
 pub mod journal;
+pub mod mkfs;
 pub mod ondisk;
 
 pub use device::{AlignedDevice, BlockDevice, FileDevice, MemDevice};
@@ -20,4 +21,5 @@ pub use error::{Error, Result};
 pub mod fs;
 
 pub use fs::{Attr, DirEntryInfo, Fs, Ino, IoExtent, MountOptions, RenameFlags, SetAttr, StatFs, XattrSetMode};
+pub use mkfs::{FormatOptions, FormatSummary, format};
 pub use ondisk::inode::{FileType, Timestamp};

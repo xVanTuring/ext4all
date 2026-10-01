@@ -172,6 +172,72 @@ pub unsafe extern "C" fn ext4_probe(ops: *const Ext4DeviceOps, out: *mut Ext4Pro
     })
 }
 
+/// Create a new ext4 file system on the device. `argv`/`argc` are
+/// mke2fs-style options (see `ext4_core::mkfs::parse_args`; may be null
+/// when `argc` is 0); `uid`/`gid` are the requesting user, used by a bare
+/// `-E root_owner`. `progress` (may be null) receives bytes written and the
+/// total. The device's `release` callback is not called.
+///
+/// # Safety
+/// `ops` must be valid; `argv` must hold `argc` NUL-terminated strings;
+/// `out` must be valid for writes (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_format(
+    ops: *const Ext4DeviceOps,
+    argv: *const *const c_char,
+    argc: usize,
+    uid: u32,
+    gid: u32,
+    progress: Ext4ProgressFn,
+    progress_ctx: *mut c_void,
+    out: *mut Ext4FormatSummary,
+) -> i32 {
+    guard(|| {
+        if ops.is_null() || (argc > 0 && argv.is_null()) {
+            return Err(Error::invalid("null argument"));
+        }
+        let mut args = Vec::with_capacity(argc);
+        for i in 0..argc {
+            // SAFETY: caller contract
+            let p = unsafe { *argv.add(i) };
+            if p.is_null() {
+                return Err(Error::invalid("null option"));
+            }
+            // SAFETY: caller contract
+            let s = unsafe { std::ffi::CStr::from_ptr(p) };
+            args.push(
+                s.to_str()
+                    .map_err(|_| Error::invalid("option is not UTF-8"))?
+                    .to_string(),
+            );
+        }
+        let opts = ext4_core::mkfs::parse_args(&args, (uid, gid))?;
+        // SAFETY: caller contract
+        let mut o = unsafe { *ops };
+        o.release = None;
+        // SAFETY: callbacks valid for the duration of this call
+        let dev = AlignedDevice::new(unsafe { CallbackDevice::new(o)? });
+        let mut report = |done: u64, total: u64| {
+            if let Some(f) = progress {
+                // SAFETY: caller contract
+                unsafe { f(progress_ctx, done, total) };
+            }
+        };
+        let s = ext4_core::format(&dev, &opts, &mut report)?;
+        let summary = Ext4FormatSummary {
+            block_size: s.block_size,
+            blocks: s.blocks,
+            inodes: s.inodes,
+            groups: s.groups,
+            journal_blocks: s.journal_blocks,
+            uuid: s.uuid,
+        };
+        // SAFETY: caller contract
+        unsafe { put(out, summary) };
+        Ok(())
+    })
+}
+
 /// Mount the file system. On success `*out` receives a handle to release
 /// with [`ext4_close`]. The device's `release` callback runs when the
 /// handle is closed (or immediately if mounting fails).

@@ -19,6 +19,9 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
 {
     /// The volume created by `loadResource` (a unary file system has one).
     let loaded = Locked<Ext4Volume?>(nil)
+    /// The device handed to `loadResource`, kept even when it holds no
+    /// ext4 file system: formatting works on it.
+    let device = Locked<FSBlockDeviceResource?>(nil)
 
     override init() {
         _ = Log.installEngineLogger
@@ -60,6 +63,9 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
             reply(nil, POSIXError(.EINVAL))
             return
         }
+        Log.fs.info(
+            "loadResource \(device.bsdName, privacy: .public) options \(options.taskOptions, privacy: .public)")
+        self.device.withLock { $0 = device }
         let readOnly = Ext4FileSystem.wantsReadOnly(options)
         do {
             let io = ResourceBlockIO(device, readOnly: readOnly)
@@ -90,6 +96,7 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
         resource: FSResource, options: FSTaskOptions, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void
     ) {
         loaded.withLock { $0 = nil }
+        device.withLock { $0 = nil }
         containerStatus = .notReady(status: POSIXError(.ENODEV))
         reply(nil)
     }
@@ -124,8 +131,56 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
         return progress
     }
 
+    /// Create a new ext4 file system (`newfs_fskit -t ext4 [mke2fs
+    /// options] /dev/diskN`). Options are parsed by the engine; a bare
+    /// `-E root_owner` gives the root directory to the requesting user.
     func startFormat(task: FSTask, options: FSTaskOptions) throws -> Progress {
-        throw fs_errorForPOSIXError(ENOTSUP)
+        let args = options.taskOptions
+        let target = device.withLock { $0 }
+        Log.fs.info(
+            "startFormat \(target?.bsdName ?? "(no device)", privacy: .public) options \(args, privacy: .public)")
+        guard let target else { throw fs_errorForPOSIXError(ENXIO) }
+        if let volume = loaded.withLock({ $0 }) {
+            // an existing ext4 file system was loaded: never format under
+            // an active volume; an inactive one is shut down first
+            guard volume.releaseIfInactive() else {
+                Log.fs.error("startFormat: \(target.bsdName, privacy: .public) is in use")
+                throw fs_errorForPOSIXError(EBUSY)
+            }
+            loaded.withLock { $0 = nil }
+        }
+        let progress = Progress(totalUnitCount: 100)
+        let (uid, gid) = (getuid(), getgid())
+        // clear signatures of the previous file system (wipefs)
+        wipe(target) { [self] wipeError in
+            if let wipeError {
+                Log.fs.info("wipe before format: \(wipeError.localizedDescription, privacy: .public)")
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                var failure: (any Error)?
+                do {
+                    let io = ResourceBlockIO(target, readOnly: false)
+                    let r = try Ext4Mount.format(io, options: args, uid: uid, gid: gid) { done, total in
+                        progress.completedUnitCount = Int64(done * 100 / max(total, 1))
+                    }
+                    let size = r.blocks * UInt64(r.blockSize)
+                    task.logMessage(
+                        "ext4: \(r.blocks) blocks of \(r.blockSize) bytes (\(size >> 20) MiB), \(r.inodes) inodes, \(r.groups) groups, journal of \(r.journalBlocks) blocks, UUID \(r.uuid.uuidString)"
+                    )
+                    Log.fs.info("formatted \(target.bsdName, privacy: .public): \(r.blocks) blocks, \(r.inodes) inodes")
+                    containerStatus = .ready
+                } catch {
+                    Log.fs.error(
+                        "format \(target.bsdName, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    )
+                    task.logMessage("ext4: format failed: \(error.localizedDescription)")
+                    failure = error
+                }
+                progress.completedUnitCount = 100
+                task.didComplete(error: failure)
+            }
+        }
+        return progress
     }
 
     /// FSKit passes `--rdonly` for read-only loads; `mount -r` and

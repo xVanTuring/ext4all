@@ -21,6 +21,45 @@ final class Ext4BridgeTests: XCTestCase {
         XCTAssertTrue(dump.lowercased().contains(info.uuid.uuidString.lowercased()))
     }
 
+    func testFormat() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ext4kit-format-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("blank.img").path
+        FileManager.default.createFile(atPath: path, contents: nil)
+        let h = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        try h.truncate(atOffset: 600 << 20)
+        try h.close()
+
+        var reports: [(UInt64, UInt64)] = []
+        let r = try Ext4Mount.format(
+            StrictBlockIO(path: path, readOnly: false), options: ["-L", "swiftfmt", "-E", "root_owner", "-m", "0"],
+            uid: 501, gid: 20
+        ) { reports.append(($0, $1)) }
+        XCTAssertEqual(r.blockSize, 4096)
+        XCTAssertEqual(r.blocks, 153600)
+        XCTAssertEqual(r.journalBlocks, 4096)
+        XCTAssertGreaterThan(reports.count, 2)
+        XCTAssertEqual(reports.last?.0, reports.last?.1)
+        try TestImage.assertClean(path)
+
+        let info = try Ext4Mount.probe(FileBlockIO(path: path, readOnly: true))
+        XCTAssertEqual(info.label, "swiftfmt")
+        XCTAssertEqual(info.uuid, r.uuid)
+        XCTAssertEqual(info.support, .readWrite)
+        let mount = try Ext4Mount(FileBlockIO(path: path, readOnly: false), readOnly: false)
+        let root = try mount.stat(Ext4Mount.rootIno)
+        XCTAssertEqual(root.uid, 501)
+        _ = try mount.create(
+            Ext4Mount.rootIno, Data("after-format".utf8), type: UInt8(EXT4_FT_REG), perm: 0o644, uid: 0, gid: 0)
+        try mount.unmount()
+        try TestImage.assertClean(path)
+
+        XCTAssertThrowsError(
+            try Ext4Mount.format(FileBlockIO(path: path, readOnly: false), options: ["-O", "bigalloc"])
+        ) { XCTAssertEqual(posixCode($0), .EINVAL) }
+        try TestImage.assertClean(path)
+    }
+
     func testProbeReadOnlyAndUnsupported() throws {
         let ext3 = try TestImage.make(options: ["-t", "ext3"])
         XCTAssertEqual(try Ext4Mount.probe(StrictBlockIO(path: ext3, readOnly: true)).support, .readWrite)

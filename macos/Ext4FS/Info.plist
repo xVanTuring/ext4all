@@ -31,6 +31,11 @@
 			<key>shortOptions</key>
 			<string>fnpqy</string>
 		</dict>
+		<key>FSFormatOptionSyntax</key>
+		<dict>
+			<key>shortOptions</key>
+			<string>FqL:b:i:m:N:E:O:U:J:</string>
+		</dict>
 		<key>FSPersonalities</key>
 		<dict>
 			<key>ext2</key>
@@ -59,6 +64,12 @@
 				<integer>2</integer>
 				<key>FSfileObjectsAreCaseSensitive</key>
 				<true/>
+				<key>FSFormatContentMask</key>
+				<string>0FC63DAF-8483-4772-8E79-3D69D8477DE4</string>
+				<key>FSFormatMinimumSize</key>
+				<integer>1048576</integer>
+				<key>FSFormatMaximumSize</key>
+				<integer>1152921504606846976</integer>
 			</dict>
 		</dict>
 		<key>FSMediaTypes</key>

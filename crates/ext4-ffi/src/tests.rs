@@ -145,6 +145,94 @@ fn probe_reports_support_and_label() {
     unsafe { cb_release(o.ctx) };
 }
 
+unsafe extern "C" fn count_progress(ctx: *mut c_void, done: u64, total: u64) {
+    let v = unsafe { &mut *(ctx as *mut Vec<(u64, u64)>) };
+    v.push((done, total));
+}
+
+#[test]
+fn format_through_c_abi() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("blank.img");
+    std::fs::File::create(&p).unwrap().set_len(64 << 20).unwrap();
+    let args: Vec<std::ffi::CString> = ["-L", "made-by-ffi", "-m", "0", "-E", "root_owner"]
+        .iter()
+        .map(|s| std::ffi::CString::new(*s).unwrap())
+        .collect();
+    let argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
+    let o = ops(&p, false, 4096);
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    let mut s = Ext4FormatSummary::default();
+    let rc = unsafe {
+        ext4_format(
+            &o,
+            argv.as_ptr(),
+            argv.len(),
+            501,
+            20,
+            Some(count_progress),
+            &mut seen as *mut _ as *mut c_void,
+            &mut s,
+        )
+    };
+    assert_eq!(rc, 0);
+    unsafe { cb_release(o.ctx) };
+    assert_eq!((s.block_size, s.blocks), (1024, 65536));
+    assert!(seen.len() > 2 && seen.last().unwrap().0 == seen.last().unwrap().1);
+    fsck_clean(&p);
+
+    let o = ops(&p, true, 512);
+    let mut info = Ext4ProbeInfo::default();
+    assert_eq!(unsafe { ext4_probe(&o, &mut info) }, 0);
+    unsafe { cb_release(o.ctx) };
+    assert_eq!(&info.label[..12], b"made-by-ffi\0");
+    assert_eq!(info.uuid, s.uuid);
+    let h = mount(&ops(&p, false, 512), None);
+    let mut root = Ext4Attr::default();
+    assert_eq!(unsafe { ext4_stat(h, 2, &mut root) }, 0);
+    assert_eq!((root.uid, root.gid), (501, 20), "bare root_owner uses the caller");
+    create(h, 2, "hello", EXT4_FT_REG);
+    assert_eq!(unsafe { ext4_unmount(h) }, 0);
+    unsafe { ext4_close(h) };
+    fsck_clean(&p);
+
+    // bad options are rejected before anything is written
+    let bad = [
+        std::ffi::CString::new("-O").unwrap(),
+        std::ffi::CString::new("bigalloc").unwrap(),
+    ];
+    let argv: Vec<*const c_char> = bad.iter().map(|a| a.as_ptr()).collect();
+    let o = ops(&p, false, 512);
+    let rc = unsafe {
+        ext4_format(
+            &o,
+            argv.as_ptr(),
+            2,
+            0,
+            0,
+            None,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { cb_release(o.ctx) };
+    assert_eq!(rc, ext4_core::error::errno::EINVAL);
+    fsck_clean(&p);
+    let rc = unsafe {
+        ext4_format(
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            None,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, ext4_core::error::errno::EINVAL);
+}
+
 #[test]
 fn probe_rejects_non_ext4() {
     let d = tempfile::tempdir().unwrap();

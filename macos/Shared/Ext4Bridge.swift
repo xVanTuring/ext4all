@@ -111,6 +111,27 @@ public struct Ext4VolumeInfo: Equatable, Sendable {
     }
 }
 
+/// What `Ext4Mount.format` created.
+public struct Ext4FormatResult: Equatable, Sendable {
+    public var blockSize: UInt32
+    public var blocks: UInt64
+    public var inodes: UInt64
+    public var groups: UInt32
+    public var journalBlocks: UInt64
+    public var uuid: UUID
+
+    init(_ s: Ext4FormatSummary) {
+        blockSize = s.block_size
+        blocks = s.blocks
+        inodes = s.inodes
+        groups = s.groups
+        journalBlocks = s.journal_blocks
+        uuid = withUnsafeBytes(of: s.uuid) { raw in
+            UUID(uuid: raw.load(as: uuid_t.self))
+        }
+    }
+}
+
 /// Swift view of a directory entry.
 public struct Ext4DirEntry {
     public var name: Data
@@ -149,6 +170,36 @@ public final class Ext4Mount: @unchecked Sendable {
         var info = Ext4ProbeInfo()
         try ext4Check(ext4_probe(&ops, &info))
         return Ext4VolumeInfo(info)
+    }
+
+    /// Create a new ext4 file system on a device. `options` are
+    /// mke2fs-style (`-L label`, `-b`, `-i`, `-N`, `-m`, `-U`, `-J size=`,
+    /// `-O ^has_journal`, `-E root_owner[=uid:gid]`); a bare `root_owner`
+    /// uses `uid`/`gid`. `progress` receives bytes written and the total.
+    public static func format(
+        _ io: BlockIO, options: [String], uid: UInt32 = 0, gid: UInt32 = 0,
+        progress: (UInt64, UInt64) -> Void = { _, _ in }
+    ) throws -> Ext4FormatResult {
+        var ops = makeOps(io)
+        defer { releaseOps(ops) }
+        var summary = Ext4FormatSummary()
+        let cArgs = options.map { strdup($0) }
+        defer { cArgs.forEach { free($0) } }
+        let argv: [UnsafePointer<CChar>?] = cArgs.map { $0.map { UnsafePointer($0) } }
+        try withoutActuallyEscaping(progress) { report in
+            var box = report
+            try withUnsafeMutablePointer(to: &box) { ctx in
+                try argv.withUnsafeBufferPointer { av in
+                    try ext4Check(
+                        ext4_format(
+                            &ops, av.baseAddress, av.count, uid, gid,
+                            { ctx, done, total in
+                                ctx!.assumingMemoryBound(to: ((UInt64, UInt64) -> Void).self).pointee(done, total)
+                            }, UnsafeMutableRawPointer(ctx), &summary))
+                }
+            }
+        }
+        return Ext4FormatResult(summary)
     }
 
     public init(_ io: BlockIO, readOnly: Bool, commitIntervalSeconds: UInt32 = 5) throws {

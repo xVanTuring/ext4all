@@ -32,6 +32,11 @@ modifying commands:
   xattr-rm PATH NAME        remove an extended attribute
   label NAME                change the volume label
   recover                   replay the journal and process orphans
+
+creating:
+  mkfs [OPTIONS]            new ext4 file system filling IMAGE (an existing
+                            file); mke2fs options -L -b -i -N -m -U -J size=
+                            -O ^has_journal -E root_owner=UID:GID
 ";
 
 fn split(path: &str) -> Result<(&str, &str)> {
@@ -193,6 +198,17 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<()> {
             Ok(())
         }
     };
+    if cmd == "mkfs" {
+        let opts = ext4_core::mkfs::parse_args(rest, (0, 0))?;
+        let dev = FileDevice::open(image, false)?;
+        let s = ext4_core::format(&dev, &opts, &mut |_, _| {})?;
+        writeln!(
+            out,
+            "{} blocks of {} bytes, {} inodes, {} groups, journal of {} blocks",
+            s.blocks, s.block_size, s.inodes, s.groups, s.journal_blocks
+        )?;
+        return Ok(());
+    }
     let rw = MODIFYING.contains(&cmd);
     let dev = Arc::new(FileDevice::open(image, !rw)?);
     let mut fs = Fs::mount(

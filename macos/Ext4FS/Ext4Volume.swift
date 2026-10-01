@@ -24,6 +24,8 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     let itemLock = NSRecursiveLock()
     /// Set by `unmount`; a later `mount` makes the volume writable again.
     private var finished = false
+    /// Between activation and deactivation; guarded by `opLock`.
+    private var active = false
     /// Events already logged once (which I/O paths FSKit actually uses).
     private var noted = Set<String>()
     /// File data requests since mounting; guarded by `opLock`.
@@ -213,6 +215,7 @@ extension Ext4Volume: FSVolume.Handler {
         options: FSTaskOptions, replyHandler reply: @escaping @Sendable (FSActivateResult?, (any Error)?) -> Void
     ) {
         run("activate", handsOutItem: true, reply) {
+            active = true
             if kernelIO {
                 kernelIO = Ext4FileSystem.wantsKernelIO(options.taskOptions, defaultOn: true)
                 Log.fs.info("kernel offloaded I/O \(self.kernelIO ? "on" : "off (-o nokoio)", privacy: .public)")
@@ -235,8 +238,23 @@ extension Ext4Volume: FSVolume.Handler {
             Log.fs.error("deactivate: \(error.localizedDescription, privacy: .public)")
         }
         items.removeAll()
+        active = false
         opLock.unlock()
         reply(nil)
+    }
+
+    /// Close the engine unless the volume is active (for formatting a
+    /// loaded but unmounted device). Returns false if it is in use.
+    func releaseIfInactive() -> Bool {
+        opLock.lock()
+        defer { opLock.unlock() }
+        if active { return false }
+        do {
+            try mount.unmount()
+        } catch {
+            Log.fs.error("release before format: \(error.localizedDescription, privacy: .public)")
+        }
+        return true
     }
 
     func mount(options: FSTaskOptions, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void) {

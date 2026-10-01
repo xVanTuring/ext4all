@@ -211,6 +211,21 @@ pub const EXT4_SUPPORT_READ_WRITE: i32 = 0;
 pub const EXT4_SUPPORT_READ_ONLY: i32 = 1;
 pub const EXT4_SUPPORT_UNSUPPORTED: i32 = 2;
 
+/// What [`crate::ext4_format`] created.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ext4FormatSummary {
+    pub block_size: u32,
+    pub blocks: u64,
+    pub inodes: u64,
+    pub groups: u32,
+    pub journal_blocks: u64,
+    pub uuid: [u8; 16],
+}
+
+/// Format progress: bytes written so far and in total.
+pub type Ext4ProgressFn = Option<unsafe extern "C" fn(ctx: *mut c_void, done: u64, total: u64)>;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Ext4ProbeInfo {

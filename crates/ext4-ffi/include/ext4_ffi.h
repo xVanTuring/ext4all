@@ -142,6 +142,23 @@ typedef struct Ext4ProbeInfo {
   uint8_t subtype;
 } Ext4ProbeInfo;
 
+/**
+ * Format progress: bytes written so far and in total.
+ */
+typedef void (*Ext4ProgressFn)(void *ctx, uint64_t done, uint64_t total);
+
+/**
+ * What [`crate::ext4_format`] created.
+ */
+typedef struct Ext4FormatSummary {
+  uint32_t block_size;
+  uint64_t blocks;
+  uint64_t inodes;
+  uint32_t groups;
+  uint64_t journal_blocks;
+  uint8_t uuid[16];
+} Ext4FormatSummary;
+
 typedef struct Ext4MountOptions {
   bool read_only;
   /**
@@ -269,6 +286,26 @@ const char *ext4_version(void);
  * `ops` must be valid; `out` must be valid for writes.
  */
 int32_t ext4_probe(const struct Ext4DeviceOps *ops, struct Ext4ProbeInfo *out);
+
+/**
+ * Create a new ext4 file system on the device. `argv`/`argc` are
+ * mke2fs-style options (see `ext4_core::mkfs::parse_args`; may be null
+ * when `argc` is 0); `uid`/`gid` are the requesting user, used by a bare
+ * `-E root_owner`. `progress` (may be null) receives bytes written and the
+ * total. The device's `release` callback is not called.
+ *
+ * # Safety
+ * `ops` must be valid; `argv` must hold `argc` NUL-terminated strings;
+ * `out` must be valid for writes (or null).
+ */
+int32_t ext4_format(const struct Ext4DeviceOps *ops,
+                    const char *const *argv,
+                    size_t argc,
+                    uint32_t uid,
+                    uint32_t gid,
+                    Ext4ProgressFn progress,
+                    void *progress_ctx,
+                    struct Ext4FormatSummary *out);
 
 /**
  * Mount the file system. On success `*out` receives a handle to release

@@ -25,6 +25,9 @@ final class ResourceBlockIO: BlockIO, @unchecked Sendable {
         self.size = resource.blockSize * resource.blockCount
         self.sectorSize = Self.alignment(logical: resource.blockSize, physical: resource.physicalBlockSize)
         self.isReadOnly = readOnly || !resource.isWritable
+        Log.fs.debug(
+            "\(resource.bsdName, privacy: .public): block size \(resource.blockSize), physical \(resource.physicalBlockSize), transfers aligned to \(self.sectorSize)"
+        )
     }
 
     /// Transfer alignment: the physical sector size when it is a sane power
@@ -64,7 +67,19 @@ final class ResourceBlockIO: BlockIO, @unchecked Sendable {
             }
             done += n
         }
+        if Self.verifyWrites {
+            var back = [UInt8](repeating: 0, count: buffer.count)
+            try back.withUnsafeMutableBytes { try read(at: offset, into: $0) }
+            if !back.elementsEqual(buffer) {
+                let first = zip(back, buffer).enumerated().first { $0.element.0 != $0.element.1 }?.offset ?? -1
+                Log.fs.error("read after write at \(offset)+\(buffer.count) differs from byte \(first)")
+            }
+        }
     }
+
+    /// Diagnostic for drives that return stale data: read every write back
+    /// at once and log differences (defaults key `VerifyWrites`). Slow.
+    static let verifyWrites = UserDefaults.standard.bool(forKey: "VerifyWrites")
 
     func flush() throws {
         if isReadOnly { return }

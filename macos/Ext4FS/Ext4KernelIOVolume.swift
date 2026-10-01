@@ -16,9 +16,12 @@ import Foundation
 final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @unchecked Sendable {
     let resource: FSBlockDeviceResource
 
-    init(mount: Ext4Mount, info: Ext4VolumeInfo, resource: FSBlockDeviceResource) {
+    init(
+        mount: Ext4Mount, info: Ext4VolumeInfo, resource: FSBlockDeviceResource,
+        dataCache: DataCachePolicy = .system
+    ) {
         self.resource = resource
-        super.init(mount: mount, info: info, bsdName: resource.bsdName, kernelIO: true)
+        super.init(mount: mount, info: info, bsdName: resource.bsdName, kernelIO: true, dataCache: dataCache)
     }
 
     /// Largest extent length the packer accepts (`UINT32_MAX`), rounded
@@ -59,6 +62,9 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
             let write = flags.contains(.write)
             noteOnce(
                 write ? "blockmap-w" : "blockmap-r", "first kernel \(write ? "write" : "read") mapping (inode \(i))")
+            Log.fs.debug("blockmap \(write ? "write" : "read", privacy: .public) \(i) \(offset)+\(length)")
+            stats.add(write ? "blockmap write" : "blockmap read", bytes: length)
+            stats.add("blockmap \(write ? "write" : "read") \(IOStats.bucket(length))")
             let resource = self.resource
             let limit = maxExtentLength
             try mount.mapForIO(i, offset: UInt64(offset), length: UInt64(length), write: write) { e in
@@ -91,6 +97,10 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
             let i = try ino(file)
             let ok = Self.succeeded(status)
             noteOnce("complete", "first kernel I/O completion (inode \(i))")
+            let kind = flags.contains(.write) ? "write" : "read"
+            stats.add(ok ? "complete \(kind)" : "complete \(kind) failed", bytes: length)
+            Log.fs.debug(
+                "complete \(kind, privacy: .public) \(i) \(offset)+\(length) \(ok ? "ok" : "failed", privacy: .public)")
             if flags.contains(.write) && offset >= 0 && length > 0 {
                 if ok {
                     try mount.completeWrite(i, offset: UInt64(offset), length: UInt64(length))

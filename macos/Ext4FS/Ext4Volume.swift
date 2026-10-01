@@ -26,6 +26,13 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     private var finished = false
     /// Events already logged once (which I/O paths FSKit actually uses).
     private var noted = Set<String>()
+    /// File data requests since mounting; guarded by `opLock`.
+    var stats = IOStats()
+    /// Writes through the extension to files that use kernel offloaded
+    /// I/O, logged individually up to this many per mount.
+    private static let mixedWritesLogged = 8
+    /// Kernel data caching granted to opened files.
+    let dataCache: DataCachePolicy
 
     /// Log `message` the first time `event` happens on this volume; call
     /// with `opLock` held.
@@ -41,11 +48,15 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     /// handed out.
     private(set) var kernelIO: Bool
 
-    init(mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false) {
+    init(
+        mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false,
+        dataCache: DataCachePolicy = .system
+    ) {
         self.mount = mount
         self.bsdName = bsdName
         self.info = info
         self.kernelIO = kernelIO
+        self.dataCache = dataCache
         self.blockSize = UInt64(info.blockSize)
         let caps = FSVolume.SupportedCapabilities()
         caps.supportsPersistentObjectIDs = true
@@ -91,6 +102,7 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
         }
         let result: Result<T, any Error>
         opLock.lock()
+        Log.fs.debug("op \(what.description, privacy: .public)")
         do {
             result = .success(try body())
         } catch {
@@ -266,8 +278,21 @@ extension Ext4Volume: FSVolume.Handler {
             Log.fs.error("unmount \(self.bsdName, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
         finished = true
+        logStats()
         opLock.unlock()
         reply()
+    }
+
+    /// Log and reset the request counts; call with `opLock` held.
+    func logStats() {
+        guard !stats.isEmpty else { return }
+        Log.fs.info(
+            "\(self.bsdName, privacy: .public) requests (data cache \(self.dataCache.rawValue, privacy: .public), kernel I/O \(self.kernelIO ? "on" : "off", privacy: .public)):"
+        )
+        for line in stats.summary {
+            Log.fs.info("  \(line, privacy: .public)")
+        }
+        stats = IOStats()
     }
 
     /// Applications' fsync arrives here (observed as wait | 0x10000), and
@@ -278,6 +303,9 @@ extension Ext4Volume: FSVolume.Handler {
     /// the commit thread to commit soon.
     func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void) {
         let wait = flags.rawValue & (FSSyncFlags.wait.rawValue | FSSyncFlags.dWait.rawValue) != 0
+        opLock.lock()
+        stats.add(wait ? "sync wait" : "sync nowait")
+        opLock.unlock()
         guard wait else {
             mount.requestCommit()
             reply(nil)
@@ -512,6 +540,7 @@ extension Ext4Volume: FSVolume.Handler {
                 req.valid |= UInt32(EXT4_SET_SIZE)
                 req.size = newAttributes.size
                 consumed.insert(.size)
+                Log.fs.debug("setattr \(i) size \(newAttributes.size)")
             }
             if newAttributes.isValid(.accessTime) {
                 req.valid |= UInt32(EXT4_SET_ATIME)
@@ -603,6 +632,9 @@ extension Ext4Volume: FSVolume.ReadWriteHandler {
                 return try mount.read(
                     i, offset: UInt64(offset), into: UnsafeMutableRawBufferPointer(rebasing: raw[0..<len]))
             }
+            stats.add("read", bytes: n)
+            stats.add("read \(IOStats.bucket(length))")
+            Log.fs.debug("read \(i) \(offset)+\(length) -> \(n)")
             return try Self.unwrap(FSReadFileResult(bytesRead: n, itemAttributes: try attributes(item)))
         }
     }
@@ -615,7 +647,20 @@ extension Ext4Volume: FSVolume.ReadWriteHandler {
             guard offset >= 0 else { throw POSIXError(.EINVAL) }
             let i = try ino(item)
             noteOnce("write", "first write through the extension (inode \(i))")
+            stats.add("write", bytes: contents.count)
+            stats.add("write \(IOStats.bucket(contents.count))")
+            if (item as? Ext4Item)?.kernelIO == true {
+                // the kernel chose this path for a kernel offloaded I/O file
+                stats.add("write to kernel I/O file", bytes: contents.count)
+                if stats.counters["write to kernel I/O file"]!.calls <= Self.mixedWritesLogged {
+                    let size = (try? mount.stat(i).size) ?? 0
+                    Log.fs.info(
+                        "write through the extension to kernel I/O file \(i): \(offset)+\(contents.count), size \(size)"
+                    )
+                }
+            }
             let n = try mount.write(i, offset: UInt64(offset), data: contents)
+            Log.fs.debug("write \(i) \(offset)+\(contents.count)")
             return try Self.unwrap(
                 FSWriteFileResult(bytesWritten: n, itemAttributes: try attributes(item), freeSpace: freeSpace()))
         }

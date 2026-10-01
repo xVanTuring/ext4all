@@ -15,6 +15,7 @@ pub mod features;
 pub mod fscrypt;
 pub mod hash;
 pub mod journal;
+pub mod luks;
 pub mod mkfs;
 pub mod ondisk;
 

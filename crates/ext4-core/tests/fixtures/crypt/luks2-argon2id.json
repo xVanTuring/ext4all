@@ -1,0 +1,38 @@
+{
+ "kind": "luks",
+ "kernel": "7.2.8-1-aarch64-ARCH",
+ "cryptsetup": "cryptsetup 2.8.8 flags: UDEV BLKID KEYRING KERNEL_CAPI HW_OPAL",
+ "passphrases": [
+  "luks test passphrase",
+  "second passphrase"
+ ],
+ "dump": "LUKS header information\nVersion:       \t2\nEpoch:         \t4\nMetadata area: \t16384 [bytes]\nKeyslots area: \t16744448 [bytes]\nUUID:          \t3ad0808f-5502-4219-a9ce-566b783d3239\nLabel:         \ttestlabel\nSubsystem:     \t(no subsystem)\nFlags:       \t(no flags)\n\nData segments:\n  0: crypt\n\toffset: 16777216 [bytes]\n\tlength: (whole device)\n\tcipher: aes-xts-plain64\n\tsector: 4096 [bytes]\n\nKeyslots:\n  0: luks2\n\tKey:        512 bits\n\tPriority:   normal\n\tCipher:     aes-xts-plain64\n\tCipher key: 512 bits\n\tPBKDF:      argon2id\n\tTime cost:  4\n\tMemory:     32768\n\tThreads:    4\n\tSalt:       3e 2b b4 c5 e7 b3 86 d3 9d e9 70 87 c7 f3 a5 c4 \n\t            cd c4 99 31 c5 f8 c5 a8 0b a9 31 41 87 2f 9f d1 \n\tAF stripes: 4000\n\tAF hash:    sha256\n\tArea offset:32768 [bytes]\n\tArea length:258048 [bytes]\n\tDigest ID:  0\n  1: luks2\n\tKey:        512 bits\n\tPriority:   normal\n\tCipher:     aes-xts-plain64\n\tCipher key: 512 bits\n\tPBKDF:      argon2i\n\tTime cost:  4\n\tMemory:     16384\n\tThreads:    4\n\tSalt:       8f 46 bc 64 81 ca 71 fe 2e 44 8d 6a 3f 80 d4 99 \n\t            3e 5e bf 81 a9 79 7c c4 ed d5 a5 90 59 d1 91 7f \n\tAF stripes: 4000\n\tAF hash:    sha256\n\tArea offset:290816 [bytes]\n\tArea length:258048 [bytes]\n\tDigest ID:  0\nTokens:\nDigests:\n  0: pbkdf2\n\tHash:       sha256\n\tIterations: 1000\n\tSalt:       1f dd b7 b8 ad 7a ab 00 10 5f b6 62 d0 83 7a 7c \n\t            6e f8 a9 f6 65 17 c8 ae df 37 ef 8e 56 dc ad 33 \n\tDigest:     c6 27 31 8a 88 a4 d9 c9 90 e0 82 02 7a ef e4 2a \n\t            70 0e b2 ea 3b a5 82 5b f9 1b 35 5d 68 62 df 31 \n",
+ "files": [
+  {
+   "path": "data.bin",
+   "ino": 13,
+   "type": "file",
+   "size": 50000,
+   "sha256": "80c50092a689612acf1663e1495aca2ac18ac27c37c8f89a002d0cbae211f3dd"
+  },
+  {
+   "path": "dir",
+   "ino": 14,
+   "type": "dir"
+  },
+  {
+   "path": "hello.txt",
+   "ino": 12,
+   "type": "file",
+   "size": 11,
+   "sha256": "f5b7b71c0f82d0a91b6491fe813344909b512b71147e16249cf21efe9d8d5782"
+  },
+  {
+   "path": "dir/nested.txt",
+   "ino": 15,
+   "type": "file",
+   "size": 7,
+   "sha256": "370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3"
+  }
+ ]
+}

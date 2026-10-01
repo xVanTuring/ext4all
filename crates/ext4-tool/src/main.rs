@@ -1,11 +1,25 @@
-//! `ext4-tool IMAGE COMMAND [ARGS...]` — inspect and modify ext4 images.
+//! `ext4-tool [KEY OPTIONS] IMAGE COMMAND [ARGS...]` — inspect and modify
+//! ext4 images, including LUKS volumes and fscrypt-encrypted directories.
 
-use ext4_core::{Error, FileDevice, FileType, Fs, Ino, MountOptions, RenameFlags, Result, XattrSetMode};
+use ext4_core::{BlockDevice, Error, FileDevice, FileType, Fs, Ino, MountOptions, RenameFlags, Result, XattrSetMode};
 use std::io::Write;
 use std::sync::Arc;
 
 const USAGE: &str = "\
-usage: ext4-tool IMAGE COMMAND [ARGS...]
+usage: ext4-tool [KEY OPTIONS] IMAGE COMMAND [ARGS...]
+
+key options (secrets given on the command line are visible to other processes):
+  --key HEX                 add an fscrypt master key (repeatable)
+  --key-file FILE           add an fscrypt master key read from FILE
+  --passphrase TEXT         unlock with the protectors of the Linux fscrypt tool
+  --luks-passphrase TEXT    open a LUKS volume
+  --luks-key HEX            open a LUKS volume with its volume key
+
+encryption commands:
+  crypt-status PATH         encryption policy of a file or directory
+  encrypt PATH [v1]         encrypt an empty directory with the first --key
+                            (v2 policy, AES-256-XTS / AES-256-CTS)
+  luks-dump                 LUKS header summary (no key needed)
 
 read-only commands:
   info                      superblock summary and features
@@ -182,9 +196,66 @@ const MODIFYING: &[&str] = &[
     "xattr-rm",
     "label",
     "recover",
+    "encrypt",
 ];
 
+/// Keys from the command line.
+#[derive(Default)]
+struct Keys {
+    fscrypt: Vec<Vec<u8>>,
+    passphrases: Vec<Vec<u8>>,
+    luks_passphrase: Option<Vec<u8>>,
+    luks_key: Option<Vec<u8>>,
+}
+
+fn hex_arg(s: &str) -> Result<Vec<u8>> {
+    ext4_core::crypto::from_hex(s).ok_or_else(|| Error::invalid(format!("not hexadecimal: {s}")))
+}
+
+/// Split leading key options off the arguments.
+fn parse_keys(args: &[String]) -> Result<(Keys, &[String])> {
+    let mut k = Keys::default();
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with("--") {
+        let val = args
+            .get(i + 1)
+            .ok_or_else(|| Error::invalid(format!("{} needs a value", args[i])))?;
+        match args[i].as_str() {
+            "--key" => k.fscrypt.push(hex_arg(val)?),
+            "--key-file" => k.fscrypt.push(std::fs::read(val)?),
+            "--passphrase" => k.passphrases.push(val.as_bytes().to_vec()),
+            "--luks-passphrase" => k.luks_passphrase = Some(val.as_bytes().to_vec()),
+            "--luks-key" => k.luks_key = Some(hex_arg(val)?),
+            o => return Err(Error::invalid(format!("unknown option {o}\n{USAGE}"))),
+        }
+        i += 2;
+    }
+    Ok((k, &args[i..]))
+}
+
+/// The device holding the file system: the image itself, or the opened
+/// data area of a LUKS volume.
+fn open_device(image: &str, rw: bool, keys: &Keys) -> Result<Arc<dyn BlockDevice>> {
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open(image, !rw)?);
+    let Some(h) = ext4_core::luks::Header::read(&*dev)? else {
+        return Ok(dev);
+    };
+    let key = match (&keys.luks_key, &keys.luks_passphrase) {
+        (Some(k), _) => ext4_core::crypto::Secret::new(k.clone()),
+        (None, Some(p)) => h
+            .unlock(&*dev, p)?
+            .ok_or_else(|| Error::invalid("no LUKS key slot opens with this passphrase"))?,
+        (None, None) => {
+            return Err(Error::invalid(format!(
+                "{image} is a LUKS volume: give --luks-passphrase or --luks-key"
+            )));
+        }
+    };
+    Ok(Arc::new(h.open(dev, &key)?))
+}
+
 fn run(args: &[String], out: &mut dyn Write) -> Result<()> {
+    let (keys, args) = parse_keys(args)?;
     if args.len() < 2 {
         return Err(Error::invalid(USAGE));
     }
@@ -209,8 +280,23 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<()> {
         )?;
         return Ok(());
     }
+    if cmd == "luks-dump" {
+        let dev = FileDevice::open(image, true)?;
+        match ext4_core::luks::Header::read(&dev)? {
+            Some(h) => {
+                writeln!(out, "uuid:  {}", h.uuid)?;
+                writeln!(out, "label: {}", h.label)?;
+                writeln!(out, "{}", h.describe())?;
+                if let Err(e) = h.check_supported() {
+                    writeln!(out, "not supported: {e}")?;
+                }
+            }
+            None => writeln!(out, "not a LUKS volume")?,
+        }
+        return Ok(());
+    }
     let rw = MODIFYING.contains(&cmd);
-    let dev = Arc::new(FileDevice::open(image, !rw)?);
+    let dev = open_device(image, rw, &keys)?;
     let mut fs = Fs::mount(
         dev,
         MountOptions {
@@ -221,7 +307,45 @@ fn run(args: &[String], out: &mut dyn Write) -> Result<()> {
     if rw && fs.is_read_only() {
         return Err(Error::ReadOnly);
     }
+    let mut first_key = None;
+    for k in &keys.fscrypt {
+        let ids = fs.add_encryption_key(k)?;
+        first_key.get_or_insert(ids);
+    }
+    for p in &keys.passphrases {
+        if fs.unlock_with_protector(p)?.is_empty() {
+            return Err(Error::invalid("no fscrypt protector opens with this passphrase"));
+        }
+    }
     match cmd {
+        "crypt-status" => {
+            need(1)?;
+            let ino = fs.resolve(&rest[0])?;
+            match fs.encryption_context(ino)? {
+                Some(c) => writeln!(out, "encrypted: {}", c.describe())?,
+                None => writeln!(out, "not encrypted")?,
+            }
+        }
+        "encrypt" => {
+            need(1)?;
+            let ids = first_key.ok_or_else(|| Error::invalid("encrypt needs --key"))?;
+            let ino = fs.resolve(&rest[0])?;
+            use ext4_core::fscrypt::{Context, KeySpec, mode};
+            let key = if rest.get(1).is_some_and(|v| v == "v1") {
+                KeySpec::V1(ids.descriptor)
+            } else {
+                KeySpec::V2(ids.identifier)
+            };
+            let policy = Context {
+                contents_mode: mode::AES_256_XTS,
+                filenames_mode: mode::AES_256_CTS,
+                flags: 3, // 32-byte name padding, as the fscrypt tool
+                log2_data_unit_size: 0,
+                key,
+                nonce: [0; 16],
+            };
+            fs.set_encryption_policy(ino, &policy)?;
+        }
         "info" => info(&fs, out)?,
         "ls" => {
             let long = rest.first().is_some_and(|a| a == "-l");

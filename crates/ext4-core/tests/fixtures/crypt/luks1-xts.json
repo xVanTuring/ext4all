@@ -1,0 +1,37 @@
+{
+ "kind": "luks",
+ "kernel": "7.2.8-1-aarch64-ARCH",
+ "cryptsetup": "cryptsetup 2.8.8 flags: UDEV BLKID KEYRING KERNEL_CAPI HW_OPAL",
+ "passphrases": [
+  "luks test passphrase"
+ ],
+ "dump": "LUKS header information for /tmp/tmpxgdi1kyz/luks1-xts.img\n\nVersion:       \t1\nCipher name:   \taes\nCipher mode:   \txts-plain64\nHash spec:     \tsha256\nPayload offset:\t4096\nMK bits:       \t512\nMK digest:     \t57 74 b2 52 0f f8 e0 f6 51 73 90 18 01 86 18 a1 56 46 b1 fb \nMK salt:       \tc4 2a 08 7b 89 56 c4 98 89 db d3 23 43 61 b2 65 \n               \t6e 9b 29 b0 47 c9 07 26 74 d2 3b a0 f0 83 a6 6d \nMK iterations: \t720175\nUUID:          \tbbe89a2f-c87b-4be0-a394-ea5be23ba890\n\nKey Slot 0: ENABLED\n\tIterations:         \t291271\n\tSalt:               \t29 05 36 7f 77 52 df 2b 32 46 24 87 73 0e 8e b3 \n\t                      \ta6 b8 d5 f5 c8 2f f4 d3 58 14 74 93 c3 3e 97 7b \n\tKey material offset:\t8\n\tAF stripes:            \t4000\nKey Slot 1: DISABLED\nKey Slot 2: DISABLED\nKey Slot 3: DISABLED\nKey Slot 4: DISABLED\nKey Slot 5: DISABLED\nKey Slot 6: DISABLED\nKey Slot 7: DISABLED\n",
+ "files": [
+  {
+   "path": "data.bin",
+   "ino": 13,
+   "type": "file",
+   "size": 50000,
+   "sha256": "1798a0cc8312c55b97d66fa50cc97a98ab5e25eeb78c1d552342e041f94bd310"
+  },
+  {
+   "path": "dir",
+   "ino": 14,
+   "type": "dir"
+  },
+  {
+   "path": "hello.txt",
+   "ino": 12,
+   "type": "file",
+   "size": 11,
+   "sha256": "f5b7b71c0f82d0a91b6491fe813344909b512b71147e16249cf21efe9d8d5782"
+  },
+  {
+   "path": "dir/nested.txt",
+   "ino": 15,
+   "type": "file",
+   "size": 7,
+   "sha256": "370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3"
+  }
+ ]
+}

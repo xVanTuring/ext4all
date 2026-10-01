@@ -7,7 +7,8 @@ mod common;
 
 use common::{Image, tool};
 use ext4_core::crypto::from_hex;
-use ext4_core::{Error, FileDevice, FileType, Fs, Ino, MountOptions};
+use ext4_core::luks::Header;
+use ext4_core::{BlockDevice, Error, FileDevice, FileType, Fs, Ino, MountOptions};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -390,3 +391,108 @@ fn debugfs_agrees_on_inodes() {
     }
 }
 
+// --- LUKS ----------------------------------------------------------------------
+
+fn luks_check(name: &str) {
+    let (img, m) = fixture(name);
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open(&img.path, false).unwrap());
+    let h = Header::read(&*dev).unwrap().expect("LUKS header");
+    h.check_supported().unwrap();
+    assert!(h.unlock(&*dev, b"not the passphrase").unwrap().is_none(), "{name}");
+    let mut key = None;
+    for p in m["passphrases"].as_array().unwrap() {
+        let k = h.unlock(&*dev, p.as_str().unwrap().as_bytes()).unwrap();
+        assert!(k.is_some(), "{name}: passphrase {p}");
+        key = k;
+    }
+    let key = key.unwrap();
+    {
+        let crypt = Arc::new(h.open(dev.clone(), &key).unwrap());
+        let mut fs = Fs::mount(crypt, MountOptions::default()).unwrap();
+        assert_eq!(fs.label(), "luksdata");
+        assert_same(&walk(&mut fs), &expected(&m["files"]), name);
+        // write through the encryption, then check the decrypted volume
+        let f = fs
+            .create(fs.root(), b"from-mac.bin", FileType::Regular, 0o644, 0, 0, 0)
+            .unwrap();
+        fs.write(f.ino, 1, &common::pattern(123_457, 9)).unwrap();
+        fs.unmount().unwrap();
+    }
+    // e2fsck on a decrypted copy
+    let crypt = h.open(dev.clone(), &key).unwrap();
+    let plain = img.dir.path().join("plain.img");
+    let mut buf = vec![0u8; crypt.size() as usize];
+    crypt.read_at(0, &mut buf).unwrap();
+    std::fs::write(&plain, &buf).unwrap();
+    let out = Command::new(tool("e2fsck")).args(["-fn"]).arg(&plain).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{name}: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut fs = Fs::mount(
+        Arc::new(crypt),
+        MountOptions {
+            read_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ino = fs.resolve("/from-mac.bin").unwrap();
+    let mut b = vec![0u8; 123_458];
+    fs.read(ino, 0, &mut b).unwrap();
+    assert_eq!(b[0], 0);
+    assert_eq!(&b[1..], &common::pattern(123_457, 9)[..]);
+}
+
+#[test]
+fn luks1_xts() {
+    luks_check("luks1-xts");
+}
+
+#[test]
+fn luks1_cbc_essiv() {
+    luks_check("luks1-cbc-essiv");
+}
+
+#[test]
+fn luks2_argon2_two_slots() {
+    luks_check("luks2-argon2id");
+}
+
+#[test]
+fn luks2_pbkdf2_4k_sectors() {
+    luks_check("luks2-pbkdf2-4k");
+}
+
+/// cryptsetup defaults (Argon2id with ~780 MiB and 15 passes): slow.
+#[test]
+#[ignore]
+fn luks2_default_parameters() {
+    let t = std::time::Instant::now();
+    luks_check("luks2-default");
+    eprintln!("luks2-default: {:?}", t.elapsed());
+}
+
+#[test]
+fn luks_headers_describe() {
+    let (img, _) = fixture("luks2-argon2id");
+    let h = Header::read(&FileDevice::open(&img.path, true).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.version, 2);
+    assert_eq!(h.label, "testlabel");
+    assert_eq!(h.sector_size, 4096);
+    assert_eq!(h.data_offset, 16 << 20);
+    assert_eq!(h.keyslots.len(), 2);
+    assert!(h.describe().contains("argon2id"), "{}", h.describe());
+    // an ext4 image is not LUKS
+    let plain = Image::new(8, &["-t", "ext4"]);
+    assert!(
+        Header::read(&FileDevice::open(&plain.path, true).unwrap())
+            .unwrap()
+            .is_none()
+    );
+}

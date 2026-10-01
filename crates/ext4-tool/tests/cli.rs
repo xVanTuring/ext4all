@@ -85,6 +85,78 @@ fn cli_roundtrip() {
     fsck_clean(&img);
 }
 
+/// `ext4-tool OPTIONS IMAGE ARGS`
+fn tool_opts(opts: &[&str], img: &Path, args: &[&str]) -> (bool, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_ext4-tool"))
+        .args(opts)
+        .arg(img)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+#[test]
+fn cli_fscrypt() {
+    let d = tempfile::tempdir().unwrap();
+    let img = d.path().join("fs.img");
+    std::fs::File::create(&img).unwrap().set_len(32 << 20).unwrap();
+    let st = Command::new(sbin("mke2fs"))
+        .args(["-F", "-q", "-t", "ext4", "-O", "encrypt"])
+        .arg(&img)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let key: String = (0..64).map(|i| format!("{:02x}", i * 3)).collect();
+    let k = ["--key", key.as_str()];
+    let host = d.path().join("note.txt");
+    std::fs::write(&host, b"encrypted on a mac\n").unwrap();
+    ok(&img, &["mkdir", "/vault"]);
+    let (s, o) = tool_opts(&k, &img, &["encrypt", "/vault"]);
+    assert!(s, "{o}");
+    let (s, o) = tool_opts(&k, &img, &["put", host.to_str().unwrap(), "/vault/note.txt"]);
+    assert!(s, "{o}");
+    let (s, o) = tool_opts(&k, &img, &["cat", "/vault/note.txt"]);
+    assert!(s && o == "encrypted on a mac\n", "{o}");
+    let status = tool_opts(&k, &img, &["crypt-status", "/vault"]).1;
+    assert!(status.contains("AES-256-XTS"), "{status}");
+    // without the key: a no-key name, and no contents
+    let ls = ok(&img, &["ls", "/vault"]);
+    assert!(!ls.contains("note.txt"), "{ls}");
+    let shown = ls.lines().find(|l| !l.starts_with('.')).unwrap();
+    let (s, o) = tool(&img, &["cat", &format!("/vault/{shown}")]);
+    assert!(!s && o.contains("required key not available"), "{o}");
+    let (s, o) = tool(&img, &["put", host.to_str().unwrap(), "/vault/other.txt"]);
+    assert!(!s && o.contains("required key not available"), "{o}");
+    fsck_clean(&img);
+}
+
+#[test]
+fn cli_luks() {
+    let d = tempfile::tempdir().unwrap();
+    let img = d.path().join("luks.img");
+    let gz = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ext4-core/tests/fixtures/crypt/luks2-pbkdf2-4k.img.gz");
+    let out = Command::new("gzip").arg("-dc").arg(&gz).output().unwrap();
+    assert!(out.status.success());
+    std::fs::write(&img, out.stdout).unwrap();
+    let dump = ok(&img, &["luks-dump"]);
+    assert!(dump.contains("LUKS2 aes-xts-plain64"), "{dump}");
+    assert!(dump.contains("pbkdf2"), "{dump}");
+    let (s, o) = tool(&img, &["ls", "/"]);
+    assert!(!s && o.contains("--luks-passphrase"), "{o}");
+    let (s, o) = tool_opts(&["--luks-passphrase", "wrong"], &img, &["ls", "/"]);
+    assert!(!s && o.contains("no LUKS key slot"), "{o}");
+    let p = ["--luks-passphrase", "luks test passphrase"];
+    let (s, o) = tool_opts(&p, &img, &["cat", "/hello.txt"]);
+    assert!(s && o == "hello luks\n", "{o}");
+    let (s, o) = tool_opts(&p, &img, &["mkdir", "/new"]);
+    assert!(s, "{o}");
+    assert!(tool_opts(&p, &img, &["ls", "/"]).1.contains("new"));
+}
+
 #[test]
 fn cli_errors() {
     let d = tempfile::tempdir().unwrap();

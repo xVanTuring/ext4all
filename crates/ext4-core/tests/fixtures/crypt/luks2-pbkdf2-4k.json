@@ -1,0 +1,37 @@
+{
+ "kind": "luks",
+ "kernel": "7.2.8-1-aarch64-ARCH",
+ "cryptsetup": "cryptsetup 2.8.8 flags: UDEV BLKID KEYRING KERNEL_CAPI HW_OPAL",
+ "passphrases": [
+  "luks test passphrase"
+ ],
+ "dump": "LUKS header information\nVersion:       \t2\nEpoch:         \t3\nMetadata area: \t16384 [bytes]\nKeyslots area: \t16744448 [bytes]\nUUID:          \t69205192-6369-4119-9a6a-a5cab8e73bd7\nLabel:         \t(no label)\nSubsystem:     \t(no subsystem)\nFlags:       \t(no flags)\n\nData segments:\n  0: crypt\n\toffset: 16777216 [bytes]\n\tlength: (whole device)\n\tcipher: aes-xts-plain64\n\tsector: 4096 [bytes]\n\nKeyslots:\n  0: luks2\n\tKey:        512 bits\n\tPriority:   normal\n\tCipher:     aes-xts-plain64\n\tCipher key: 512 bits\n\tPBKDF:      pbkdf2\n\tHash:       sha512\n\tIterations: 1000\n\tSalt:       bc 76 98 c5 55 2e c4 49 fc 91 91 fa 63 c4 d9 7b \n\t            99 d4 c2 59 4a 75 cd dc 99 b1 03 e2 02 94 d5 38 \n\tAF stripes: 4000\n\tAF hash:    sha512\n\tArea offset:32768 [bytes]\n\tArea length:258048 [bytes]\n\tDigest ID:  0\nTokens:\nDigests:\n  0: pbkdf2\n\tHash:       sha512\n\tIterations: 1000\n\tSalt:       d8 76 f7 df 7a ae 8e 25 7b 51 85 f1 9b 6a 8a f1 \n\t            7b 4e fd 0e 70 3e 5a ec fc c2 c9 8b ec 99 b0 7f \n\tDigest:     45 0d 12 9b de 68 48 df 05 8f c9 e7 3a d5 dd d2 \n\t            18 eb 75 57 59 e1 4c a2 e0 4f a5 a2 d6 4a 2f 97 \n\t            22 08 72 a4 f4 45 bd bf f8 b0 38 b4 8b ef 65 fa \n\t            9f 38 b6 7f 6e c2 0f 5e 34 a5 f9 fe 32 a8 7d c4 \n",
+ "files": [
+  {
+   "path": "data.bin",
+   "ino": 13,
+   "type": "file",
+   "size": 50000,
+   "sha256": "3eabc5f6a67c6ae2f5a254c7b52298ad107cafabecdaf0530e42e1f46a52fa9d"
+  },
+  {
+   "path": "dir",
+   "ino": 14,
+   "type": "dir"
+  },
+  {
+   "path": "hello.txt",
+   "ino": 12,
+   "type": "file",
+   "size": 11,
+   "sha256": "f5b7b71c0f82d0a91b6491fe813344909b512b71147e16249cf21efe9d8d5782"
+  },
+  {
+   "path": "dir/nested.txt",
+   "ino": 15,
+   "type": "file",
+   "size": 7,
+   "sha256": "370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3"
+  }
+ ]
+}

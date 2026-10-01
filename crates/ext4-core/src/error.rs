@@ -80,6 +80,14 @@ pub enum Error {
     NoSuchOffset,
     #[error("directory cookie no longer valid")]
     StaleCookie,
+    /// The file is encrypted and its key has not been added (Linux
+    /// `ENOKEY`; Darwin has no such code, so it maps to `EACCES`).
+    #[error("required key not available")]
+    NoKey,
+    /// Linking or moving a file into an encrypted directory with a
+    /// different encryption policy (Linux also uses `EXDEV`).
+    #[error("invalid cross-device link")]
+    CrossDevice,
 }
 
 impl Error {
@@ -120,6 +128,8 @@ impl Error {
             Error::Busy => EBUSY,
             Error::NoSuchOffset => ENXIO,
             Error::StaleCookie => ESTALE,
+            Error::NoKey => EACCES,
+            Error::CrossDevice => EXDEV,
         }
     }
 }
@@ -144,6 +154,7 @@ mod tests {
         assert_eq!(Error::unsupported("x").errno(), 45);
         assert_eq!(Error::corrupt("x").errno(), 5);
         assert_eq!(Error::Device(16).errno(), 16);
+        assert_eq!(Error::NoKey.errno(), 13);
     }
 
     #[test]

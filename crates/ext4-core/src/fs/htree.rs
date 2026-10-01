@@ -1,5 +1,6 @@
 //! Hashed (htree / dx) directories.
 
+use super::crypt::{Fname, NameView};
 use super::dir::DirSlot;
 use super::{Fs, Ino};
 use crate::error::{Error, Result};
@@ -11,6 +12,10 @@ use crate::ondisk::superblock::{hash_version as hv, incompat};
 /// Marks directory cookies that are hash positions (htree directories)
 /// rather than byte offsets (linear directories).
 pub(crate) const HASH_COOKIE: u64 = 1 << 63;
+
+/// An entry gathered for enumeration: cookie key, on-disk name, inode,
+/// file type, (major, minor) hash.
+type HashedEntry = (u64, Vec<u8>, Ino, u8, (u32, u32));
 
 #[derive(Clone, Debug)]
 struct Frame {
@@ -51,9 +56,11 @@ impl Fs {
     }
 
     /// Hash version and seed to use for a directory, from its root block.
+    /// Encrypted directories hash the ciphertext names the same way;
+    /// casefolded ones hash casefolded (or, encrypted, keyed) names.
     fn dx_hash_params(&self, inode: &Inode, root: &[u8]) -> Result<(u8, [u32; 4])> {
-        if inode.has_flag(flags::CASEFOLD) || inode.has_flag(flags::ENCRYPT) {
-            return Err(Error::unsupported("casefold/encrypted htree hashing"));
+        if inode.has_flag(flags::CASEFOLD) {
+            return Err(Error::unsupported("casefold htree hashing"));
         }
         let info = DxRootInfo::parse(root);
         let v = self.sb.effective_hash_version(info.hash_version);
@@ -167,6 +174,7 @@ impl Fs {
         ino: Ino,
         inode: &Inode,
         cookie: u64,
+        view: &NameView,
         f: &mut dyn FnMut(super::DirEntryInfo) -> bool,
     ) -> Result<()> {
         let pos = if cookie == 0 {
@@ -197,17 +205,18 @@ impl Fs {
         // the legacy hash has no minor part: order names with the same
         // major hash by a second, independent hash so their keys differ
         let legacy = matches!(version, hv::LEGACY | hv::LEGACY_UNSIGNED);
-        let key_of = |name: &[u8]| -> Result<u64> {
+        // (cookie key, (major, minor) hash)
+        let key_of = |name: &[u8]| -> Result<(u64, (u32, u32))> {
             let h = dirhash(name, version, &seed).ok_or_else(|| Error::unsupported("hash"))?;
             let minor = if legacy { crate::csum::crc32c(!0, name) } else { h.minor };
-            Ok((((h.major >> 1) as u64) << 32) | minor as u64)
+            Ok(((((h.major >> 1) as u64) << 32) | minor as u64, (h.major, h.minor)))
         };
         let mut frames = self.dx_probe(ino, inode, ((start_key >> 32) as u32) << 1)?;
         let bs = self.bs as usize;
         let mut more = true;
         while more {
             // gather a leaf plus any leaves continuing its last hash
-            let mut batch: Vec<(u64, Vec<u8>, Ino, u8)> = Vec::new();
+            let mut batch: Vec<HashedEntry> = Vec::new();
             loop {
                 let b = frames.last().unwrap();
                 let leaf = b.entry(b.at).block as u64;
@@ -215,7 +224,8 @@ impl Fs {
                 for d in de::parse_block(&data, self.leaf_limit(&data), bs)? {
                     if d.inode != 0 {
                         let name = d.name(&data).to_vec();
-                        batch.push((key_of(&name)?, name, d.inode, d.file_type));
+                        let (key, hash) = key_of(&name)?;
+                        batch.push((key, name, d.inode, d.file_type, hash));
                     }
                 }
                 match self.dx_advance(ino, inode, &mut frames)? {
@@ -228,10 +238,18 @@ impl Fs {
                 }
             }
             batch.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            for (key, name, child, ft) in batch {
+            for (key, disk, child, ft, hash) in batch {
                 if key < start_key {
                     continue;
                 }
+                let name = if view.is_plain() {
+                    disk
+                } else {
+                    match view.present(&disk, None, Some(hash)) {
+                        Some(n) => n,
+                        None => continue,
+                    }
+                };
                 let info = super::DirEntryInfo {
                     name,
                     ino: child,
@@ -274,9 +292,17 @@ impl Fs {
         Ok(true)
     }
 
-    pub(crate) fn dx_find(&mut self, ino: Ino, inode: &Inode, name: &[u8]) -> Result<Option<DirSlot>> {
+    pub(crate) fn dx_find(&mut self, ino: Ino, inode: &Inode, name: &Fname) -> Result<Option<DirSlot>> {
         let root = self.dir_block(ino, inode, 0)?.1;
-        let hash = self.name_hash(inode, &root, name)?;
+        let hash = match (name.disk(), name.hash_hint()) {
+            (Some(n), _) => self.name_hash(inode, &root, n)?,
+            (None, Some(h)) => {
+                // hash as listed; validate the root before trusting it
+                self.dx_hash_params(inode, &root)?;
+                h & !1
+            }
+            (None, None) => return Err(Error::unsupported("name without a hash")),
+        };
         let mut frames = self.dx_probe(ino, inode, hash)?;
         loop {
             let b = frames.last().unwrap();

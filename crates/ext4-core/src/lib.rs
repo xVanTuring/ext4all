@@ -7,10 +7,12 @@
 
 pub mod bytes;
 pub mod cache;
+pub mod crypto;
 pub mod csum;
 pub mod device;
 pub mod error;
 pub mod features;
+pub mod fscrypt;
 pub mod hash;
 pub mod journal;
 pub mod mkfs;

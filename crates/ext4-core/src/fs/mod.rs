@@ -6,6 +6,7 @@
 
 mod alloc;
 mod bmap;
+mod crypt;
 mod dir;
 mod extent;
 mod file;
@@ -97,6 +98,10 @@ pub struct Fs {
     /// and must restore it on unmount.
     pub(crate) mounted_rw: bool,
     pub(crate) report: MountReport,
+    /// fscrypt master keys added for this mount.
+    pub(crate) keys: crate::fscrypt::Keyring,
+    /// Derived keys of recently used encrypted inodes.
+    pub(crate) crypt_cache: HashMap<Ino, Arc<crate::fscrypt::InodeCrypt>>,
     /// Number of metadata checksum errors seen (non-strict mode).
     pub checksum_errors: u64,
 }
@@ -198,6 +203,8 @@ impl Fs {
             generation_seed: rand_seed(),
             mounted_rw: false,
             report: MountReport::default(),
+            keys: Default::default(),
+            crypt_cache: HashMap::new(),
             checksum_errors: 0,
         };
         fs.load_group_descs()?;

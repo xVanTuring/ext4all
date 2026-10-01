@@ -3,10 +3,12 @@
 use super::extent::Mapping;
 use super::{Fs, Ino};
 use crate::error::{Error, Result};
+use crate::fscrypt::InodeCrypt;
 use crate::ondisk::extent::{Extent, MAX_INIT_LEN};
 use crate::ondisk::inode::{Inode, Timestamp, flags};
 use crate::ondisk::superblock::incompat;
 use crate::ondisk::xattr::{self as xa, INDEX_SYSTEM};
+use std::sync::Arc;
 
 /// Direct writes tracked per inode between mapping and completion (the
 /// kernel keeps far fewer in flight; the cap only bounds lost completions).
@@ -47,6 +49,8 @@ impl Fs {
 
     /// Read data of any inode type (used for files, symlinks, EA inodes).
     pub(crate) fn read_inode_data(&mut self, ino: Ino, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        // without the key even an empty encrypted file cannot be read
+        let crypt = self.contents_crypt(ino, inode)?;
         let size = inode.size();
         if offset >= size || buf.is_empty() {
             return Ok(0);
@@ -81,7 +85,17 @@ impl Fs {
                         if pblk + run > self.sb.blocks_count() {
                             return Err(Error::corrupt(format!("inode {ino}: block {pblk} beyond device")));
                         }
-                        self.dev.read_at(pblk * bs + in_blk, dst)?;
+                        match &crypt {
+                            None => self.dev.read_at(pblk * bs + in_blk, dst)?,
+                            Some(c) => {
+                                // whole data units, decrypted, then the part asked for
+                                let n = (in_blk + avail as u64).div_ceil(bs);
+                                let mut img = vec![0u8; (n * bs) as usize];
+                                self.dev.read_at(pblk * bs, &mut img)?;
+                                c.crypt_data(self.first_data_unit(c, lblk), &mut img, false)?;
+                                dst.copy_from_slice(&img[in_blk as usize..in_blk as usize + avail]);
+                            }
+                        }
                     }
                     done += avail;
                 }
@@ -93,6 +107,30 @@ impl Fs {
             }
         }
         Ok(len)
+    }
+
+    /// Key for the contents of a regular file (`None`: not encrypted;
+    /// [`Error::NoKey`] if encrypted and locked).
+    pub(crate) fn contents_crypt(&mut self, ino: Ino, inode: &Inode) -> Result<Option<Arc<InodeCrypt>>> {
+        if inode.is_reg() && inode.has_flag(flags::ENCRYPT) {
+            self.file_crypt(ino, inode)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Index of the first data unit of logical block `lblk`.
+    pub(crate) fn first_data_unit(&self, c: &InodeCrypt, lblk: u64) -> u64 {
+        lblk << (self.bs.trailing_zeros() - c.du_bits)
+    }
+
+    /// Write whole blocks of file data starting at logical block `lblk`
+    /// to physical block `pblk`, encrypting them first if needed.
+    fn write_file_blocks(&mut self, crypt: Option<&InodeCrypt>, lblk: u64, pblk: u64, mut img: Vec<u8>) -> Result<()> {
+        if let Some(c) = crypt {
+            c.crypt_data(self.first_data_unit(c, lblk), &mut img, true)?;
+        }
+        self.dev.write_at(pblk * self.bs as u64, &img)
     }
 
     /// Inline data: `i_block` followed by the `system.data` xattr value.
@@ -182,6 +220,7 @@ impl Fs {
         if inode.has_flag(flags::APPEND) && offset != inode.size() {
             return Err(Error::NotPermitted);
         }
+        self.contents_crypt(ino, &inode)?;
         if data.is_empty() {
             return Ok(0);
         }
@@ -234,20 +273,45 @@ impl Fs {
         if size % bs == 0 || inode.has_flag(flags::INLINE_DATA) {
             return Ok(());
         }
-        if let Mapping::Mapped {
-            pblk, unwritten: false, ..
-        } = self.map_block(ino, inode, size / bs)?
-        {
-            let off = size % bs;
-            let zeros = vec![0u8; (bs - off) as usize];
-            self.dev.write_at(pblk * bs + off, &zeros)?;
+        self.zero_in_block(ino, inode, size, size.div_ceil(bs) * bs)
+    }
+
+    /// Zero bytes `[start, end)` of the file, which lie within one block
+    /// (nothing to do for holes and unwritten blocks).
+    pub(crate) fn zero_in_block(&mut self, ino: Ino, inode: &Inode, start: u64, end: u64) -> Result<()> {
+        let bs = self.bs as u64;
+        if start >= end {
+            return Ok(());
         }
-        Ok(())
+        let lblk = start / bs;
+        debug_assert_eq!((end - 1) / bs, lblk);
+        let Mapping::Mapped {
+            pblk, unwritten: false, ..
+        } = self.map_block(ino, inode, lblk)?
+        else {
+            return Ok(());
+        };
+        match self.contents_crypt(ino, inode)? {
+            None => {
+                let zeros = vec![0u8; (end - start) as usize];
+                self.dev.write_at(pblk * bs + start % bs, &zeros)
+            }
+            Some(c) => {
+                let mut img = vec![0u8; bs as usize];
+                self.dev.read_at(pblk * bs, &mut img)?;
+                let du = self.first_data_unit(&c, lblk);
+                c.crypt_data(du, &mut img, false)?;
+                img[(start % bs) as usize..((end - 1) % bs + 1) as usize].fill(0);
+                self.write_file_blocks(Some(&c), lblk, pblk, img)
+            }
+        }
     }
 
     /// Core write path (extent or block mapped, not inline). Does not touch
     /// the size or timestamps.
     pub(crate) fn write_data(&mut self, ino: Ino, inode: &mut Inode, offset: u64, data: &[u8]) -> Result<usize> {
+        let crypt = self.contents_crypt(ino, inode)?;
+        let crypt = crypt.as_deref();
         let bs = self.bs as u64;
         let mut done = 0usize;
         let len = data.len();
@@ -269,10 +333,10 @@ impl Fs {
                         let nblocks = (in_blk + avail as u64).div_ceil(bs);
                         let mut img = vec![0u8; (nblocks * bs) as usize];
                         img[in_blk as usize..in_blk as usize + avail].copy_from_slice(chunk);
-                        self.dev.write_at(pblk * bs, &img)?;
+                        self.write_file_blocks(crypt, lblk, pblk, img)?;
                         self.ext_mark_written(ino, inode, lblk as u32, nblocks as u32)?;
                     } else {
-                        self.write_blocks_partial(pblk, in_blk, chunk)?;
+                        self.write_blocks_partial(crypt, lblk, pblk, in_blk, chunk)?;
                     }
                     done += avail;
                 }
@@ -297,7 +361,7 @@ impl Fs {
                     let avail = (got as u64 * bs - in_blk).min((len - done) as u64) as usize;
                     let mut img = vec![0u8; got as usize * bs as usize];
                     img[in_blk as usize..in_blk as usize + avail].copy_from_slice(&data[done..done + avail]);
-                    self.dev.write_at(start * bs, &img)?;
+                    self.write_file_blocks(crypt, lblk, start, img)?;
                     let per = bs as i64 / 512;
                     if extents {
                         let ins = self.ext_insert(
@@ -337,30 +401,46 @@ impl Fs {
     }
 
     /// Write `chunk` starting `in_blk` bytes into physical block `pblk`
-    /// (spanning following contiguous blocks), preserving partial blocks.
-    fn write_blocks_partial(&mut self, pblk: u64, in_blk: u64, chunk: &[u8]) -> Result<()> {
+    /// (logical block `lblk`, spanning following contiguous blocks),
+    /// preserving partial blocks.
+    fn write_blocks_partial(
+        &mut self,
+        crypt: Option<&InodeCrypt>,
+        lblk: u64,
+        pblk: u64,
+        in_blk: u64,
+        chunk: &[u8],
+    ) -> Result<()> {
         let bs = self.bs as u64;
         let start = pblk * bs + in_blk;
         let end = start + chunk.len() as u64;
         let head_aligned = start % bs == 0;
         let tail_aligned = end % bs == 0;
-        if head_aligned && tail_aligned {
+        if head_aligned && tail_aligned && crypt.is_none() {
             return self.dev.write_at(start, chunk);
         }
         // read-modify-write the partial head/tail blocks
         let first = start / bs;
         let last = (end - 1) / bs;
         let mut img = vec![0u8; ((last - first + 1) * bs) as usize];
+        let read_block = |fs: &mut Fs, img: &mut [u8], b: u64| -> Result<()> {
+            let o = ((b - first) * bs) as usize;
+            fs.dev.read_at(b * bs, &mut img[o..o + bs as usize])?;
+            if let Some(c) = crypt {
+                let du = fs.first_data_unit(c, lblk + (b - first));
+                c.crypt_data(du, &mut img[o..o + bs as usize], false)?;
+            }
+            Ok(())
+        };
         if !head_aligned {
-            self.dev.read_at(first * bs, &mut img[..bs as usize])?;
+            read_block(self, &mut img, first)?;
         }
         if !tail_aligned && (last != first || head_aligned) {
-            let o = ((last - first) * bs) as usize;
-            self.dev.read_at(last * bs, &mut img[o..o + bs as usize])?;
+            read_block(self, &mut img, last)?;
         }
         let o = (start - first * bs) as usize;
         img[o..o + chunk.len()].copy_from_slice(chunk);
-        self.dev.write_at(first * bs, &img)
+        self.write_file_blocks(crypt, lblk, first, img)
     }
 
     /// Change the file size, freeing or (sparsely) extending.
@@ -453,6 +533,7 @@ impl Fs {
         if !inode.is_reg() {
             return Err(Error::invalid("fallocate on non-regular file"));
         }
+        self.contents_crypt(ino, &inode)?;
         let end = offset.checked_add(len).ok_or(Error::TooBig)?;
         if end > self.max_file_size(&inode) {
             return Err(Error::TooBig);
@@ -519,6 +600,7 @@ impl Fs {
         if !inode.is_reg() {
             return Err(Error::invalid("punch_hole on non-regular file"));
         }
+        self.contents_crypt(ino, &inode)?;
         if let Some(old) = self.prepare_for_write(ino, &mut inode)? {
             let sz = inode.size();
             inode.set_size(0);
@@ -536,24 +618,11 @@ impl Fs {
         // zero partial blocks at the edges, free whole blocks in between
         let first_full = offset.div_ceil(bs);
         let last_full = end / bs;
-        let zero_range = |fs: &mut Fs, inode: &Inode, s: u64, e: u64| -> Result<()> {
-            if s >= e {
-                return Ok(());
-            }
-            if let Mapping::Mapped {
-                pblk, unwritten: false, ..
-            } = fs.map_block(ino, inode, s / bs)?
-            {
-                let zeros = vec![0u8; (e - s) as usize];
-                fs.dev.write_at(pblk * bs + s % bs, &zeros)?;
-            }
-            Ok(())
-        };
         if first_full > last_full {
-            zero_range(self, &inode, offset, end)?;
+            self.zero_in_block(ino, &inode, offset, end)?;
         } else {
-            zero_range(self, &inode, offset, first_full * bs)?;
-            zero_range(self, &inode, last_full * bs, end)?;
+            self.zero_in_block(ino, &inode, offset, first_full * bs)?;
+            self.zero_in_block(ino, &inode, last_full * bs, end)?;
             self.free_range(ino, &mut inode, first_full, last_full)?;
         }
         let now = Timestamp::now();
@@ -596,6 +665,10 @@ impl Fs {
         let mut inode = self.read_live_inode(ino)?;
         if !inode.is_reg() {
             return Err(Error::invalid("direct I/O on a non-regular file"));
+        }
+        if inode.has_flag(flags::ENCRYPT) {
+            // the kernel would move ciphertext
+            return Err(Error::unsupported("direct I/O on an encrypted file"));
         }
         if len == 0 {
             return Ok(Vec::new());

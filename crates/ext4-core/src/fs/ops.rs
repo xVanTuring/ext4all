@@ -1,6 +1,7 @@
 //! Namespace operations: create, mkdir, symlink, link, unlink, rmdir,
 //! rename, set_attr, read_link.
 
+use super::crypt::Fname;
 use super::dir::validate_name;
 use super::{Attr, Fs, Ino, RenameFlags, SetAttr};
 use crate::error::{Error, Result};
@@ -140,15 +141,22 @@ impl Fs {
         if parent_inode.has_flag(flags::PROJINHERIT) {
             inode.set_projid(parent_inode.projid());
         }
+        // files in an encrypted directory are encrypted with its policy
+        if let Some(ctx) = self.inherit_context(parent, parent_inode, ft)? {
+            self.apply_context(ino, &mut inode, &ctx)?;
+        }
         Ok((ino, inode))
     }
 
-    fn check_new_name(&mut self, dir: Ino, dinode: &Inode, name: &[u8]) -> Result<()> {
+    /// Check that `name` can be added to `dir`; returns its on-disk name
+    /// (encrypted in an encrypted directory, which needs the key).
+    fn check_new_name(&mut self, dir: Ino, dinode: &Inode, name: &[u8]) -> Result<Vec<u8>> {
         reject_dots(name)?;
-        if self.find_entry(dir, dinode, name)?.is_some() {
+        let disk = self.new_disk_name(dir, dinode, name)?;
+        if self.find_entry(dir, dinode, &Fname::Disk(disk.clone()))?.is_some() {
             return Err(Error::Exists);
         }
-        Ok(())
+        Ok(disk)
     }
 
     /// Create a regular file, device node, FIFO or socket.
@@ -180,13 +188,13 @@ impl Fs {
             return Err(Error::invalid("use mkdir/symlink"));
         }
         let mut dinode = self.parent_dir(dir)?;
-        self.check_new_name(dir, &dinode, name)?;
+        let disk = self.check_new_name(dir, &dinode, name)?;
         let (ino, mut inode) = self.new_inode(dir, &dinode, ft, perm, uid, gid)?;
         if matches!(ft, FileType::CharDev | FileType::BlockDev) {
             inode.set_rdev(rdev);
         }
         self.write_inode(ino, &inode)?;
-        if let Err(e) = self.add_entry(dir, &mut dinode, name, ino, ft) {
+        if let Err(e) = self.add_entry(dir, &mut dinode, &disk, ino, ft) {
             self.free_inode(ino, false)?;
             return Err(e);
         }
@@ -203,7 +211,7 @@ impl Fs {
     fn mkdir_impl(&mut self, dir: Ino, name: &[u8], perm: u16, uid: u32, gid: u32) -> Result<Attr> {
         self.require_rw()?;
         let mut dinode = self.parent_dir(dir)?;
-        self.check_new_name(dir, &dinode, name)?;
+        let disk = self.check_new_name(dir, &dinode, name)?;
         self.can_add_subdir(&dinode)?;
         self.ensure_space(4)?;
         let (ino, mut inode) = self.new_inode(dir, &dinode, FileType::Directory, perm, uid, gid)?;
@@ -212,7 +220,7 @@ impl Fs {
             return Err(e);
         }
         self.write_inode(ino, &inode)?;
-        if let Err(e) = self.add_entry(dir, &mut dinode, name, ino, FileType::Directory) {
+        if let Err(e) = self.add_entry(dir, &mut dinode, &disk, ino, FileType::Directory) {
             self.destroy_inode(ino, &mut inode)?;
             return Err(e);
         }
@@ -244,8 +252,14 @@ impl Fs {
             return Err(Error::NameTooLong);
         }
         let mut dinode = self.parent_dir(dir)?;
-        self.check_new_name(dir, &dinode, name)?;
+        let disk = self.check_new_name(dir, &dinode, name)?;
         let (ino, mut inode) = self.new_inode(dir, &dinode, FileType::Symlink, 0o777, uid, gid)?;
+        // an encrypted target is stored as `le16 length || ciphertext`
+        let stored = match self.file_crypt(ino, &inode)? {
+            Some(c) => crate::fscrypt::encrypt_symlink(&c, target, self.bs as usize)?,
+            None => target.to_vec(),
+        };
+        let target = &stored[..];
         if target.len() < 60 {
             inode.set_flag(flags::EXTENTS, false);
             let area = inode.block_area_mut();
@@ -277,18 +291,52 @@ impl Fs {
             inode.set_size(target.len() as u64);
         }
         self.write_inode(ino, &inode)?;
-        if let Err(e) = self.add_entry(dir, &mut dinode, name, ino, FileType::Symlink) {
+        if let Err(e) = self.add_entry(dir, &mut dinode, &disk, ino, FileType::Symlink) {
             self.destroy_inode(ino, &mut inode)?;
             return Err(e);
         }
         Self::touch_dir(&mut dinode);
         self.write_inode(dir, &dinode)?;
         self.maybe_commit()?;
-        Ok(self.inode_attr(ino, &inode))
+        self.symlink_attr(ino, &inode)
     }
 
+    /// Target of a symlink: decrypted, or in no-key form when encrypted
+    /// without the key (as Linux shows it).
     pub fn read_link(&mut self, ino: Ino) -> Result<Vec<u8>> {
         let inode = self.read_live_inode(ino)?;
+        let stored = self.read_link_stored(ino, &inode)?;
+        if !inode.has_flag(flags::ENCRYPT) {
+            return Ok(stored);
+        }
+        let cipher = crate::fscrypt::symlink_ciphertext(&stored)?;
+        let t = match self.crypt(ino, &inode)? {
+            super::crypt::Crypt::Unlocked(c) => c.decrypt_name(cipher)?,
+            _ => {
+                if cipher.len() < crate::fscrypt::MIN_NAME_LEN {
+                    return Err(Error::corrupt("encrypted symlink target too short"));
+                }
+                crate::fscrypt::nokey_name(0, 0, cipher)
+            }
+        };
+        if t.is_empty() {
+            return Err(Error::corrupt(format!("symlink {ino}: empty target")));
+        }
+        Ok(t)
+    }
+
+    /// Attributes of a symlink, with the size of the target as presented.
+    pub(crate) fn symlink_attr(&mut self, ino: Ino, inode: &Inode) -> Result<Attr> {
+        let mut a = self.inode_attr(ino, inode);
+        if inode.has_flag(flags::ENCRYPT) {
+            a.size = self.read_link(ino)?.len() as u64;
+        }
+        Ok(a)
+    }
+
+    /// The bytes stored for a symlink target.
+    fn read_link_stored(&mut self, ino: Ino, inode: &Inode) -> Result<Vec<u8>> {
+        let inode = inode.clone();
         if !inode.is_symlink() {
             return Err(Error::invalid("not a symlink"));
         }
@@ -339,15 +387,16 @@ impl Fs {
             return Err(Error::NotFound);
         }
         let mut dinode = self.parent_dir(dir)?;
-        self.check_new_name(dir, &dinode, name)?;
-        self.add_entry(dir, &mut dinode, name, ino, inode.file_type())?;
+        let disk = self.check_new_name(dir, &dinode, name)?;
+        self.check_permitted_context(dir, &dinode, ino, &inode)?;
+        self.add_entry(dir, &mut dinode, &disk, ino, inode.file_type())?;
         Self::touch_dir(&mut dinode);
         self.write_inode(dir, &dinode)?;
         inode.set_links_count(inode.links_count() + 1);
         inode.set_ctime(Timestamp::now());
         self.write_inode(ino, &inode)?;
         self.maybe_commit()?;
-        Ok(self.inode_attr(ino, &inode))
+        self.full_attr(ino, &inode)
     }
 
     /// Drop one link of an inode; release it when no links remain.
@@ -384,7 +433,9 @@ impl Fs {
         self.require_rw()?;
         reject_dots(name)?;
         let mut dinode = self.parent_dir(dir)?;
-        let slot = self.find_entry(dir, &dinode, name)?.ok_or(Error::NotFound)?;
+        // works without the key too (by no-key name), as on Linux
+        let fname = self.lookup_fname(dir, &dinode, name)?;
+        let slot = self.find_entry(dir, &dinode, &fname)?.ok_or(Error::NotFound)?;
         let mut inode = self.read_live_inode(slot.ino)?;
         if inode.is_dir() {
             return Err(Error::IsDir);
@@ -392,7 +443,7 @@ impl Fs {
         if inode.has_flag(flags::IMMUTABLE) || inode.has_flag(flags::APPEND) {
             return Err(Error::NotPermitted);
         }
-        self.remove_slot(dir, &mut dinode, &slot, name)?;
+        self.remove_slot(dir, &mut dinode, &slot, &fname)?;
         Self::touch_dir(&mut dinode);
         self.write_inode(dir, &dinode)?;
         self.drop_link(slot.ino, &mut inode)?;
@@ -413,7 +464,8 @@ impl Fs {
         }
         validate_name(name)?;
         let mut dinode = self.parent_dir(dir)?;
-        let slot = self.find_entry(dir, &dinode, name)?.ok_or(Error::NotFound)?;
+        let fname = self.lookup_fname(dir, &dinode, name)?;
+        let slot = self.find_entry(dir, &dinode, &fname)?.ok_or(Error::NotFound)?;
         if slot.ino == ROOT_INO {
             return Err(Error::Busy);
         }
@@ -427,7 +479,7 @@ impl Fs {
         if inode.has_flag(flags::IMMUTABLE) || inode.has_flag(flags::APPEND) {
             return Err(Error::NotPermitted);
         }
-        self.remove_slot(dir, &mut dinode, &slot, name)?;
+        self.remove_slot(dir, &mut dinode, &slot, &fname)?;
         Self::dec_dir_links(&mut dinode);
         Self::touch_dir(&mut dinode);
         self.write_inode(dir, &dinode)?;
@@ -451,7 +503,7 @@ impl Fs {
             }
             let inode = self.read_live_inode(dir)?;
             let parent = self
-                .find_entry(dir, &inode, b"..")?
+                .find_entry(dir, &inode, &Fname::plain(b".."))?
                 .ok_or_else(|| Error::corrupt("missing .."))?
                 .ino;
             if parent == dir {
@@ -473,9 +525,15 @@ impl Fs {
             return Err(Error::invalid("exchange with no_replace"));
         }
         let sinode_dir = self.parent_dir(sdir)?;
-        let src = self.find_entry(sdir, &sinode_dir, sname)?.ok_or(Error::NotFound)?;
         let dinode_dir = self.parent_dir(ddir)?;
-        let dst = self.find_entry(ddir, &dinode_dir, dname)?;
+        // names in encrypted directories move only with the keys (Linux
+        // refuses no-key names here)
+        self.require_key(sdir, &sinode_dir)?;
+        self.require_key(ddir, &dinode_dir)?;
+        let sfname = self.lookup_fname(sdir, &sinode_dir, sname)?;
+        let dfname = self.lookup_fname(ddir, &dinode_dir, dname)?;
+        let src = self.find_entry(sdir, &sinode_dir, &sfname)?.ok_or(Error::NotFound)?;
+        let dst = self.find_entry(ddir, &dinode_dir, &dfname)?;
         let src_inode = self.read_live_inode(src.ino)?;
         let src_is_dir = src_inode.is_dir();
         if sdir == ddir && sname == dname {
@@ -484,9 +542,12 @@ impl Fs {
         if src_is_dir && sdir != ddir && self.is_ancestor(src.ino, ddir)? {
             return Err(Error::invalid("cannot move a directory into itself"));
         }
+        if sdir != ddir {
+            self.check_permitted_context(ddir, &dinode_dir, src.ino, &src_inode)?;
+        }
         if fl.exchange {
             let dst = dst.ok_or(Error::NotFound)?;
-            return self.rename_exchange(sdir, sname, src.ino, ddir, dname, dst.ino);
+            return self.rename_exchange(sdir, &sfname, src.ino, ddir, &dfname, dst.ino);
         }
         if let Some(d) = &dst {
             if fl.no_replace {
@@ -519,11 +580,12 @@ impl Fs {
         let mut dd = self.read_live_inode(ddir)?;
         let replaced = match &dst {
             Some(d) => {
-                self.retarget_slot(ddir, &mut dd, d, dname, src.ino, ft)?;
+                self.retarget_slot(ddir, &mut dd, d, &dfname, src.ino, ft)?;
                 Some(d.ino)
             }
             None => {
-                self.add_entry(ddir, &mut dd, dname, src.ino, ft)?;
+                let disk = dfname.disk().ok_or(Error::NoKey)?;
+                self.add_entry(ddir, &mut dd, disk, src.ino, ft)?;
                 None
             }
         };
@@ -533,9 +595,9 @@ impl Fs {
         // 2. remove the source entry (re-found: the block may have changed)
         let mut sd = self.read_live_inode(sdir)?;
         let slot = self
-            .find_entry(sdir, &sd, sname)?
+            .find_entry(sdir, &sd, &sfname)?
             .ok_or_else(|| Error::corrupt("rename source vanished"))?;
-        self.remove_slot(sdir, &mut sd, &slot, sname)?;
+        self.remove_slot(sdir, &mut sd, &slot, &sfname)?;
         Self::touch_dir(&mut sd);
         self.write_inode(sdir, &sd)?;
 
@@ -576,10 +638,10 @@ impl Fs {
     fn rename_exchange(
         &mut self,
         sdir: Ino,
-        sname: &[u8],
+        sname: &Fname,
         sino: Ino,
         ddir: Ino,
-        dname: &[u8],
+        dname: &Fname,
         dino: Ino,
     ) -> Result<()> {
         if sino == dino {
@@ -592,6 +654,10 @@ impl Fs {
         }
         if di.is_dir() && sdir != ddir && self.is_ancestor(dino, sdir)? {
             return Err(Error::invalid("cannot move a directory into itself"));
+        }
+        if sdir != ddir {
+            let sd = self.read_live_inode(sdir)?;
+            self.check_permitted_context(sdir, &sd, dino, &di)?;
         }
         let mut dd = self.read_live_inode(ddir)?;
         let dslot = self.find_entry(ddir, &dd, dname)?.ok_or(Error::NotFound)?;
@@ -671,6 +737,8 @@ impl Fs {
             if !inode.is_reg() {
                 return Err(Error::invalid("truncate of non-regular file"));
             }
+            // Linux needs the key to truncate an encrypted file
+            self.require_key(ino, &inode)?;
             if sz != inode.size() {
                 if sz > inode.size() {
                     self.ensure_space(1)?;
@@ -699,7 +767,7 @@ impl Fs {
         }
         self.write_inode(ino, &inode)?;
         self.maybe_commit()?;
-        Ok(self.inode_attr(ino, &inode))
+        self.full_attr(ino, &inode)
     }
 
     /// Truncate or extend a regular file.

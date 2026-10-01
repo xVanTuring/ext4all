@@ -1,5 +1,6 @@
 //! Directories: lookup, enumeration, entry insertion and removal.
 
+use super::crypt::Fname;
 use super::extent::Mapping;
 use super::{Attr, DirEntryInfo, Fs, Ino};
 use crate::error::{Error, Result};
@@ -154,7 +155,7 @@ impl Fs {
     }
 
     /// Convert an inline directory to a regular one-block directory.
-    fn uninline_dir(&mut self, ino: Ino, inode: &mut Inode) -> Result<()> {
+    pub(crate) fn uninline_dir(&mut self, ino: Ino, inode: &mut Inode) -> Result<()> {
         let entries = self.inline_dir_entries(inode)?;
         let parent = entries[0].1;
         if let Some(r) = inode.xattr_area() {
@@ -174,14 +175,14 @@ impl Fs {
 
     // --- lookup -----------------------------------------------------------
 
-    /// Find `name` in a directory.
-    pub(crate) fn find_entry(&mut self, ino: Ino, inode: &Inode, name: &[u8]) -> Result<Option<DirSlot>> {
+    /// Find the entry with on-disk name `name` in a directory.
+    pub(crate) fn find_entry(&mut self, ino: Ino, inode: &Inode, name: &Fname) -> Result<Option<DirSlot>> {
         if !inode.is_dir() {
             return Err(Error::NotDir);
         }
         if inode.has_flag(flags::INLINE_DATA) {
             for (n, child, ft) in self.inline_dir_entries(inode)? {
-                if n == name {
+                if name.matches(&n) {
                     return Ok(Some(DirSlot {
                         lblk: u64::MAX,
                         pblk: 0,
@@ -194,7 +195,7 @@ impl Fs {
             }
             return Ok(None);
         }
-        if name == b"." || name == b".." {
+        if matches!(name.disk(), Some(b".") | Some(b"..")) {
             // always in the first block (the dx root of an htree directory)
             if self.dir_nblocks(inode) == 0 {
                 return Ok(None);
@@ -203,7 +204,11 @@ impl Fs {
         }
         if inode.has_flag(flags::INDEX) && self.sb.has_compat(compat::DIR_INDEX) {
             match self.dx_find(ino, inode, name) {
-                Ok(r) => return Ok(r),
+                Ok(Some(r)) => return Ok(Some(r)),
+                // a long no-key name carries the hash it was listed with;
+                // should that not lead to it, look at every block
+                Ok(None) if matches!(name, Fname::Long(_)) => {}
+                Ok(None) => return Ok(None),
                 Err(Error::Unsupported(_)) => {} // e.g. casefold hash: scan linearly
                 Err(e) => return Err(e),
             }
@@ -217,13 +222,19 @@ impl Fs {
     }
 
     /// Search one leaf block for `name`.
-    pub(crate) fn find_in_block(&mut self, ino: Ino, inode: &Inode, lblk: u64, name: &[u8]) -> Result<Option<DirSlot>> {
+    pub(crate) fn find_in_block(
+        &mut self,
+        ino: Ino,
+        inode: &Inode,
+        lblk: u64,
+        name: &Fname,
+    ) -> Result<Option<DirSlot>> {
         let (pblk, data) = self.dir_block(ino, inode, lblk)?;
         let kind = self.dir_block_kind(inode, lblk, &data);
         let entries = self.block_entries(&data, kind)?;
         let mut prev = None;
         for d in entries {
-            if d.inode != 0 && d.name(&data) == name {
+            if d.inode != 0 && name.matches(d.name(&data)) {
                 return Ok(Some(DirSlot {
                     lblk,
                     pblk,
@@ -267,10 +278,15 @@ impl Fs {
         }
     }
 
-    /// Look up `name` in directory `dir`.
+    /// Look up `name` in directory `dir` (in an encrypted directory, the
+    /// plaintext name with the key, the no-key name without).
     pub fn lookup(&mut self, dir: Ino, name: &[u8]) -> Result<Ino> {
         let inode = self.read_live_inode(dir)?;
-        match self.find_entry(dir, &inode, name)? {
+        if !inode.is_dir() {
+            return Err(Error::NotDir);
+        }
+        let fname = self.lookup_fname(dir, &inode, name)?;
+        match self.find_entry(dir, &inode, &fname)? {
             Some(slot) => Ok(slot.ino),
             None => Err(Error::NotFound),
         }
@@ -318,12 +334,9 @@ impl Fs {
             }
             return Ok(());
         }
-        if inode.has_flag(flags::INDEX)
-            && self.sb.has_compat(compat::DIR_INDEX)
-            && !inode.has_flag(flags::CASEFOLD)
-            && !inode.has_flag(flags::ENCRYPT)
-        {
-            return self.dx_read_dir(dir, &inode, cookie, &mut f);
+        let view = self.name_view(dir, &inode)?;
+        if inode.has_flag(flags::INDEX) && self.sb.has_compat(compat::DIR_INDEX) && !inode.has_flag(flags::CASEFOLD) {
+            return self.dx_read_dir(dir, &inode, cookie, &view, &mut f);
         }
         if cookie & super::htree::HASH_COOKIE != 0 {
             return Err(Error::StaleCookie);
@@ -340,8 +353,17 @@ impl Fs {
                 if d.offset < skip_to || d.inode == 0 {
                     continue;
                 }
+                let disk = d.name(&data);
+                let name = if view.is_plain() {
+                    disk.to_vec()
+                } else {
+                    match view.present(disk, Some((&data, &d)), None) {
+                        Some(n) => n,
+                        None => continue,
+                    }
+                };
                 let info = DirEntryInfo {
-                    name: d.name(&data).to_vec(),
+                    name,
                     ino: d.inode,
                     file_type: self.dirent_file_type(d.inode, d.file_type)?,
                     next_cookie: lblk * bs + (d.offset + d.rec_len) as u64,
@@ -500,11 +522,8 @@ impl Fs {
                 return Ok(());
             }
         }
-        if n == 1
-            && self.sb.has_compat(compat::DIR_INDEX)
-            && !inode.has_flag(flags::CASEFOLD)
-            && !inode.has_flag(flags::ENCRYPT)
-        {
+        // encrypted directories hash the ciphertext names, like Linux
+        if n == 1 && self.sb.has_compat(compat::DIR_INDEX) && !inode.has_flag(flags::CASEFOLD) {
             self.make_indexed(ino, inode)?;
             return self.dx_add_entry(ino, inode, name, child, ft);
         }
@@ -518,7 +537,8 @@ impl Fs {
         Ok(())
     }
 
-    /// Add a directory entry. Persists `inode` changes via the caller.
+    /// Add a directory entry with on-disk name `name`. Persists `inode`
+    /// changes via the caller.
     pub(crate) fn add_entry(
         &mut self,
         ino: Ino,
@@ -527,7 +547,18 @@ impl Fs {
         child: Ino,
         ft: FileType,
     ) -> Result<()> {
-        validate_name(name)?;
+        if inode.has_flag(flags::ENCRYPT) {
+            // ciphertext may hold any byte
+            if name.len() < crate::fscrypt::MIN_NAME_LEN || name.len() > MAX_NAME_LEN {
+                return Err(Error::invalid("bad encrypted name length"));
+            }
+            if inode.has_flag(flags::CASEFOLD) {
+                // entries would need the name's keyed hash stored with them
+                return Err(Error::unsupported("adding to an encrypted, casefolded directory"));
+            }
+        } else {
+            validate_name(name)?;
+        }
         let ft = self.dirent_type(ft);
         if inode.has_flag(flags::INLINE_DATA) {
             self.uninline_dir(ino, inode)?;
@@ -544,7 +575,7 @@ impl Fs {
     }
 
     /// Remove an entry found by [`Fs::find_entry`].
-    pub(crate) fn remove_slot(&mut self, ino: Ino, inode: &mut Inode, slot: &DirSlot, name: &[u8]) -> Result<()> {
+    pub(crate) fn remove_slot(&mut self, ino: Ino, inode: &mut Inode, slot: &DirSlot, name: &Fname) -> Result<()> {
         if inode.has_flag(flags::INLINE_DATA) {
             self.uninline_dir(ino, inode)?;
             let s = self.find_entry(ino, inode, name)?.ok_or(Error::NotFound)?;
@@ -570,7 +601,7 @@ impl Fs {
         ino: Ino,
         inode: &mut Inode,
         slot: &DirSlot,
-        name: &[u8],
+        name: &Fname,
         child: Ino,
         ft: FileType,
     ) -> Result<()> {
@@ -598,10 +629,11 @@ impl Fs {
             crate::bytes::set_le32(inode.block_area_mut(), 0, parent);
             return Ok(());
         }
+        let dotdot = Fname::plain(b"..");
         let slot = self
-            .find_in_block(ino, inode, 0, b"..")?
+            .find_in_block(ino, inode, 0, &dotdot)?
             .ok_or_else(|| Error::corrupt(format!("directory {ino} has no ..")))?;
-        self.retarget_slot(ino, inode, &slot, b"..", parent, FileType::Directory)
+        self.retarget_slot(ino, inode, &slot, &dotdot, parent, FileType::Directory)
     }
 
     /// Update directory timestamps after a modification.

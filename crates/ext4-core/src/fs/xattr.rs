@@ -99,18 +99,36 @@ impl Fs {
         if idx == 0 {
             return Err(Error::unsupported("unknown xattr namespace"));
         }
+        // inline data and encryption contexts belong to the file system
+        if idx == xa::INDEX_SYSTEM && suffix == b"data" || idx == xa::INDEX_ENCRYPTION {
+            return Err(Error::NotPermitted);
+        }
+        let mut inode = self.read_live_inode(ino)?;
+        self.xattr_put(ino, &mut inode, idx, suffix, value, mode)?;
+        inode.set_ctime(Timestamp::now());
+        self.write_inode(ino, &inode)?;
+        self.maybe_commit()
+    }
+
+    /// Store attribute `idx.suffix` into `inode` (its in-inode area or
+    /// its xattr block); the caller writes the inode.
+    pub(crate) fn xattr_put(
+        &mut self,
+        ino: Ino,
+        inode: &mut Inode,
+        idx: u8,
+        suffix: &[u8],
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<()> {
         if suffix.len() > 255 {
             return Err(Error::NameTooLong);
-        }
-        if idx == xa::INDEX_SYSTEM && suffix == b"data" {
-            return Err(Error::NotPermitted);
         }
         let max_value = self.bs as usize - xa::BLOCK_HEADER_SIZE - xa::pad(xa::ENTRY_HEADER_SIZE + suffix.len()) - 4;
         if value.len() > max_value {
             return Err(Error::NoSpace);
         }
-        let mut inode = self.read_live_inode(ino)?;
-        let l = self.load_xattrs(ino, &inode)?;
+        let l = self.load_xattrs(ino, inode)?;
         let matches = |e: &XattrEntry| e.index == idx && e.name == suffix;
         let in_ibody = l.ibody.iter().any(matches);
         let in_block = l.block.as_ref().is_some_and(|b| b.2.iter().any(matches));
@@ -160,11 +178,24 @@ impl Fs {
             xa::write_ibody(&mut inode.raw[r], &ibody)?;
         }
         if !into_ibody || in_block {
-            self.store_xattr_block(ino, &mut inode, l.block.as_ref().map(|b| (b.0, b.1)), block)?;
+            self.store_xattr_block(ino, inode, l.block.as_ref().map(|b| (b.0, b.1)), block)?;
         }
-        inode.set_ctime(Timestamp::now());
-        self.write_inode(ino, &inode)?;
-        self.maybe_commit()
+        Ok(())
+    }
+
+    /// Value of attribute `idx.suffix` of `inode`, if present.
+    pub(crate) fn xattr_get(&mut self, ino: Ino, inode: &Inode, idx: u8, suffix: &[u8]) -> Result<Option<Vec<u8>>> {
+        let l = self.load_xattrs(ino, inode)?;
+        let found = l
+            .ibody
+            .iter()
+            .chain(l.block.iter().flat_map(|b| b.2.iter()))
+            .find(|e| e.index == idx && e.name == suffix)
+            .cloned();
+        match found {
+            Some(e) => Ok(Some(self.entry_value(&e)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn remove_xattr(&mut self, ino: Ino, name: &[u8]) -> Result<()> {
@@ -176,6 +207,9 @@ impl Fs {
         let (idx, suffix) = xa::split_name(name);
         if idx == 0 {
             return Err(Error::NoAttr);
+        }
+        if idx == xa::INDEX_ENCRYPTION {
+            return Err(Error::NotPermitted);
         }
         let mut inode = self.read_live_inode(ino)?;
         if !self.remove_entry_from(ino, &mut inode, idx, suffix, false)? {

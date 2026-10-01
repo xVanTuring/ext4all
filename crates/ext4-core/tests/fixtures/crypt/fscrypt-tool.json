@@ -1,0 +1,380 @@
+{
+ "kind": "fscrypt-tool",
+ "kernel": "7.2.8-1-aarch64-ARCH",
+ "cryptsetup": "cryptsetup 2.8.8 flags: UDEV BLKID KEYRING KERNEL_CAPI HW_OPAL",
+ "passphrase": "fscrypt test passphrase",
+ "raw_protector_key": "545f6a75808b96a1acb7c2cdd8e3eef9040f1a25303b46515c67727d88939ea9",
+ "tool": "fscrypt 0.3.6-2",
+ "with_key": [
+  {
+   "path": "rawdir",
+   "ino": 2050,
+   "type": "dir"
+  },
+  {
+   "path": "secret",
+   "ino": 2049,
+   "type": "dir"
+  },
+  {
+   "path": "rawdir/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL.txt",
+   "ino": 37,
+   "type": "file",
+   "size": 10,
+   "sha256": "1272a49868c41260330ce643f91dffd1114abc24bf149dfb4ebfb8833bbe5670"
+  },
+  {
+   "path": "rawdir/MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM",
+   "ino": 38,
+   "type": "file",
+   "size": 13,
+   "sha256": "d36b7c1c4529f2b95e47ee49d2f0626a80537cea3da3bd2fbccec64da25ffbe6"
+  },
+  {
+   "path": "rawdir/block.bin",
+   "ino": 35,
+   "type": "file",
+   "size": 4096,
+   "sha256": "a45961fda5b5c1e5508f0de917a6cf622ba99f63d78584c77894745345075179"
+  },
+  {
+   "path": "rawdir/empty",
+   "ino": 33,
+   "type": "file",
+   "size": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+   "path": "rawdir/fifo",
+   "ino": 43,
+   "type": "fifo"
+  },
+  {
+   "path": "rawdir/hello-hardlink",
+   "ino": 32,
+   "type": "file",
+   "size": 14,
+   "sha256": "d92b8f97c8bcc6a4a32b6402c9a6225dc0de229e5215e030a3d699a29457e266"
+  },
+  {
+   "path": "rawdir/hello.txt",
+   "ino": 32,
+   "type": "file",
+   "size": 14,
+   "sha256": "d92b8f97c8bcc6a4a32b6402c9a6225dc0de229e5215e030a3d699a29457e266"
+  },
+  {
+   "path": "rawdir/long-link",
+   "ino": 42,
+   "type": "link",
+   "target": "sub/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "size": 84
+  },
+  {
+   "path": "rawdir/odd.bin",
+   "ino": 36,
+   "type": "file",
+   "size": 10000,
+   "sha256": "fad7daab9f64136e7d2803ca35264bc5d29cd33ec0db1730ebe64245013861cc"
+  },
+  {
+   "path": "rawdir/short-link",
+   "ino": 41,
+   "type": "link",
+   "target": "hello.txt",
+   "size": 9
+  },
+  {
+   "path": "rawdir/sub",
+   "ino": 39,
+   "type": "dir"
+  },
+  {
+   "path": "rawdir/中文名.txt",
+   "ino": 34,
+   "type": "file",
+   "size": 22,
+   "sha256": "91159865a56930b393bdca17917e1fb4735b679a2518576b9962f0e3fb2b59de"
+  },
+  {
+   "path": "rawdir/sub/deep.txt",
+   "ino": 40,
+   "type": "file",
+   "size": 5,
+   "sha256": "64896f89fd11190013b70103e603a1c5826e56b7fb7d2197ab279b0690043599"
+  },
+  {
+   "path": "secret/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL.txt",
+   "ino": 23,
+   "type": "file",
+   "size": 10,
+   "sha256": "1272a49868c41260330ce643f91dffd1114abc24bf149dfb4ebfb8833bbe5670"
+  },
+  {
+   "path": "secret/MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM",
+   "ino": 24,
+   "type": "file",
+   "size": 13,
+   "sha256": "d36b7c1c4529f2b95e47ee49d2f0626a80537cea3da3bd2fbccec64da25ffbe6"
+  },
+  {
+   "path": "secret/block.bin",
+   "ino": 21,
+   "type": "file",
+   "size": 4096,
+   "sha256": "ccc52e15122afd6bce936480b88090fd45662760a2b4283e8399d1fabca3a180"
+  },
+  {
+   "path": "secret/empty",
+   "ino": 19,
+   "type": "file",
+   "size": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+   "path": "secret/fifo",
+   "ino": 29,
+   "type": "fifo"
+  },
+  {
+   "path": "secret/hello-hardlink",
+   "ino": 18,
+   "type": "file",
+   "size": 14,
+   "sha256": "d92b8f97c8bcc6a4a32b6402c9a6225dc0de229e5215e030a3d699a29457e266"
+  },
+  {
+   "path": "secret/hello.txt",
+   "ino": 18,
+   "type": "file",
+   "size": 14,
+   "sha256": "d92b8f97c8bcc6a4a32b6402c9a6225dc0de229e5215e030a3d699a29457e266"
+  },
+  {
+   "path": "secret/long-link",
+   "ino": 28,
+   "type": "link",
+   "target": "sub/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "size": 84
+  },
+  {
+   "path": "secret/odd.bin",
+   "ino": 22,
+   "type": "file",
+   "size": 10000,
+   "sha256": "b4f6591e74b28c7808bb39706122cd075a148ed9d17d9abc9b05e66ff5ce76e1"
+  },
+  {
+   "path": "secret/short-link",
+   "ino": 27,
+   "type": "link",
+   "target": "hello.txt",
+   "size": 9
+  },
+  {
+   "path": "secret/sub",
+   "ino": 25,
+   "type": "dir"
+  },
+  {
+   "path": "secret/中文名.txt",
+   "ino": 20,
+   "type": "file",
+   "size": 22,
+   "sha256": "91159865a56930b393bdca17917e1fb4735b679a2518576b9962f0e3fb2b59de"
+  },
+  {
+   "path": "secret/sub/deep.txt",
+   "ino": 26,
+   "type": "file",
+   "size": 5,
+   "sha256": "64896f89fd11190013b70103e603a1c5826e56b7fb7d2197ab279b0690043599"
+  }
+ ],
+ "without_key": [
+  {
+   "path": "rawdir",
+   "ino": 2050,
+   "type": "dir"
+  },
+  {
+   "path": "secret",
+   "ino": 2049,
+   "type": "dir"
+  },
+  {
+   "path": "rawdir/4ospmRKWs_gdI6Vz6Mat5gDHo8cBqBpEyKmbT7qyiDjAMjEAoU96pg",
+   "ino": 33,
+   "type": "file",
+   "size": 0,
+   "locked": true
+  },
+  {
+   "path": "rawdir/7C60CtWg93_08MPpvqEqX0kWJfEZxMjRX4dv9_kUxpIjz0GqnOMjFA",
+   "ino": 32,
+   "type": "file",
+   "size": 14,
+   "locked": true
+  },
+  {
+   "path": "rawdir/7GPoCUnmnWVjc9KHoyERNlGSaJA3Wa9zl_lAs65SQSx142CqunvSQA",
+   "ino": 34,
+   "type": "file",
+   "size": 22,
+   "locked": true
+  },
+  {
+   "path": "rawdir/DDOaxCATGR3m2udRUfw2gzXu77fqAWZsW21WHm5QOeDTfSLrnIRhHw",
+   "ino": 32,
+   "type": "file",
+   "size": 14,
+   "locked": true
+  },
+  {
+   "path": "rawdir/Ng3RVpViT5ZMW7RsjJ8PC7iz-TWbGnamU4JELLSftUVwS3b_ZZhRSn7_m7VkCpdqZH90DO9IRvFZXlnmPN9y6bVxDCTcVq4fivBRJeREjRx2vwSJ-NRm5RHTqrCanPzbimkKkTiA01FbUQ6nX8JJDpNvtmQCX1iwhPMiN_e6hLeCcAJKplXgn3IJZTFMGPWvW07PNK9P64oirAbpSCLUpdPx7yCWP0IR15cvVOZwv5AEDGjpO5KK8ovkVOIB",
+   "ino": 38,
+   "type": "file",
+   "size": 13,
+   "locked": true
+  },
+  {
+   "path": "rawdir/RMSOPs3gSkKqKwtVoaZisyjFIQMuJhbw2FV0-bfwwu--wL2wwOAIwg",
+   "ino": 41,
+   "type": "link",
+   "target": "AAAAAAAAAACU21wVYEiY4MCdabsEGqmeir8hWeB3ohv9HI3KE-4Gwg",
+   "size": 54
+  },
+  {
+   "path": "rawdir/cnP2nMWo7U9_7iZSPKTGepchmIihM-9oEHV6SHe6q6lyzgO38HZUog",
+   "ino": 43,
+   "type": "fifo"
+  },
+  {
+   "path": "rawdir/dKNLhZhi5BXD4mvUGza2E5daeciTQGvEGGNbIO6_zZQxb7LCp06x6w",
+   "ino": 36,
+   "type": "file",
+   "size": 10000,
+   "locked": true
+  },
+  {
+   "path": "rawdir/fqMQz1tXZ5nIqvtLICMl8sVy2nXwME0v6M0QQTTdWePNd1y3ocK_SZfnvFiHeEPUSiylyBGMRq6LlEBW1CoNrhFDzIrtFVuAeUDbnJ9RWNXXXEmkYL2nWtf8bpXtT3ofIYs11hm6N3KQWX71U_OtC-qP6e4v5_f-JeFdrbNjRlkSqaAmW_MbfeYronZU4ABhnMNBh15ugNcsshEVJemRZfDjIBGz3YWZD_gNSFJvycjqCLzd2gobAQgYPHsT",
+   "ino": 37,
+   "type": "file",
+   "size": 10,
+   "locked": true
+  },
+  {
+   "path": "rawdir/fsBdlcINPjNpiIY5oqZQcxuqsP8wxcuGqd7B34Dcd3MM2Af8SunljA",
+   "ino": 39,
+   "type": "dir"
+  },
+  {
+   "path": "rawdir/misBCO-TDFOcrJzl1Ds1-HcYdg5ruvLM0-7jtTQFRyJNYHY3Q9IKpw",
+   "ino": 35,
+   "type": "file",
+   "size": 4096,
+   "locked": true
+  },
+  {
+   "path": "rawdir/th6RC_0xreHVNL6SjGqj72CkyRq4PteRxg4ABP-uWR1Yh8A31LbD3A",
+   "ino": 42,
+   "type": "link",
+   "target": "AAAAAAAAAADZZ9ZDHOW93GoF9r1lb62Epczos_J41HrMKCiLCEByc-nXp5tBaiDKclPdJpOf-Nw_toy69XQWXF-ppOEREJqBuc2LLFX5uXSEfvn38PZESiJ-CB-l11gpRAG7jVEaIpg",
+   "size": 139
+  },
+  {
+   "path": "rawdir/fsBdlcINPjNpiIY5oqZQcxuqsP8wxcuGqd7B34Dcd3MM2Af8SunljA/WNFRdI7OVbuTB1Z5wozuSv_5YJts8qSmRBrvm6racNE9lA7oylZhsA",
+   "ino": 40,
+   "type": "file",
+   "size": 5,
+   "locked": true
+  },
+  {
+   "path": "secret/6ITBbsPNQ-M-B80mf8KMM6ybFkJZXLhpW2xp137uLdQQZoteDX36Tg",
+   "ino": 28,
+   "type": "link",
+   "target": "AAAAAAAAAACmlojXBJ9ReU1ZBKtE502O0DHngV5iUVPS-ZUQPo44lzLMztsYSlDpH6OosiDz9e9vqcwac2V04eAL8S0TwKRNWSgONEh2d5DjE91WpfuvKfgqMNGdX8b720qKULnLiww",
+   "size": 139
+  },
+  {
+   "path": "secret/MGNY1AcaqQshq0u5jYHZE2z7lFk3XHVBUVseDB8thDXVmRl5M690BQ",
+   "ino": 29,
+   "type": "fifo"
+  },
+  {
+   "path": "secret/WkWoffNFyDXnUxih3ve27btnXIM1vbjiotu_nGhmJnmIxrIFGFRmIw",
+   "ino": 18,
+   "type": "file",
+   "size": 14,
+   "locked": true
+  },
+  {
+   "path": "secret/Wkd1tjHkUQeIrRYXaJEDoOLhwnwb60YaE_D0Knz45ku4biVzq363W-DI-ex99JmSvsVKbPIITZr5ev9khH_n3UzrHeoGUiw7JUCulrar3bYiNqJv225utohoKeD8B3ApSookdtMQkVQuVVJVwgXFk051m3eOgkxwDb7ruN0zoM68-739VElUZzz2c8t4-vwTY1UC6pdl-V2Y-4jo9T8IORwpD3IyuPmPVFqxLuTszo-aOQq596uAxxvdAvnY",
+   "ino": 23,
+   "type": "file",
+   "size": 10,
+   "locked": true
+  },
+  {
+   "path": "secret/dDbkl5JH_TOXMaAiMp2iWnZMFEKfhYRv2EwhMVF--3jbvDiWjYp5nw",
+   "ino": 18,
+   "type": "file",
+   "size": 14,
+   "locked": true
+  },
+  {
+   "path": "secret/fHxMatIb5vO_IUqqKMgsj40XziEZReYNWBmuOd4n0HCKlIrC0hYNRQ",
+   "ino": 21,
+   "type": "file",
+   "size": 4096,
+   "locked": true
+  },
+  {
+   "path": "secret/fsX9sTSvqNJZOufskfHI11oq_MhEloNk-t9IlcPZDY34Yvylkt_1WA",
+   "ino": 25,
+   "type": "dir"
+  },
+  {
+   "path": "secret/lNgr5YUJ3tPxaLolgGbquVnqPX9RYwQFJc5wo9QivyamV5VOwPNT5A",
+   "ino": 22,
+   "type": "file",
+   "size": 10000,
+   "locked": true
+  },
+  {
+   "path": "secret/ljnc4RSeVj0_p3t06JcpLjo9lHWDEGlFlG-AEZsIgXGtRe9TeIdWjA",
+   "ino": 19,
+   "type": "file",
+   "size": 0,
+   "locked": true
+  },
+  {
+   "path": "secret/oMAm1XpEWJKDpWpeOJZrR2yAHSUWYqLz-XcGTb1uI8WslAru98669Dd3inoIi35_yteXINkwNYZwUCyBjOJqxJSrCm8CAskazR75M9KpjTBE3T4N4oVPwhA7JbbZQPXEgFMlY1ZPDi45VhYMfmlMobFsIMHyR-hF3bwmqQEcU4bGbn4j9eFvKNIlGS8UH7P43sa5MTG_3z_DIlush6MlxMtGiAgK9sedr87xoXU8m4Y97zVg6lg0q24oS4qf",
+   "ino": 24,
+   "type": "file",
+   "size": 13,
+   "locked": true
+  },
+  {
+   "path": "secret/sEWg9KBZ4pFOPS8w2p3-Qoz9i3bwOZItW0HSKrVAhfPEj6l4lhqWYA",
+   "ino": 20,
+   "type": "file",
+   "size": 22,
+   "locked": true
+  },
+  {
+   "path": "secret/tCeAJhG522WNQdhDF7oIwbGDuW9YXzQJvlT5Yw7ZvQ1qOFHB4gd-Pw",
+   "ino": 27,
+   "type": "link",
+   "target": "AAAAAAAAAADddvU_zbaZeFVeQ5qDjDUz691ZkPYCSRMGHl8NOav-HA",
+   "size": 54
+  },
+  {
+   "path": "secret/fsX9sTSvqNJZOufskfHI11oq_MhEloNk-t9IlcPZDY34Yvylkt_1WA/uhgP97pQhLPmv_gWxZ32JGOU0xr5yITyym2VRPqyNsjFh6vT3IimDQ",
+   "ino": 26,
+   "type": "file",
+   "size": 5,
+   "locked": true
+  }
+ ]
+}

@@ -28,7 +28,8 @@ const INCOMPAT_READ: u32 = incompat::FILETYPE
     | incompat::ENCRYPT
     | incompat::CASEFOLD;
 
-/// Incompat features we can also write.
+/// Incompat features we can also write. With `encrypt`, encrypted
+/// directories need their key for anything but deleting (as on Linux).
 const INCOMPAT_WRITE: u32 = incompat::FILETYPE
     | incompat::RECOVER
     | incompat::META_BG
@@ -37,7 +38,8 @@ const INCOMPAT_WRITE: u32 = incompat::FILETYPE
     | incompat::FLEX_BG
     | incompat::CSUM_SEED
     | incompat::LARGEDIR
-    | incompat::INLINE_DATA;
+    | incompat::INLINE_DATA
+    | incompat::ENCRYPT;
 
 /// ro_compat features we can write.
 const RO_COMPAT_WRITE: u32 = ro_compat::SPARSE_SUPER
@@ -207,9 +209,16 @@ mod tests {
     }
 
     #[test]
+    fn encrypt_is_writable() {
+        let mut sb = sample();
+        sb.set_journal_inum(8);
+        sb.set_feature_incompat(sb.feature_incompat() | incompat::ENCRYPT);
+        assert_eq!(check(&sb), Support::ReadWrite);
+    }
+
+    #[test]
     fn read_only_features() {
         for (f, name) in [
-            (incompat::ENCRYPT, "encrypt"),
             (incompat::CASEFOLD, "casefold"),
             (incompat::MMP, "mmp"),
             (incompat::EA_INODE, "ea_inode"),

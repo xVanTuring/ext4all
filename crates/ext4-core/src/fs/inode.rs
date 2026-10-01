@@ -101,7 +101,16 @@ impl Fs {
     /// Attributes of an inode.
     pub fn stat(&mut self, ino: Ino) -> Result<Attr> {
         let inode = self.read_live_inode(ino)?;
-        Ok(self.inode_attr(ino, &inode))
+        self.full_attr(ino, &inode)
+    }
+
+    /// [`Fs::inode_attr`] plus what needs more than the inode: the size of
+    /// an encrypted symlink is the length of its target as presented.
+    pub(crate) fn full_attr(&mut self, ino: Ino, inode: &Inode) -> Result<Attr> {
+        if inode.is_symlink() && inode.has_flag(crate::ondisk::inode::flags::ENCRYPT) {
+            return self.symlink_attr(ino, inode);
+        }
+        Ok(self.inode_attr(ino, inode))
     }
 
     /// Fresh generation number for a new inode.

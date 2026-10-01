@@ -605,9 +605,6 @@ pub fn format(dev: &dyn BlockDevice, o: &FormatOptions, progress: &mut dyn FnMut
     if dev.is_read_only() {
         return Err(Error::ReadOnly);
     }
-    if o.label.len() > 16 {
-        return Err(Error::invalid("label longer than 16 bytes"));
-    }
     if !(0.0..=50.0).contains(&o.reserved_percent) {
         return Err(Error::invalid("reserved percentage must be between 0 and 50"));
     }
@@ -669,7 +666,13 @@ pub fn format(dev: &dyn BlockDevice, o: &FormatOptions, progress: &mut dyn FnMut
     sb.set_first_ino_raw(FIRST_INO);
     sb.set_inode_size_raw(INODE_SIZE as u16);
     sb.raw[0x68..0x78].copy_from_slice(&uuid);
-    sb.set_volume_name(&o.label);
+    // labels hold 16 bytes; longer ones are cut like mke2fs does, at a
+    // character boundary
+    let mut cut = o.label.len().min(16);
+    while !o.label.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    sb.set_volume_name(&o.label[..cut]);
     let mut seed = [0u32; 4];
     for (k, s) in seed.iter_mut().enumerate() {
         *s = u32::from_le_bytes(hash_seed[k * 4..k * 4 + 4].try_into().unwrap());

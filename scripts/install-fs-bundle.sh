@@ -2,7 +2,7 @@
 # Install (or remove with --remove) the file system description bundle
 # /Library/Filesystems/ext4.fs so diskutil and Disk Utility recognize ext4
 # volumes mounted by the FSKit extension (without it, `diskutil unmount`
-# and `diskutil eject` refuse them). Needs root:
+# and `diskutil eject` refuse them) and can erase disks as ext4. Needs root:
 #   sudo scripts/install-fs-bundle.sh [--remove]
 # Compatible with the system bash 3.2.
 set -euo pipefail

@@ -22,6 +22,9 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     /// The device handed to `loadResource`, kept even when it holds no
     /// ext4 file system: formatting works on it.
     let device = Locked<FSBlockDeviceResource?>(nil)
+    /// Why the device could not be loaded as ext4 (a placeholder volume
+    /// was handed out instead).
+    let loadFailure = Locked<(any Error)?>(nil)
 
     override init() {
         _ = Log.installEngineLogger
@@ -66,6 +69,7 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
         Log.fs.info(
             "loadResource \(device.bsdName, privacy: .public) options \(options.taskOptions, privacy: .public)")
         self.device.withLock { $0 = device }
+        loadFailure.withLock { $0 = nil }
         let readOnly = Ext4FileSystem.wantsReadOnly(options)
         do {
             let io = ResourceBlockIO(device, readOnly: readOnly)
@@ -85,10 +89,14 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
             )
             reply(volume, nil)
         } catch {
+            // FSKit also loads a device before formatting it, so loading
+            // succeeds with a stand-in that fails activation (and checks)
+            // with this error
             Log.fs.error(
                 "load \(device.bsdName, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            loadFailure.withLock { $0 = error }
             containerStatus = .blocked(status: error)
-            reply(nil, error)
+            reply(Ext4PlaceholderVolume(bsdName: device.bsdName, failure: error), nil)
         }
     }
 
@@ -97,6 +105,7 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     ) {
         loaded.withLock { $0 = nil }
         device.withLock { $0 = nil }
+        loadFailure.withLock { $0 = nil }
         containerStatus = .notReady(status: POSIXError(.ENODEV))
         reply(nil)
     }
@@ -111,9 +120,13 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     func startCheck(task: FSTask, options: FSTaskOptions) throws -> Progress {
         let progress = Progress(totalUnitCount: 1)
         let volume = loaded.withLock { $0 }
+        let loadError = loadFailure.withLock { $0 }
         DispatchQueue.global(qos: .userInitiated).async {
             var failure: (any Error)?
-            if let volume {
+            if let loadError {
+                task.logMessage("ext4: no usable ext4 file system: \(loadError.localizedDescription)")
+                failure = loadError
+            } else if let volume {
                 do {
                     for line in try volume.quickCheck() {
                         task.logMessage(line)
@@ -124,6 +137,7 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
                 }
             } else {
                 task.logMessage("ext4: no volume loaded")
+                failure = POSIXError(.ENXIO)
             }
             progress.completedUnitCount = 1
             task.didComplete(error: failure)
@@ -168,6 +182,7 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
                         "ext4: \(r.blocks) blocks of \(r.blockSize) bytes (\(size >> 20) MiB), \(r.inodes) inodes, \(r.groups) groups, journal of \(r.journalBlocks) blocks, UUID \(r.uuid.uuidString)"
                     )
                     Log.fs.info("formatted \(target.bsdName, privacy: .public): \(r.blocks) blocks, \(r.inodes) inodes")
+                    loadFailure.withLock { $0 = nil }
                     containerStatus = .ready
                 } catch {
                     Log.fs.error(

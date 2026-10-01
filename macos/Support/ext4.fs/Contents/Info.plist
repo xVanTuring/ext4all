@@ -5,7 +5,9 @@
   The FSKit extension does the actual work; this bundle only names the
   personalities so StorageKit (diskutil, Disk Utility) recognizes volumes
   whose kind is ext2/ext3/ext4 and agrees to unmount and eject them, like
-  /System/Library/Filesystems/virtiofs.fs does for virtio-fs.
+  /System/Library/Filesystems/virtiofs.fs does for virtio-fs. The ext4
+  personality can also be used for erasing: Resources/newfs_ext4 forwards
+  to the FSKit module (newfs_fskit -t ext4).
 -->
 <plist version="1.0">
 <dict>
@@ -45,6 +47,16 @@
 			<string>Linux ext4</string>
 			<key>FSSubType</key>
 			<integer>2</integer>
+			<key>FSFormatExecutable</key>
+			<string>newfs_ext4</string>
+			<key>FSFormatArguments</key>
+			<string></string>
+			<key>FSFormatContentMask</key>
+			<string>0FC63DAF-8483-4772-8E79-3D69D8477DE4</string>
+			<key>FSFormatMinimumSize</key>
+			<integer>1048576</integer>
+			<key>FSFormatMaximumSize</key>
+			<integer>1152921504606846976</integer>
 		</dict>
 	</dict>
 </dict>

@@ -1,0 +1,29 @@
+#!/bin/bash
+# Format executable of the ext4 personality in /Library/Filesystems/ext4.fs.
+# StorageKit (Disk Utility, `diskutil eraseVolume ext4 NAME diskNsM`) runs it
+# as root; it forwards to the FSKit module through newfs_fskit. StorageKit
+# names the volume with -v, like newfs_msdos and newfs_exfat; every other
+# option is passed on as an mke2fs-style option of the module.
+#   newfs_ext4 [-v name] [mke2fs options] device
+# Compatible with the system bash 3.2.
+set -eu
+
+logger -t newfs_ext4 "arguments: $*" 2>/dev/null || true
+args=()
+while [ $# -gt 1 ]; do
+    case "$1" in
+        -v)
+            args+=(-L "$2")
+            shift 2
+            ;;
+        *)
+            args+=("$1")
+            shift
+            ;;
+    esac
+done
+if [ $# -ne 1 ]; then
+    echo "usage: newfs_ext4 [-v name] [mke2fs options] device" >&2
+    exit 64
+fi
+exec /sbin/newfs_fskit -t ext4 ${args[@]+"${args[@]}"} "$1"

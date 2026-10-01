@@ -198,12 +198,15 @@ fn options_are_honoured() {
     assert!(f["Filesystem created"].contains("2023"), "{}", f["Filesystem created"]);
     exercise(&img, 10, 10);
 
+    // long labels are cut to 16 bytes at a character boundary, like mke2fs
     let dev = FileDevice::open(&img.path, false).unwrap();
     let long = FormatOptions {
-        label: "seventeen-bytes!!".into(),
+        label: "外置硬盘数据盘一号".into(),
         ..Default::default()
     };
-    assert!(format(&dev, &long, &mut |_, _| {}).is_err());
+    format(&dev, &long, &mut |_, _| {}).unwrap();
+    assert_eq!(fields(&img)["Filesystem volume name"], "外置硬盘数");
+    img.assert_clean();
     let bad = FormatOptions {
         block_size: Some(3000),
         ..Default::default()

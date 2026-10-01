@@ -31,8 +31,6 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     /// Writes through the extension to files that use kernel offloaded
     /// I/O, logged individually up to this many per mount.
     private static let mixedWritesLogged = 8
-    /// Kernel data caching granted to opened files.
-    let dataCache: DataCachePolicy
 
     /// Log `message` the first time `event` happens on this volume; call
     /// with `opLock` held.
@@ -48,15 +46,11 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     /// handed out.
     private(set) var kernelIO: Bool
 
-    init(
-        mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false,
-        dataCache: DataCachePolicy = .system
-    ) {
+    init(mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false) {
         self.mount = mount
         self.bsdName = bsdName
         self.info = info
         self.kernelIO = kernelIO
-        self.dataCache = dataCache
         self.blockSize = UInt64(info.blockSize)
         let caps = FSVolume.SupportedCapabilities()
         caps.supportsPersistentObjectIDs = true
@@ -287,7 +281,7 @@ extension Ext4Volume: FSVolume.Handler {
     func logStats() {
         guard !stats.isEmpty else { return }
         Log.fs.info(
-            "\(self.bsdName, privacy: .public) requests (data cache \(self.dataCache.rawValue, privacy: .public), kernel I/O \(self.kernelIO ? "on" : "off", privacy: .public)):"
+            "\(self.bsdName, privacy: .public) requests (kernel offloaded I/O \(self.kernelIO ? "on" : "off", privacy: .public)):"
         )
         for line in stats.summary {
             Log.fs.info("  \(line, privacy: .public)")

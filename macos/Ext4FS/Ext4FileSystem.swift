@@ -68,16 +68,14 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
             // opt-in; read-only mounts benefit as well (reads bypass the
             // extension)
             let kernelIO = UserDefaults.standard.bool(forKey: Ext4FileSystem.kernelIODefaultsKey)
-            let dataCache = DataCachePolicy(
-                defaultsValue: UserDefaults.standard.string(forKey: Ext4FileSystem.dataCacheDefaultsKey))
             let volume: Ext4Volume =
                 kernelIO
-                ? Ext4KernelIOVolume(mount: mount, info: info, resource: device, dataCache: dataCache)
-                : Ext4Volume(mount: mount, info: info, bsdName: device.bsdName, dataCache: dataCache)
+                ? Ext4KernelIOVolume(mount: mount, info: info, resource: device)
+                : Ext4Volume(mount: mount, info: info, bsdName: device.bsdName)
             loaded.withLock { $0 = volume }
             containerStatus = .ready
             Log.fs.info(
-                "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)\(kernelIO ? ", kernel offloaded I/O" : "", privacy: .public), data cache \(dataCache.rawValue, privacy: .public)"
+                "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)\(kernelIO ? ", kernel offloaded I/O" : "", privacy: .public)"
             )
             reply(volume, nil)
         } catch {
@@ -147,11 +145,6 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     /// the volume's class decides which FSKit protocols it implements and
     /// `-o` mount options only arrive later, at activation.
     static let kernelIODefaultsKey = "KernelOffloadedIO"
-
-    /// Defaults key choosing the kernel data caching granted to opened
-    /// files (a `DataCachePolicy` raw value); read at load, because FSKit
-    /// reads `isDataCacheInhibited` once, right after loading.
-    static let dataCacheDefaultsKey = "DataCache"
 
     /// With kernel offloaded I/O available, `-o nokoio` switches it off for
     /// one mount (and `-o koio` on); otherwise `defaultOn` decides.

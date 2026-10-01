@@ -16,12 +16,9 @@ import Foundation
 final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @unchecked Sendable {
     let resource: FSBlockDeviceResource
 
-    init(
-        mount: Ext4Mount, info: Ext4VolumeInfo, resource: FSBlockDeviceResource,
-        dataCache: DataCachePolicy = .system
-    ) {
+    init(mount: Ext4Mount, info: Ext4VolumeInfo, resource: FSBlockDeviceResource) {
         self.resource = resource
-        super.init(mount: mount, info: info, bsdName: resource.bsdName, kernelIO: true, dataCache: dataCache)
+        super.init(mount: mount, info: info, bsdName: resource.bsdName, kernelIO: true)
     }
 
     /// Largest extent length the packer accepts (`UINT32_MAX`), rounded

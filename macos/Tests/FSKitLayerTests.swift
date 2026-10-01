@@ -25,23 +25,6 @@ final class FSKitLayerTests: XCTestCase {
         XCTAssertFalse(Ext4FileSystem.wantsKernelIO(["-o", "koio,nokoio"], defaultOn: true), "nokoio wins")
     }
 
-    func testDataCacheGrants() {
-        XCTAssertEqual(DataCachePolicy(defaultsValue: nil), .system)
-        XCTAssertEqual(DataCachePolicy(defaultsValue: "bogus"), .system)
-        XCTAssertEqual(DataCachePolicy(defaultsValue: "writeBack"), .writeBack)
-        let modes: [FSVolume.DataCacheMode] = [.none, .readWithCache, .readWriteWithCache]
-        let expected: [DataCachePolicy: [FSVolume.KernelCacheCoherencyType]] = [
-            .system: [.noCache, .noCache, .noCache],
-            .none: [.noCache, .noCache, .noCache],
-            .read: [.noCache, .readCache, .readCache],
-            .writeThrough: [.noCache, .readCache, .writeThrough],
-            .writeBack: [.noCache, .readCache, .writeBack],
-        ]
-        for policy in DataCachePolicy.allCases {
-            XCTAssertEqual(modes.map { policy.grant(for: $0) }, expected[policy], "\(policy)")
-        }
-    }
-
     func testIOStatsSummary() {
         var s = IOStats()
         XCTAssertTrue(s.isEmpty)
@@ -255,7 +238,6 @@ final class FSKitLayerTests: XCTestCase {
         XCTAssertEqual(volume.stats.counters["write"], IOStats.Counter(calls: 1, bytes: 12))
         XCTAssertEqual(volume.stats.counters["write <4K"]?.calls, 1)
         XCTAssertNil(volume.stats.counters["write to kernel I/O file"])
-        XCTAssertTrue(volume.isDataCacheInhibited, "no negotiation unless configured")
 
         let failed = expectation(description: "negative offset")
         volume.write(contents: Data("x".utf8), to: item, at: -1) { _, error in

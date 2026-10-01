@@ -6,6 +6,7 @@
 - 崩溃一致性：实现 jbd2 日志（Linux 同格式），所有元数据修改以事务方式原子提交；挂载时自动回放未完成的日志
 - 兼容现代 Linux 默认格式：`metadata_csum`、`64bit`、`flex_bg`、`extent`、htree 目录、`orphan_file`、`inline_data` 等
 - ext3 / ext2（间接块映射）同样支持读写；含 `bigalloc`、`quota`、`encrypt`、`casefold` 等特性的卷以**只读**方式挂载
+- 格式化：在 Mac 上直接把磁盘抹成 ext4（`diskutil`、磁盘工具、`newfs_fskit`），结果与 Linux 的 mke2fs 一致
 
 ## 架构
 
@@ -99,6 +100,26 @@ mount -F -t ext4 -o nokoio disk4s1 /tmp/ext4
   defaults write ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs VerifyWrites -bool YES
   ```
 
+### 格式化为 ext4
+
+格式化会清空整块盘或整个分区。三种方式：
+
+```bash
+# 1. diskutil / 磁盘工具（需要已安装 /Library/Filesystems/ext4.fs，见上文 install-fs-bundle.sh）
+diskutil eraseDisk ext4 DATA GPT disk4      # 整盘：新建 GPT，分区类型为 Linux 文件系统
+diskutil eraseVolume ext4 DATA disk4s2      # 只格式化一个分区
+# 2. FSKit 命令行，可带 mke2fs 风格的选项；真实磁盘需要 sudo（设备节点属于 root）
+sudo newfs_fskit -t ext4 -L DATA -m 0 /dev/disk4s2
+# 3. 磁盘镜像文件（开发用）
+cargo run -p ext4-tool -- disk.img mkfs -L DATA
+```
+
+- 生成的文件系统与 e2fsprogs 1.47 的 `mke2fs -t ext4` 相同（块大小、inode 数、日志大小和位置都一致），只是不启用 `resize_inode`、`orphan_file`、`metadata_csum_seed`，以便较老的 Linux 内核（4.x）也能读写。
+- 支持的选项：`-L` 卷标（超过 16 字节会截断）、`-b` 块大小、`-i` 每个 inode 对应的字节数、`-N` inode 数、`-m` 保留比例、`-U` UUID、`-J size=` 日志大小（MB）、`-O ^has_journal`、`-E root_owner[=uid:gid]`。
+- 通过 diskutil / 磁盘工具抹盘时默认不给 root 保留空间（`-m 0`）；其余方式和 mke2fs 一样默认保留 5%。
+- 除第 0 组外不清零 inode 表（与 Linux 上 mke2fs 的延迟初始化相同），大盘几秒即可完成；主要耗时是清零日志（最大 1 GB）。
+- `newfs_fskit` 之后系统可能还记着“无法识别”的旧探测结果，需要重新插拔才会自动挂载；`diskutil` 抹盘会自己挂载。
+
 发布给他人使用时需 Developer ID 签名 + 公证。
 
 ## 测试
@@ -114,6 +135,7 @@ mount -F -t ext4 -o nokoio disk4s1 /tmp/ext4
 | FFI / CLI | C ABI 全流程、扇区对齐、并发、定时提交；命令行工具 | `cargo test -p ext4-ffi -p ext4-tool` |
 | Swift | 桥接层、FSKit 属性转换、Handler 调用 | `xcodebuild ... -scheme Ext4KitTests test` |
 | 端到端 | 安装并启用扩展后，真实挂载镜像做 cp/rsync/xattr/链接/删除等，卸载后 e2fsck | `scripts/e2e-mount-test.sh` |
+| 格式化 | 与 mke2fs 对比几何参数和日志位置；各种大小（含随机数据填充、已有 ext4、64 GB 稀疏镜像）格式化后 e2fsck 干净、可挂载并在多个组里写入；选项解析 | `cargo test -p ext4-core --test mkfs` |
 | 随机操作（真实卷） | 在已挂载的卷上随机覆盖写、不经缓存写、追加、截断、扩展、预分配、内存映射写、改名覆盖、删除，每轮与内存模型逐字节比对，每 3 轮重新挂载；默认方式和内核直通 I/O 各跑一遍 | `python3 scripts/fsstress.py /Volumes/X/stress 1 15 diskNsM` |
 
 辅助工具：
@@ -168,6 +190,8 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 两块盘上，默认方式和内核直通 I/O 下的随机操作测试（`scripts/fsstress.py`，每组 18 轮、每 3 轮重新挂载）全部通过。
 
 正确性方面，用 RK3399 开发板的 SD 卡（Linux 内核写入、带未回放日志）验证过：日志回放后 `e2fsck` 干净；约 6 万个文件和 e2fsprogs 的 `debugfs` 导出逐个比对，内容全部一致。
+
+格式化在 Linux 内核上验证过：本工具格式化的 3 GB 镜像，在 Arch Linux ARM（内核 5.18、e2fsprogs 1.46.5）虚拟机里 `e2fsck` 干净，由内核挂载并写入约 3600 个文件和 300 MB 数据后仍然干净；传回 Mac 后，Linux 写入的 2430 个文件由本引擎读出，SHA-256 全部一致。
 
 **容量显示**：和 Linux 一样，总容量不含元数据（inode 表、日志等）；mke2fs 默认保留 5% 给 root，这部分算空闲但不算可用，Finder 会把它显示为“已用”。只存数据的盘可以在卸载状态下执行 `sudo tune2fs -m 0 /dev/diskNsM` 取消保留。注意 e2fsprogs 修改已有文件系统时要用块设备 `/dev/diskNsM`：原始设备 `/dev/rdiskNsM` 要求按扇区对齐读写，`tune2fs` 写超级块时会报 `Invalid argument`。
 

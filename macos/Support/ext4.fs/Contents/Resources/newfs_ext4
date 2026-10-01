@@ -10,11 +10,17 @@ set -eu
 
 logger -t newfs_ext4 "arguments: $*" 2>/dev/null || true
 args=()
+reserve_given=0
 while [ $# -gt 1 ]; do
     case "$1" in
         -v)
             args+=(-L "$2")
             shift 2
+            ;;
+        -m*)
+            reserve_given=1
+            args+=("$1")
+            shift
             ;;
         *)
             args+=("$1")
@@ -25,5 +31,19 @@ done
 if [ $# -ne 1 ]; then
     echo "usage: newfs_ext4 [-v name] [mke2fs options] device" >&2
     exit 64
+fi
+# Disks erased from macOS hold data: no blocks reserved for root (mke2fs
+# reserves 5%, meant for Linux system disks), unless asked for with -m.
+if [ "$reserve_given" -eq 0 ]; then
+    args+=(-m 0)
+fi
+# FSKit modules are enabled per user. Running as root, newfs_fskit takes
+# the user whose modules it may use from SUDO_UID (set by sudo); storagekitd
+# does not set it, so use the user logged in at the console.
+if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_UID:-}" ]; then
+    console_uid=$(stat -f %u /dev/console 2>/dev/null || echo 0)
+    if [ "$console_uid" -ne 0 ]; then
+        export SUDO_UID="$console_uid"
+    fi
 fi
 exec /sbin/newfs_fskit -t ext4 ${args[@]+"${args[@]}"} "$1"

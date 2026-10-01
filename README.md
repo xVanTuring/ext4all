@@ -57,7 +57,8 @@ FSKit 扩展必须带 `com.apple.developer.fskit.fsmodule` 权限签名，这需
 2. 执行 `scripts/install-dev.sh`：签名构建（自动登记本机设备、注册 App ID 和带 FSKit Module 能力的描述文件），安装到 `/Applications`，并取消构建目录里其它副本在系统中的登记（否则「系统设置」里会出现多个 Ext4Kit）。
    如果仍报 FSKit Module 能力相关的错误，用 Xcode 打开 `macos/Ext4Kit.xcodeproj`，在 `Ext4FS` target 的 Signing & Capabilities 中加上 **FSKit Module**，或在开发者网站为 App ID `tech.xvanturing.ext4.fs` 勾选该能力。
 3. 打开「系统设置 › 通用 › 登录项与扩展 › 文件系统扩展」，在「按类别」视图中启用 **Ext4Kit**（「按 App」视图里的开关可能无法切换）。
-4. 插入 ext4 磁盘即可自动挂载；也可手动：
+4. 执行 `sudo scripts/install-fs-bundle.sh`，安装文件系统描述包 `/Library/Filesystems/ext4.fs`。`diskutil` 和「磁盘工具」靠它识别 ext4；没有它时卷照样能挂载和读写，但 `diskutil unmount` / `eject` 会拒绝这些卷（直接调用 DiskArbitration 卸载不受影响）。`--remove` 可删除。
+5. 插入 ext4 磁盘即可自动挂载；也可手动：
 
 ```bash
 diskutil list                                   # 找到分区，例如 disk4s1

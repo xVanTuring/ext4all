@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  File system description bundle for /Library/Filesystems/ext4.fs.
+  The FSKit extension does the actual work; this bundle only names the
+  personalities so StorageKit (diskutil, Disk Utility) recognizes volumes
+  whose kind is ext2/ext3/ext4 and agrees to unmount and eject them, like
+  /System/Library/Filesystems/virtiofs.fs does for virtio-fs.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleIdentifier</key>
+	<string>tech.xvanturing.ext4.filesystem</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ext4</string>
+	<key>CFBundlePackageType</key>
+	<string>fs  </string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>FSPersonalities</key>
+	<dict>
+		<key>ext2</key>
+		<dict>
+			<key>FSName</key>
+			<string>Linux ext2</string>
+			<key>FSSubType</key>
+			<integer>0</integer>
+		</dict>
+		<key>ext3</key>
+		<dict>
+			<key>FSName</key>
+			<string>Linux ext3</string>
+			<key>FSSubType</key>
+			<integer>1</integer>
+		</dict>
+		<key>ext4</key>
+		<dict>
+			<key>FSName</key>
+			<string>Linux ext4</string>
+			<key>FSSubType</key>
+			<integer>2</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>

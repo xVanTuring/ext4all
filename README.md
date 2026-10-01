@@ -121,6 +121,27 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 - **目录枚举游标**：htree 目录按哈希顺序枚举、使用基于哈希的游标（与 Linux 相同），枚举过程中目录分裂不会漏项或重复；线性目录使用字节偏移游标。
 - **挂载前检查**：实现 FSKit 的检查操作，系统在自动挂载块设备前会调用。
 
+## 实测（macOS 27，Apple Silicon）
+
+| 介质 | 顺序写 | 顺序读（冷缓存） | 复制 57 个源码文件 | 3000 个小文件 | 每次 fsync |
+|---|---|---|---|---|---|
+| NVMe（USB 10Gbps 硬盘盒） | 753 MB/s（KOIO 925） | 781 MB/s（KOIO 967） | 0.18 秒 | 1.15 秒 | 0.6 毫秒 |
+| SD 卡 | 33 MB/s | 37 MB/s（KOIO 相同） | 0.82 秒 | 5.6 秒 | 5.5 毫秒 |
+| 入门级 U 盘 | 8 MB/s | 37 MB/s | 约 7 秒 | 约 19 秒 | 受随机写延迟限制 |
+
+慢速介质上瓶颈是硬件本身（入门级 U 盘单次 4K 随机写可能卡 1.5 秒）；高速 NVMe 上开启内核直通 I/O 大文件吞吐高约 20%，小文件略慢。
+
+正确性方面，用 RK3399 开发板的 SD 卡（Linux 内核写入、带未回放日志）验证过：日志回放后 `e2fsck` 干净；约 6 万个文件和 e2fsprogs 的 `debugfs` 导出逐个比对，内容全部一致。
+
+**容量显示**：和 Linux 一样，总容量不含元数据（inode 表、日志等）；mke2fs 默认保留 5% 给 root，这部分算空闲但不算可用，Finder 会把它显示为“已用”。只存数据的盘可以在卸载状态下执行 `sudo tune2fs -m 0 /dev/rdiskNsM` 取消保留。
+
+**自定义分区类型**：开发板镜像（如 Rockchip）常用厂商自定义的分区类型 GUID，macOS 不会自动探测（Linux 桌面同样不会自动挂载）。手动挂载时注意 FSKit 扩展按用户启用，不能用 `sudo mount`；先把设备交给当前用户再挂载：
+
+```bash
+sudo chown $USER /dev/disk4s9 /dev/rdisk4s9 && sudo chmod u+w /dev/disk4s9 /dev/rdisk4s9
+mkdir -p ~/mnt/sd && mount -F -t ext4 disk4s9 ~/mnt/sd
+```
+
 ## 已知限制
 
 - 无日志的 ext4 卷在断电后可能需要 `fsck`（与 Linux 相同，挂载期间会标记为未干净卸载）。

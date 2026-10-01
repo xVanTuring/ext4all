@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Check whether a drive returns stale data for blocks read shortly after
-they were written (seen with a USB NVMe enclosure: a read issued about a
+they were written. Seen with an NVMe SSD (Fanxiang S790MAX, InnoGrit
+IG5236, firmware 030W0P4W) in USB and Thunderbolt enclosures alike: after
+a block had been rewritten many times in a row, a read issued about a
 millisecond after a write returned the previous contents, and kept doing
-so until other data had been read). No file system is involved.
+so until other data had been read. No file system is involved.
 
 Uses a 4 MiB region 64 MiB before the end of the partition, saves it first
 and writes it back at the end. The partition must not be mounted, and the

@@ -133,7 +133,7 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 
 正确性方面，用 RK3399 开发板的 SD 卡（Linux 内核写入、带未回放日志）验证过：日志回放后 `e2fsck` 干净；约 6 万个文件和 e2fsprogs 的 `debugfs` 导出逐个比对，内容全部一致。
 
-**容量显示**：和 Linux 一样，总容量不含元数据（inode 表、日志等）；mke2fs 默认保留 5% 给 root，这部分算空闲但不算可用，Finder 会把它显示为“已用”。只存数据的盘可以在卸载状态下执行 `sudo tune2fs -m 0 /dev/rdiskNsM` 取消保留。
+**容量显示**：和 Linux 一样，总容量不含元数据（inode 表、日志等）；mke2fs 默认保留 5% 给 root，这部分算空闲但不算可用，Finder 会把它显示为“已用”。只存数据的盘可以在卸载状态下执行 `sudo tune2fs -m 0 /dev/diskNsM` 取消保留。注意 e2fsprogs 修改已有文件系统时要用块设备 `/dev/diskNsM`：原始设备 `/dev/rdiskNsM` 要求按扇区对齐读写，`tune2fs` 写超级块时会报 `Invalid argument`。
 
 **自定义分区类型**：开发板镜像（如 Rockchip）常用厂商自定义的分区类型 GUID，macOS 不会自动探测（Linux 桌面同样不会自动挂载）。手动挂载时注意 FSKit 扩展按用户启用，不能用 `sudo mount`；先把设备交给当前用户再挂载：
 

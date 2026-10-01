@@ -57,6 +57,8 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
             guard offset >= 0, length >= 0 else { throw POSIXError(.EINVAL) }
             let i = try ino(file)
             let write = flags.contains(.write)
+            noteOnce(
+                write ? "blockmap-w" : "blockmap-r", "first kernel \(write ? "write" : "read") mapping (inode \(i))")
             let resource = self.resource
             let limit = maxExtentLength
             try mount.mapForIO(i, offset: UInt64(offset), length: UInt64(length), write: write) { e in
@@ -88,6 +90,7 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
         run("completeIO", reply) {
             let i = try ino(file)
             let ok = Self.succeeded(status)
+            noteOnce("complete", "first kernel I/O completion (inode \(i))")
             if flags.contains(.write) && offset >= 0 && length > 0 {
                 if ok {
                     try mount.completeWrite(i, offset: UInt64(offset), length: UInt64(length))

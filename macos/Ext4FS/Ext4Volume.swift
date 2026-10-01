@@ -24,6 +24,17 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     let itemLock = NSRecursiveLock()
     /// Set by `unmount`; a later `mount` makes the volume writable again.
     private var finished = false
+    /// Events already logged once (which I/O paths FSKit actually uses).
+    private var noted = Set<String>()
+
+    /// Log `message` the first time `event` happens on this volume; call
+    /// with `opLock` held.
+    func noteOnce(_ event: String, _ message: @autoclosure () -> String) {
+        if noted.insert(event).inserted {
+            let text = message()
+            Log.fs.info("\(self.bsdName, privacy: .public): \(text, privacy: .public)")
+        }
+    }
     /// Regular extent-mapped files use kernel offloaded I/O
     /// (`Ext4KernelIOVolume`); all others go through read/write. Can only
     /// be switched off, at activation (`-o nokoio`), before any item is
@@ -573,6 +584,7 @@ extension Ext4Volume: FSVolume.ReadWriteHandler {
         run("read", reply) {
             guard offset >= 0 else { throw POSIXError(.EINVAL) }
             let i = try ino(item)
+            noteOnce("read", "first read through the extension (inode \(i))")
             let n = try buffer.withUnsafeMutableBytes { raw -> Int in
                 let len = min(length, raw.count)
                 guard len > 0 else { return 0 }
@@ -589,7 +601,9 @@ extension Ext4Volume: FSVolume.ReadWriteHandler {
     ) {
         run("write", reply) {
             guard offset >= 0 else { throw POSIXError(.EINVAL) }
-            let n = try mount.write(try ino(item), offset: UInt64(offset), data: contents)
+            let i = try ino(item)
+            noteOnce("write", "first write through the extension (inode \(i))")
+            let n = try mount.write(i, offset: UInt64(offset), data: contents)
             return try Self.unwrap(
                 FSWriteFileResult(bytesWritten: n, itemAttributes: try attributes(item), freeSpace: freeSpace()))
         }

@@ -54,9 +54,9 @@ xcodebuild -project Ext4Kit.xcodeproj -scheme Ext4KitTests test
 FSKit 扩展必须带 `com.apple.developer.fskit.fsmodule` 权限签名，这需要 Apple 开发者账号生成的描述文件：
 
 1. 打开 Xcode › Settings › Accounts，登录开发者账号（团队 `T8F5T6HKG8`，已写在 `macos/project.yml`）。
-2. 用 Xcode 打开 `macos/Ext4Kit.xcodeproj`，在 `Ext4FS` target 的 Signing & Capabilities 中确认有 **FSKit Module** 能力（Xcode 会自动为 `tech.xvanturing.ext4` / `tech.xvanturing.ext4.fs` 注册 App ID 和描述文件）。
-   命令行等价做法：`xcodebuild ... -allowProvisioningUpdates build`。
-3. 运行 `Ext4Kit.app`（放到 `/Applications` 更稳妥），按界面提示打开「系统设置 › 通用 › 登录项与扩展 › 文件系统扩展」，启用 **Ext4Kit**。
+2. 执行 `scripts/install-dev.sh`：签名构建（自动登记本机设备、注册 App ID 和带 FSKit Module 能力的描述文件），安装到 `/Applications`，并取消构建目录里其它副本在系统中的登记（否则「系统设置」里会出现多个 Ext4Kit）。
+   如果仍报 FSKit Module 能力相关的错误，用 Xcode 打开 `macos/Ext4Kit.xcodeproj`，在 `Ext4FS` target 的 Signing & Capabilities 中加上 **FSKit Module**，或在开发者网站为 App ID `tech.xvanturing.ext4.fs` 勾选该能力。
+3. 打开「系统设置 › 通用 › 登录项与扩展 › 文件系统扩展」，在「按类别」视图中启用 **Ext4Kit**（「按 App」视图里的开关可能无法切换）。
 4. 插入 ext4 磁盘即可自动挂载；也可手动：
 
 ```bash
@@ -124,6 +124,7 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 - 无日志的 ext4 卷在断电后可能需要 `fsck`（与 Linux 相同，挂载期间会标记为未干净卸载）。
 - FSKit 没有提供让磁盘把自身写缓存刷到介质的接口。日志提交依赖原始写入按顺序同步完成；如果磁盘在突然断电时丢失了写缓存里的数据，日志可能无法完整回放。拔盘前请先推出。
 - 单个操作修改的元数据超过日志容量（极大且极碎片化的文件删除）时，会在标记"未干净"的前提下直接写入原位置。
-- 内核直通 I/O 默认关闭（见上文）。引擎侧写映射先分配未写入 extent、部分覆盖的新块先清零，完成后才转换并增长文件大小，断电不会暴露旧数据；这部分有单元测试，但内核一侧的行为只能在签名后实测。
+- 内核直通 I/O 默认关闭（见上文）。引擎侧写映射先分配未写入 extent、部分覆盖的新块先清零，完成后才转换并增长文件大小，断电不会暴露旧数据。已在 macOS 27 上实测：内核确实通过块映射直接读写文件数据，端到端测试 5 种格式全部通过；系统日志里会记录每个卷第一次使用块映射或经扩展读写的情况。
+- FSKit 卷上 `fcntl(F_LOG2PHYS)` / `F_LOG2PHYS_EXT` 返回“不支持”（内核没有转发给扩展），开启内核直通 I/O 时也一样。
 - ext2/ext3 的文件不支持预分配（`fallocate`，与 Linux 相同，块映射无法表示未写入块）。
 - 只读支持：`bigalloc`、`quota`、`encrypt`、`casefold`、`verity`、`ea_inode`、`mmp` 等特性的卷可以读取，但不写入。

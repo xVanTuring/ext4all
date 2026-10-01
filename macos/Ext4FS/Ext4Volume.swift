@@ -270,10 +270,12 @@ extension Ext4Volume: FSVolume.Handler {
         reply()
     }
 
-    /// FSKit calls this very often (around every file close), so a sync
-    /// must be cheap: a waiting sync commits to the journal (durable; the
-    /// blocks reach their home locations at a later checkpoint), a
-    /// non-waiting one only asks the commit thread to commit soon.
+    /// Applications' fsync arrives here (observed as wait | 0x10000), and
+    /// macOS `cp` issues a waiting and a non-waiting sync for every copied
+    /// file; closing a file does not sync. So a sync must be cheap: a
+    /// waiting one commits to the journal (durable; the blocks reach their
+    /// home locations at a later checkpoint), a non-waiting one only asks
+    /// the commit thread to commit soon.
     func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void) {
         let wait = flags.rawValue & (FSSyncFlags.wait.rawValue | FSSyncFlags.dWait.rawValue) != 0
         guard wait else {

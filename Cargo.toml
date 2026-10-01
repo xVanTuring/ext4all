@@ -5,8 +5,8 @@ members = ["crates/ext4-core", "crates/ext4-ffi", "crates/ext4-tool"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
-authors = ["xvan"]
+license = "GPL-3.0-or-later"
+authors = ["xVanTuring"]
 
 [workspace.lints.clippy]
 # `x % n == 0` reads naturally next to the on-disk format arithmetic

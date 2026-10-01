@@ -42,7 +42,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Ext4Kit
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
-        INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 xvan"
+        INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 xVanTuring. GPL-3.0-or-later."
         CODE_SIGN_ENTITLEMENTS: App/Ext4Kit.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     dependencies:
@@ -64,7 +64,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_FILE: Ext4FS/Info.plist
         INFOPLIST_KEY_CFBundleDisplayName: Ext4Kit ext4
-        INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 xvan"
+        INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 xVanTuring. GPL-3.0-or-later."
         CODE_SIGN_ENTITLEMENTS: Ext4FS/Ext4FS.entitlements
         SKIP_INSTALL: YES
     preBuildScripts:

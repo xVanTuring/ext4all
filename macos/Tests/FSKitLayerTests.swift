@@ -25,6 +25,16 @@ final class FSKitLayerTests: XCTestCase {
         XCTAssertFalse(Ext4FileSystem.wantsKernelIO(["-o", "koio,nokoio"], defaultOn: true), "nokoio wins")
     }
 
+    func testTransferAlignment() {
+        XCTAssertEqual(ResourceBlockIO.alignment(logical: 512, physical: 512), 512)
+        XCTAssertEqual(ResourceBlockIO.alignment(logical: 512, physical: 4096), 4096, "4K physical sectors")
+        XCTAssertEqual(ResourceBlockIO.alignment(logical: 4096, physical: 4096), 4096)
+        XCTAssertEqual(ResourceBlockIO.alignment(logical: 0, physical: 0), 512)
+        XCTAssertEqual(ResourceBlockIO.alignment(logical: 512, physical: 3000), 512, "not a power of two")
+        XCTAssertEqual(ResourceBlockIO.alignment(logical: 512, physical: 1 << 20), 512, "implausibly large")
+        XCTAssertEqual(ResourceBlockIO.alignment(logical: 4096, physical: 512), 4096, "never below logical")
+    }
+
     func testKernelIOAttributeDecision() {
         var a = Ext4Attr()
         a.ino = 20

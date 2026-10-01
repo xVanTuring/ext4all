@@ -868,8 +868,13 @@ impl Fs {
         Ok(())
     }
 
+    /// Space statistics. Like Linux (`bsddf`, the default), the total
+    /// excludes the file system's own metadata (superblock copies,
+    /// descriptor tables, bitmaps, inode tables, journal), so a fresh volume
+    /// shows almost nothing used. Reserved blocks count as free but not as
+    /// available.
     pub fn statfs(&self) -> StatFs {
-        let blocks = self.sb.blocks_count();
+        let blocks = self.sb.blocks_count().saturating_sub(self.zone.total());
         let pending: u64 = self.deferred_free.iter().map(|&(_, n)| n).sum();
         let free = self.sb.free_blocks_count().saturating_add(pending).min(blocks);
         let reserved = self.sb.r_blocks_count();

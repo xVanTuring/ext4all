@@ -183,7 +183,9 @@ fn statfs_matches_superblock() {
         .unwrap();
     assert_eq!(s.free_blocks, free);
     assert_eq!(s.block_size, 4096);
-    assert_eq!(s.blocks, 8192);
+    // 8192 blocks minus the metadata overhead (inode tables, journal, ...)
+    assert!(s.blocks < 8192 && s.blocks > 4096, "{}", s.blocks);
+    assert!(s.blocks - s.free_blocks < 2048, "only file data counts as used");
     assert!(s.avail_blocks <= s.free_blocks);
     assert_eq!(s.name_max, 255);
 }

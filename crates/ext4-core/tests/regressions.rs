@@ -557,7 +557,7 @@ fn bigalloc_free_counts_are_in_blocks() {
         let fs = img.mount_ro();
         let s = fs.statfs();
         assert_eq!(s.free_blocks, field("Free blocks:"), "cluster {cluster}");
-        assert_eq!(s.blocks, field("Block count:"));
+        assert!(s.blocks < field("Block count:"), "metadata overhead excluded");
         assert!(
             s.avail_blocks > 0 && s.avail_blocks <= s.free_blocks,
             "cluster {cluster}: {s:?}"
@@ -626,5 +626,49 @@ fn overlapping_metadata_is_rejected_at_mount() {
         }
         // the untouched image still mounts
         pristine.mount().unmount().unwrap();
+    }
+}
+
+/// statfs excludes metadata overhead from the total like Linux's default
+/// (bsddf): a fresh volume shows only the few blocks of its directories
+/// and special inodes as used, not its inode tables and journal.
+#[test]
+fn statfs_total_excludes_metadata_overhead() {
+    for opts in [
+        &["-t", "ext4"][..],
+        &["-t", "ext4", "-b", "1024"][..],
+        &["-t", "ext3"][..],
+        &["-t", "ext2"][..],
+    ] {
+        let img = Image::new(64, opts);
+        let dump = img.dumpe2fs();
+        let field = |name: &str| -> u64 {
+            dump.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let mut fs = img.mount();
+        let s = fs.statfs();
+        let total = field("Block count:");
+        assert!(s.blocks < total, "{opts:?}: overhead not excluded");
+        assert_eq!(s.free_blocks, field("Free blocks:"), "{opts:?}");
+        let used = s.blocks - s.free_blocks;
+        assert!(used < 64, "{opts:?}: fresh volume shows {used} blocks used");
+        assert_eq!(s.avail_blocks, s.free_blocks - field("Reserved block count:"));
+        // writing data moves exactly those blocks from free to used
+        let f = fs.create(2, b"f", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+        fs.write(f, 0, &vec![7u8; 1 << 20]).unwrap();
+        let s2 = fs.statfs();
+        assert_eq!(s2.blocks, s.blocks);
+        let bs = fs.block_size() as u64;
+        let grew = (s2.blocks - s2.free_blocks) - used;
+        assert!(
+            grew >= (1 << 20) / bs && grew <= (1 << 20) / bs + 8,
+            "{opts:?}: grew {grew}"
+        );
+        fs.unmount().unwrap();
     }
 }

@@ -52,6 +52,11 @@ impl SystemZone {
         i < self.ranges.len() && self.ranges[i].0 < end
     }
 
+    /// Number of blocks in the zone (the file system's metadata overhead).
+    pub(crate) fn total(&self) -> u64 {
+        self.ranges.iter().map(|r| r.1 - r.0).sum()
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.ranges.len()

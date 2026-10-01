@@ -273,6 +273,31 @@ pub unsafe extern "C" fn ext4_sync(h: *const Ext4Handle) -> i32 {
     guard(|| unsafe { handle(h) }?.with(|fs| fs.sync()))
 }
 
+/// Make every completed operation durable by committing it to the journal
+/// (fsync semantics). Cheaper than [`ext4_sync`]: the blocks reach their
+/// home locations at a later checkpoint.
+///
+/// # Safety
+/// `h` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_commit(h: *const Ext4Handle) -> i32 {
+    // SAFETY: caller contract
+    guard(|| unsafe { handle(h) }?.with(|fs| fs.commit()))
+}
+
+/// Ask for a commit soon without waiting (MNT_NOWAIT syncs).
+///
+/// # Safety
+/// `h` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_request_commit(h: *const Ext4Handle) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        unsafe { handle(h) }?.request_commit();
+        Ok(())
+    })
+}
+
 /// # Safety
 /// `h` must be a live handle.
 #[unsafe(no_mangle)]

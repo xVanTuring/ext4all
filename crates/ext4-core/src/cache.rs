@@ -6,6 +6,12 @@
 //! (through the journal when there is one). Clean blocks are evicted in
 //! least-recently-used order once the cache exceeds its capacity.
 //!
+//! With a journal, committed blocks are written to their home location
+//! only at the next checkpoint. Until then a copy of their committed
+//! contents is kept here ("logged"): a checkpoint writes exactly that
+//! (never later, uncommitted changes), and a block that left the cache is
+//! read back from it rather than from its stale home location.
+//!
 //! Regular file data never enters the cache.
 
 use crate::device::BlockDevice;
@@ -33,6 +39,9 @@ pub struct BlockCache {
     /// modification (None = was not cached), so a failed operation can be
     /// undone.
     undo: Option<HashMap<u64, SavedBlock>>,
+    /// Committed contents of blocks whose home location is not written yet
+    /// (checkpoint pending).
+    logged: HashMap<u64, Box<[u8]>>,
     pub hits: u64,
     pub misses: u64,
 }
@@ -47,8 +56,55 @@ impl BlockCache {
             clock: 0,
             dirty_count: 0,
             undo: None,
+            logged: HashMap::new(),
             hits: 0,
             misses: 0,
+        }
+    }
+
+    /// After the dirty blocks were committed to the journal: remember their
+    /// committed contents for the checkpoint and mark them clean.
+    pub fn log_dirty(&mut self) {
+        for (&b, e) in &self.entries {
+            if e.dirty {
+                self.logged.insert(b, e.data.clone());
+            }
+        }
+        self.mark_all_clean();
+    }
+
+    /// Number of blocks waiting for a checkpoint.
+    pub fn logged_len(&self) -> usize {
+        self.logged.len()
+    }
+
+    /// Whether any block of `[start, start+count)` waits for a checkpoint.
+    pub fn logged_intersects(&self, start: u64, count: u64) -> bool {
+        if (count as usize) < self.logged.len() {
+            (start..start + count).any(|b| self.logged.contains_key(&b))
+        } else {
+            self.logged.keys().any(|&b| b >= start && b - start < count)
+        }
+    }
+
+    /// Blocks waiting for a checkpoint with their committed contents, in
+    /// block order.
+    pub fn logged_sorted(&self) -> Vec<(u64, &[u8])> {
+        let mut v: Vec<(u64, &[u8])> = self.logged.iter().map(|(&b, d)| (b, &d[..])).collect();
+        v.sort_unstable_by_key(|e| e.0);
+        v
+    }
+
+    /// The checkpoint wrote every logged block home.
+    pub fn clear_logged(&mut self) {
+        self.logged.clear();
+    }
+
+    /// Keep a logged copy in step with a direct write of part of the block
+    /// (the superblock), so a later checkpoint does not undo it.
+    pub fn patch_logged(&mut self, blk: u64, off: usize, bytes: &[u8]) {
+        if let Some(d) = self.logged.get_mut(&blk) {
+            d[off..off + bytes.len()].copy_from_slice(bytes);
         }
     }
 
@@ -130,6 +186,12 @@ impl BlockCache {
             return Ok(());
         }
         self.misses += 1;
+        if let Some(d) = self.logged.get(&blk) {
+            // committed but not checkpointed: the home location is stale
+            let data = d.clone();
+            self.insert(blk, data, false);
+            return Ok(());
+        }
         let mut data = vec![0u8; self.block_size].into_boxed_slice();
         dev.read_at(blk * self.block_size as u64, &mut data)?;
         self.insert(blk, data, false);
@@ -460,5 +522,40 @@ mod tests {
         c.put(1, &[0u8; 1024]);
         c.zeroed(1);
         assert_eq!(c.dirty_count(), 1);
+    }
+
+    #[test]
+    fn logged_copies_survive_eviction_and_later_changes() {
+        let d = dev();
+        let mut c = BlockCache::new(1024, 16);
+        c.get_mut(&d, 3).unwrap().fill(0xAA);
+        c.get_mut(&d, 4).unwrap().fill(0xBB);
+        c.log_dirty();
+        assert_eq!(c.dirty_count(), 0);
+        assert_eq!(c.logged_len(), 2);
+        // a newer, uncommitted change does not alter what the checkpoint
+        // writes
+        c.get_mut(&d, 3).unwrap().fill(0xCC);
+        let logged = c.logged_sorted();
+        assert_eq!(logged.iter().map(|e| e.0).collect::<Vec<_>>(), vec![3, 4]);
+        assert!(logged[0].1.iter().all(|&b| b == 0xAA));
+        assert!(logged[1].1.iter().all(|&b| b == 0xBB));
+        // evict block 4 (clean): a later read must come from the logged
+        // copy, not from the stale device contents
+        for b in 20..60 {
+            c.get(&d, b).unwrap();
+        }
+        assert!(!c.contains(4));
+        assert!(c.get(&d, 4).unwrap().iter().all(|&b| b == 0xBB));
+        assert!(c.logged_intersects(4, 1));
+        assert!(c.logged_intersects(0, 100));
+        assert!(!c.logged_intersects(5, 10));
+        c.patch_logged(4, 10, &[1, 2, 3]);
+        assert_eq!(&c.logged_sorted()[1].1[9..14], &[0xBB, 1, 2, 3, 0xBB]);
+        c.clear_logged();
+        assert_eq!(c.logged_len(), 0);
+        // after the checkpoint, eviction falls back to the device again
+        c.log_dirty(); // block 3 (0xCC) committed
+        assert_eq!(c.logged_len(), 1);
     }
 }

@@ -90,7 +90,9 @@ fn escaped_block_replays_with_checksum_v3() {
 #[test]
 fn failed_commit_aborts_and_recovers() {
     let img = Image::new(32, &["-t", "ext4"]);
-    for fail_after in [2usize, 4, 5, 7, 9] {
+    // write failures during the commit (journal superblock, log, commit
+    // block) and during the checkpoint that follows it in sync()
+    for fail_after in [0usize, 1, 2, 3, 4, 5] {
         let c = img.copy();
         let dev = load(&c);
         let mut fs = Fs::mount(
@@ -107,7 +109,7 @@ fn failed_commit_aborts_and_recovers() {
                 .unwrap();
         }
         dev.fail_writes_after(Some(fail_after));
-        assert!(fs.commit().is_err());
+        assert!(fs.sync().is_err(), "fail_after {fail_after}");
         dev.fail_writes_after(None);
         // the device works again, but the volume must stay aborted
         assert!(fs.is_read_only());

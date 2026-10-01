@@ -184,8 +184,19 @@ public final class Ext4Mount: @unchecked Sendable {
         return s
     }
 
+    /// Commit and checkpoint: everything at its home location.
     public func sync() throws {
         try ext4Check(ext4_sync(handle))
+    }
+
+    /// Make completed operations durable (journal commit, fsync semantics).
+    public func commit() throws {
+        try ext4Check(ext4_commit(handle))
+    }
+
+    /// Ask for a commit soon without waiting.
+    public func requestCommit() {
+        _ = ext4_request_commit(handle)
     }
 
     /// Commit everything and mark the volume clean.

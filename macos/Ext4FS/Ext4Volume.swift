@@ -270,9 +270,19 @@ extension Ext4Volume: FSVolume.Handler {
         reply()
     }
 
+    /// FSKit calls this very often (around every file close), so a sync
+    /// must be cheap: a waiting sync commits to the journal (durable; the
+    /// blocks reach their home locations at a later checkpoint), a
+    /// non-waiting one only asks the commit thread to commit soon.
     func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping @Sendable ((any Error)?) -> Void) {
+        let wait = flags.rawValue & (FSSyncFlags.wait.rawValue | FSSyncFlags.dWait.rawValue) != 0
+        guard wait else {
+            mount.requestCommit()
+            reply(nil)
+            return
+        }
         do {
-            try mount.sync()
+            try mount.commit()
             reply(nil)
         } catch {
             reply(error)

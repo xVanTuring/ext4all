@@ -323,6 +323,24 @@ void ext4_close(struct Ext4Handle *h);
 int32_t ext4_sync(const struct Ext4Handle *h);
 
 /**
+ * Make every completed operation durable by committing it to the journal
+ * (fsync semantics). Cheaper than [`ext4_sync`]: the blocks reach their
+ * home locations at a later checkpoint.
+ *
+ * # Safety
+ * `h` must be a live handle.
+ */
+int32_t ext4_commit(const struct Ext4Handle *h);
+
+/**
+ * Ask for a commit soon without waiting (MNT_NOWAIT syncs).
+ *
+ * # Safety
+ * `h` must be a live handle.
+ */
+int32_t ext4_request_commit(const struct Ext4Handle *h);
+
+/**
  * # Safety
  * `h` must be a live handle.
  */

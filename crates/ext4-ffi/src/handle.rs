@@ -87,6 +87,11 @@ impl Ext4Handle {
         }
     }
 
+    /// Ask the commit thread to commit soon, without waiting for it.
+    pub fn request_commit(&self) {
+        self.shared.wake.notify_all();
+    }
+
     /// Commit and mark the file system clean but keep it open (read-only)
     /// so late reclaims and attribute requests still succeed.
     pub fn finish(&self) -> Result<()> {
@@ -139,18 +144,29 @@ fn commit_loop(s: Arc<Shared>, interval: Duration) {
             continue;
         }
         drop(stop);
+        // Commit new changes to the journal; once a whole interval passes
+        // without changes, checkpoint so the home locations are current
+        // while the volume is idle.
         if let Ok(mut g) = s.fs.lock()
             && let Some(fs) = g.as_mut()
             && !fs.is_read_only()
-            && fs.has_pending_changes()
         {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fs.commit()));
-            match r {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => log::error!("periodic commit failed: {e}"),
-                Err(_) => {
-                    s.broken.store(true, Ordering::SeqCst);
-                    log::error!("panic during periodic commit; volume disabled");
+            let work: Option<fn(&mut Fs) -> Result<()>> = if fs.has_pending_changes() {
+                Some(Fs::commit)
+            } else if fs.has_pending_checkpoint() {
+                Some(Fs::checkpoint)
+            } else {
+                None
+            };
+            if let Some(work) = work {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(fs)));
+                match r {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::error!("periodic commit failed: {e}"),
+                    Err(_) => {
+                        s.broken.store(true, Ordering::SeqCst);
+                        log::error!("panic during periodic commit; volume disabled");
+                    }
                 }
             }
         }

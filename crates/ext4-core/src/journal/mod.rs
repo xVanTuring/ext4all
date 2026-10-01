@@ -51,6 +51,9 @@ pub struct Journal {
     /// Sequence number the next commit will use.
     pub sequence: u32,
     pub commits: u64,
+    /// Next free log block while committed transactions wait for a
+    /// checkpoint; `None` while the log is empty.
+    head: Option<u32>,
 }
 
 impl Journal {
@@ -81,6 +84,7 @@ impl Journal {
             block_size: fs_block_size,
             sequence,
             commits: 0,
+            head: None,
         })
     }
 
@@ -124,8 +128,39 @@ impl Journal {
         self.sb.set_start(0);
         self.sb.set_sequence(next_seq);
         self.sequence = next_seq;
+        self.head = None;
         self.write_sb(dev)?;
         dev.flush()
+    }
+
+    /// Whether committed transactions wait for a checkpoint.
+    pub fn has_pending_checkpoint(&self) -> bool {
+        self.head.is_some()
+    }
+
+    /// Log blocks in use by transactions waiting for a checkpoint.
+    pub fn used(&self) -> u32 {
+        self.head.map_or(0, |h| h - self.sb.first())
+    }
+
+    /// Whether a transaction of `n` metadata blocks fits in the space left
+    /// after the transactions already in the log.
+    pub fn fits_now(&self, n: usize) -> bool {
+        let head = self.head.unwrap_or(self.sb.first());
+        self.blocks_needed(n) <= self.log_end().saturating_sub(head) as usize
+    }
+
+    /// The caller wrote every logged block home: mark the log empty.
+    pub fn mark_checkpointed(&mut self, dev: &dyn BlockDevice) -> Result<()> {
+        if self.head.is_none() {
+            return Ok(());
+        }
+        self.sb.set_start(0);
+        self.sb.set_sequence(self.sequence);
+        self.write_sb(dev)?;
+        dev.flush()?;
+        self.head = None;
+        Ok(())
     }
 
     /// One past the last block of the regular log. With fast commits the
@@ -196,12 +231,31 @@ impl Journal {
         self.blocks_needed(n) <= self.capacity() as usize
     }
 
-    /// Log `blocks` (home block number → contents), then checkpoint them.
+    /// Log `blocks` (home block number → contents), then checkpoint them
+    /// right away.
     pub fn commit(&mut self, dev: &dyn BlockDevice, blocks: &[(u64, &[u8])]) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
-        if !self.fits(blocks.len()) {
+        self.append(dev, blocks)?;
+        for (home, data) in blocks {
+            dev.write_at(home * self.block_size as u64, data)?;
+        }
+        dev.flush()?;
+        self.mark_checkpointed(dev)
+    }
+
+    /// Append a transaction (home block number → contents) to the log, like
+    /// jbd2: the journal superblock is written only when the log was empty,
+    /// so a commit is a few sequential writes. The blocks stay in the log
+    /// until the caller has written them home and calls
+    /// [`Journal::mark_checkpointed`]; recovery replays every transaction
+    /// still in the log.
+    pub fn append(&mut self, dev: &dyn BlockDevice, blocks: &[(u64, &[u8])]) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        if !self.fits_now(blocks.len()) {
             return Err(Error::TooBig);
         }
         if !self.sb.is_64bit() && blocks.iter().any(|(h, _)| *h > u32::MAX as u64) {
@@ -262,16 +316,22 @@ impl Journal {
                 log.extend_from_slice(&d);
             }
         }
-        let first = self.sb.first();
         let data_blocks = (log.len() / bs) as u32;
 
         // 1. ordered data durable
         dev.flush()?;
-        // 2. journal superblock points at the new transaction
-        self.sb.set_start(first);
-        self.sb.set_sequence(seq);
-        self.write_sb(dev)?;
-        dev.flush()?;
+        // 2. an empty log: the journal superblock points at this transaction
+        let first = match self.head {
+            Some(h) => h,
+            None => {
+                let first = self.sb.first();
+                self.sb.set_start(first);
+                self.sb.set_sequence(seq);
+                self.write_sb(dev)?;
+                dev.flush()?;
+                first
+            }
+        };
         // 3. log blocks
         self.write_log(dev, first, &log)?;
         dev.flush()?;
@@ -288,15 +348,7 @@ impl Journal {
         }
         self.write_log(dev, first + data_blocks, &commit)?;
         dev.flush()?;
-        // 5. checkpoint
-        for (home, data) in blocks {
-            dev.write_at(home * bs as u64, data)?;
-        }
-        dev.flush()?;
-        // 6. journal empty again
-        self.sb.set_start(0);
-        self.sb.set_sequence(self.sequence);
-        self.write_sb(dev)?;
+        self.head = Some(first + data_blocks + 1);
         self.commits += 1;
         Ok(())
     }

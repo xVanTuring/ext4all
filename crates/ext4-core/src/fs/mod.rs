@@ -36,6 +36,10 @@ use crate::ondisk::superblock::{
 };
 use std::collections::{BTreeSet, HashMap};
 
+/// Most blocks kept in memory for the next checkpoint (16 MiB of 4K
+/// blocks) before one is forced.
+const MAX_LOGGED: usize = 4096;
+
 /// In-memory state captured when an operation starts (block contents are
 /// tracked by the cache's undo log).
 pub(crate) struct Savepoint {
@@ -487,6 +491,8 @@ impl Fs {
         self.dev.flush()?;
         // keep a cached copy of the superblock block coherent
         let (blk, off) = self.super_location();
+        let raw = self.sb.raw.clone();
+        self.cache.patch_logged(blk, off, &raw[..]);
         if self.cache.contains(blk) {
             let raw = self.sb.raw.clone();
             let b = self.cache.get_mut(&*self.dev, blk)?;
@@ -629,7 +635,15 @@ impl Fs {
             return Ok(());
         }
         self.end_savepoint();
+        let started = std::time::Instant::now();
+        let dirty = self.cache.dirty_count();
         let r = self.commit_inner();
+        let ms = started.elapsed().as_millis();
+        if ms >= 200 {
+            log::info!("commit of {dirty} metadata blocks took {ms} ms");
+        } else {
+            log::debug!("commit of {dirty} metadata blocks took {ms} ms");
+        }
         if let Err(e) = &r {
             // Like a jbd2 abort: stop writing. A committed-but-unwritten
             // transaction stays in the journal for the next mount.
@@ -645,13 +659,20 @@ impl Fs {
     }
 
     fn commit_inner(&mut self) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        // blocks becoming reusable with this commit
+        let freed = self.deferred_free.clone();
         self.release_deferred_frees()?;
+        let t_free = t0.elapsed().as_millis();
         let dirty_estimate = self.cache.dirty_count() + self.dirty_groups.len() + self.bitmaps_dirty.len() + 1;
         let journal_fits = self.journal.as_ref().is_some_and(|j| j.fits(dirty_estimate));
         let in_place_with_journal = self.journal.is_some() && !journal_fits;
         if in_place_with_journal {
             // Too big for the journal: write in place, but mark the file
             // system not clean for the duration so a crash forces fsck.
+            // Earlier transactions must be home first: replaying them after
+            // the in-place writes would undo those.
+            self.checkpoint_inner()?;
             log::warn!("transaction of ~{dirty_estimate} blocks exceeds the journal; writing in place");
             let s = self.sb.state() & !STATE_VALID;
             self.sb.set_state(s);
@@ -661,17 +682,42 @@ impl Fs {
         } else {
             self.stage_metadata()?;
         }
+        let t_stage = t0.elapsed().as_millis();
         let dirty = self.cache.dirty_blocks();
         if dirty.is_empty() {
             return Ok(());
         }
-        if !in_place_with_journal && let Some(j) = self.journal.as_mut() {
+        if !in_place_with_journal && self.journal.is_some() {
+            if !self.journal.as_ref().is_some_and(|j| j.fits_now(dirty.len())) {
+                // make room (the checkpoint writes committed contents only,
+                // so the running transaction's changes are unaffected)
+                self.checkpoint_inner()?;
+            }
+            let j = self.journal.as_mut().expect("journal");
             let blocks: Vec<(u64, &[u8])> = dirty
                 .iter()
                 .map(|&b| (b, self.cache.peek(b).expect("dirty block cached")))
                 .collect();
-            j.commit(&*self.dev, &blocks)?;
-            self.cache.mark_all_clean();
+            j.append(&*self.dev, &blocks)?;
+            let t_append = t0.elapsed().as_millis();
+            self.cache.log_dirty();
+            // Checkpoint now when a block that becomes reusable still has a
+            // copy in the log: it may be reused for file data right after
+            // this commit, and replaying (or checkpointing) the old copy
+            // would overwrite that data. Also keep half the log free and
+            // bound the memory held for the checkpoint.
+            let freed_logged = freed.iter().any(|&(s, n)| self.cache.logged_intersects(s, n));
+            let j = self.journal.as_ref().expect("journal");
+            let ckpt =
+                freed_logged || j.used() as usize * 2 > j.capacity() as usize || self.cache.logged_len() > MAX_LOGGED;
+            if ckpt {
+                self.checkpoint_inner()?;
+            }
+            log::debug!(
+                "commit phases: frees {t_free} ms, stage {t_stage} ms, append {t_append} ms, checkpoint {ckpt} \
+                 (freed blocks in the log: {freed_logged}), total {} ms",
+                t0.elapsed().as_millis()
+            );
             return Ok(());
         }
         self.dev.flush()?;
@@ -703,9 +749,70 @@ impl Fs {
         self.cache.dirty_count() > 0 || !self.dirty_groups.is_empty() || self.sb_dirty || !self.deferred_free.is_empty()
     }
 
-    /// Flush everything to disk.
+    /// Write every block waiting in the journal to its home location and
+    /// mark the log empty. Only committed contents are written, so this is
+    /// safe at any time; it keeps the volume consistent without a replay.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if self.aborted {
+            return Err(Error::Device(crate::error::errno::EIO));
+        }
+        if self.read_only {
+            return Ok(());
+        }
+        let r = self.checkpoint_inner();
+        if let Err(e) = &r {
+            log::error!("checkpoint failed, volume is now read-only: {e}");
+            self.aborted = true;
+            self.read_only = true;
+        }
+        r
+    }
+
+    fn checkpoint_inner(&mut self) -> Result<()> {
+        let pending = self.journal.as_ref().is_some_and(|j| j.has_pending_checkpoint());
+        if !pending && self.cache.logged_len() == 0 {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let bs = self.bs as u64;
+        let blocks = self.cache.logged_sorted();
+        let count = blocks.len();
+        // runs of consecutive blocks (inode tables, bitmaps) in one write
+        let mut i = 0;
+        while i < blocks.len() {
+            let mut j = i + 1;
+            while j < blocks.len() && blocks[j].0 == blocks[j - 1].0 + 1 {
+                j += 1;
+            }
+            if j - i == 1 {
+                self.dev.write_at(blocks[i].0 * bs, blocks[i].1)?;
+            } else {
+                let mut run = Vec::with_capacity((j - i) * bs as usize);
+                for b in &blocks[i..j] {
+                    run.extend_from_slice(b.1);
+                }
+                self.dev.write_at(blocks[i].0 * bs, &run)?;
+            }
+            i = j;
+        }
+        self.dev.flush()?;
+        if let Some(j) = self.journal.as_mut() {
+            j.mark_checkpointed(&*self.dev)?;
+        }
+        self.cache.clear_logged();
+        log::debug!("checkpoint of {count} blocks took {} ms", started.elapsed().as_millis());
+        Ok(())
+    }
+
+    /// Whether committed transactions wait in the journal for a checkpoint.
+    pub fn has_pending_checkpoint(&self) -> bool {
+        self.journal.as_ref().is_some_and(|j| j.has_pending_checkpoint())
+    }
+
+    /// Commit and checkpoint: everything on disk at its home location.
     pub fn sync(&mut self) -> Result<()> {
         self.commit()?;
+        self.checkpoint()?;
         if !self.read_only {
             self.dev.flush()?;
         }
@@ -744,6 +851,8 @@ impl Fs {
         }
         self.reclaim_all()?;
         self.commit()?;
+        // an empty journal: clean for Linux and e2fsck, no replay needed
+        self.checkpoint()?;
         if self.mounted_rw {
             if self.journal.is_some() {
                 let f = self.sb.feature_incompat() & !incompat::RECOVER;

@@ -697,3 +697,51 @@ fn allocated_end_reports_physical_eof() {
     unsafe { ext4_close(h) };
     fsck_clean(&p);
 }
+
+/// Names in the root directory of a crash copy of the image, after e2fsck
+/// replayed its journal.
+fn root_names_after_replay(p: &std::path::Path, tag: &str) -> String {
+    let copy = p.with_extension(format!("{tag}.img"));
+    std::fs::copy(p, &copy).unwrap();
+    let out = Command::new(sbin("e2fsck")).arg("-fy").arg(&copy).output().unwrap();
+    assert!(
+        out.status.code().unwrap_or(8) <= 1,
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let ls = Command::new(sbin("debugfs"))
+        .arg("-R")
+        .arg("ls -l /")
+        .arg(&copy)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&ls.stdout).into_owned()
+}
+
+#[test]
+fn commit_is_durable_and_request_commit_wakes_the_thread() {
+    let d = tempfile::tempdir().unwrap();
+    let p = mkfs(d.path(), &["-t", "ext4"]);
+    let o = ops(&p, false, 512);
+    // a long interval: only explicit requests commit
+    let h = mount(
+        &o,
+        Some(Ext4MountOptions {
+            commit_interval_secs: 3600,
+            ..Default::default()
+        }),
+    );
+    create(h, 2, "durable-by-commit", EXT4_FT_REG);
+    assert_eq!(unsafe { ext4_commit(h) }, 0);
+    // power loss right now: the journal holds the transaction
+    assert!(root_names_after_replay(&p, "a").contains("durable-by-commit"));
+
+    create(h, 2, "committed-on-request", EXT4_FT_REG);
+    assert_eq!(unsafe { ext4_request_commit(h) }, 0);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(root_names_after_replay(&p, "b").contains("committed-on-request"));
+
+    assert_eq!(unsafe { ext4_unmount(h) }, 0);
+    unsafe { ext4_close(h) };
+    fsck_clean(&p);
+}

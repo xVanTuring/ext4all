@@ -133,6 +133,72 @@ fn crash_at_every_write(opts: &[&str]) {
     assert!(saw_old && saw_new, "expected to observe both outcomes");
 }
 
+/// Power loss at every write of: a transaction appended to a log that
+/// already holds an uncheckpointed one, followed by the checkpoint of both
+/// (`sync`). The earlier transaction must always survive, the workload must
+/// be all or nothing, and e2fsck must agree.
+fn crash_at_every_write_lazy(opts: &[&str]) {
+    let base = base_image(opts);
+    let mut saw_old = false;
+    let mut saw_new = false;
+    for fail_after in 0..400usize {
+        let img = base.copy();
+        let dev = load(&img);
+        let mut fs = Fs::mount(dev.clone(), no_auto_commit()).unwrap();
+        let root = fs.root();
+        let pre = fs.create(root, b"pre", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+        fs.write(pre, 0, &pattern(5000, 9)).unwrap();
+        fs.commit().unwrap();
+        assert!(fs.has_pending_checkpoint());
+        workload(&mut fs);
+        dev.fail_writes_after(Some(fail_after));
+        let res = fs.sync();
+        std::mem::forget(fs);
+        dev.fail_writes_after(None);
+        save(&img, &dev);
+
+        let c = img.copy();
+        let (code, out) = c.fsck_fix();
+        assert!(code <= 1, "fail_after={fail_after}: e2fsck -fy exit {code}\n{out}");
+        assert!(
+            !out.contains("Fix? yes"),
+            "fail_after={fail_after}: e2fsck had to repair\n{out}"
+        );
+        c.assert_clean();
+
+        let mut fs = img.mount();
+        let root = fs.root();
+        let p = fs.lookup(root, b"pre").expect("earlier transaction lost");
+        assert_eq!(read_all(&mut fs, p), pattern(5000, 9));
+        if check_atomic(&mut fs) {
+            saw_new = true;
+        } else {
+            saw_old = true;
+        }
+        fs.unmount().unwrap();
+        img.assert_clean();
+        if res.is_ok() {
+            break;
+        }
+    }
+    assert!(saw_old && saw_new, "expected to observe both outcomes");
+}
+
+#[test]
+fn crash_during_lazy_commit_and_checkpoint_4k() {
+    crash_at_every_write_lazy(&["-t", "ext4", "-b", "4096"]);
+}
+
+#[test]
+fn crash_during_lazy_commit_and_checkpoint_1k() {
+    crash_at_every_write_lazy(&["-t", "ext4", "-b", "1024"]);
+}
+
+#[test]
+fn crash_during_lazy_commit_and_checkpoint_ext3() {
+    crash_at_every_write_lazy(&["-t", "ext3"]);
+}
+
 #[test]
 fn crash_during_commit_4k() {
     crash_at_every_write(&["-t", "ext4", "-b", "4096"]);
@@ -155,11 +221,10 @@ fn replay_on_read_only_mount_uses_overlay() {
     let dev = load(&img);
     let mut fs = Fs::mount(dev.clone(), no_auto_commit()).unwrap();
     workload(&mut fs);
-    // everything up to and including the commit block, then power loss
-    dev.fail_writes_after(Some(4));
-    assert!(fs.commit().is_err());
+    // committed to the log, power loss before the checkpoint
+    fs.commit().unwrap();
+    assert!(fs.has_pending_checkpoint());
     std::mem::forget(fs);
-    dev.fail_writes_after(None);
     save(&img, &dev);
     let before = std::fs::read(&img.path).unwrap();
     {
@@ -178,8 +243,10 @@ fn journal_replayed_by_rw_mount_is_reported() {
     let dev = load(&img);
     let mut fs = Fs::mount(dev.clone(), no_auto_commit()).unwrap();
     workload(&mut fs);
-    dev.fail_writes_after(Some(4));
-    assert!(fs.commit().is_err());
+    fs.commit().unwrap();
+    // power loss half way through writing the blocks home
+    dev.fail_writes_after(Some(2));
+    assert!(fs.checkpoint().is_err());
     std::mem::forget(fs);
     dev.fail_writes_after(None);
     save(&img, &dev);
@@ -189,6 +256,64 @@ fn journal_replayed_by_rw_mount_is_reported() {
     assert_eq!(r.replayed_transactions, 1);
     assert!(r.replayed_blocks > 5);
     assert!(check_atomic(&mut fs));
+    fs.unmount().unwrap();
+    img.assert_clean();
+}
+
+/// Several committed transactions in the log at once (no checkpoint in
+/// between), then power loss: replay applies all of them in order, and so
+/// does e2fsck (the log format is the kernel's).
+#[test]
+fn several_transactions_in_the_log_replay_in_order() {
+    let base = base_image(&["-t", "ext4"]);
+    let img = base.copy();
+    let dev = load(&img);
+    let mut fs = Fs::mount(dev.clone(), no_auto_commit()).unwrap();
+    let d = fs.mkdir(2, b"multi", 0o755, 0, 0).unwrap().ino;
+    let mut names = Vec::new();
+    for t in 0..12 {
+        for i in 0..20 {
+            let n = format!("t{t:02}-f{i:02}");
+            let f = fs
+                .create(d, n.as_bytes(), FileType::Regular, 0o644, 0, 0, 0)
+                .unwrap()
+                .ino;
+            fs.write(f, 0, n.as_bytes()).unwrap();
+            names.push(n);
+        }
+        // the same directory and inode table blocks change in every one
+        fs.commit().unwrap();
+    }
+    assert!(
+        fs.has_pending_checkpoint(),
+        "lazy checkpoint keeps transactions in the log"
+    );
+    std::mem::forget(fs);
+    save(&img, &dev);
+
+    // e2fsck replays the kernel-format log and finds nothing to fix
+    let copy = img.copy();
+    let (rc, out) = copy.fsck_fix();
+    assert!(rc == 0 || rc == 1, "e2fsck -fy: {out}");
+    let (rc, out) = copy.fsck();
+    assert_eq!(rc, 0, "after e2fsck replay: {out}");
+    let listed = copy.debugfs_ls("/multi");
+    for n in &names {
+        assert!(listed.iter().any(|(e, _)| e == n), "e2fsck replay lost {n}");
+    }
+
+    // our own replay
+    let mut fs = img.mount();
+    let r = fs.mount_report().clone();
+    assert!(r.journal_replayed);
+    assert_eq!(r.replayed_transactions, 12);
+    let d = fs.resolve("/multi").unwrap();
+    for n in &names {
+        let f = fs.lookup(d, n.as_bytes()).unwrap();
+        let mut b = vec![0u8; 16];
+        let k = fs.read(f, 0, &mut b).unwrap();
+        assert_eq!(&b[..k], n.as_bytes());
+    }
     fs.unmount().unwrap();
     img.assert_clean();
 }
@@ -485,4 +610,76 @@ fn power_loss_without_journal_is_detected_and_repairable() {
 #[test]
 fn random_ops_with_power_loss_ext3() {
     random_power_loss(&["-t", "ext3", "-b", "1024"], 300..316);
+}
+
+/// A metadata block that is still in the log (committed, not checkpointed)
+/// is freed and then reused for file data. Neither the checkpoint nor a
+/// replay after power loss may write the old metadata over the data.
+#[test]
+fn freed_logged_metadata_reused_for_data_is_never_overwritten() {
+    for crash in [false, true] {
+        let img = Image::new(16, &["-t", "ext4", "-b", "1024"]);
+        let dev = load(&img);
+        let mut fs = Fs::mount(dev.clone(), no_auto_commit()).unwrap();
+        let root = fs.root();
+        // a directory with many blocks, committed to the log only
+        let d = fs.mkdir(root, b"big", 0o755, 0, 0).unwrap().ino;
+        for i in 0..400 {
+            let n = format!("entry-{i:04}-{}", "x".repeat(40));
+            fs.create(d, n.as_bytes(), FileType::Regular, 0o644, 0, 0, 0).unwrap();
+        }
+        fs.commit().unwrap();
+        assert!(fs.has_pending_checkpoint());
+        let dir_blocks: Vec<u64> = fs
+            .file_extents(d)
+            .unwrap()
+            .iter()
+            .flat_map(|e| e.start..e.start + e.len as u64)
+            .collect();
+        assert!(dir_blocks.len() > 10);
+        // free the directory and its blocks
+        for i in 0..400 {
+            let n = format!("entry-{i:04}-{}", "x".repeat(40));
+            fs.unlink(d, n.as_bytes()).unwrap();
+        }
+        fs.rmdir(root, b"big").unwrap();
+        fs.commit().unwrap();
+        // fill the volume with data so the freed blocks are reused
+        let f = fs.create(root, b"fill", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+        let chunk = pattern(64 * 1024, 7);
+        let mut off = 0u64;
+        while fs.write(f, off, &chunk).is_ok() {
+            off += chunk.len() as u64;
+        }
+        fs.commit().unwrap();
+        let data_blocks: std::collections::HashSet<u64> = fs
+            .file_extents(f)
+            .unwrap()
+            .iter()
+            .flat_map(|e| e.start..e.start + e.len as u64)
+            .collect();
+        let reused = dir_blocks.iter().filter(|b| data_blocks.contains(b)).count();
+        assert!(reused > 0, "test did not reuse the freed directory blocks");
+        let size = fs.stat(f).unwrap().size;
+        if crash {
+            std::mem::forget(fs);
+        } else {
+            fs.unmount().unwrap();
+        }
+        save(&img, &dev);
+        let mut fs = img.mount();
+        let root = fs.root();
+        let f = fs.lookup(root, b"fill").unwrap();
+        assert_eq!(fs.stat(f).unwrap().size, size);
+        let mut buf = vec![0u8; chunk.len()];
+        let mut pos = 0u64;
+        while pos < size {
+            let n = fs.read(f, pos, &mut buf).unwrap();
+            let want = &chunk[..n];
+            assert!(buf[..n] == *want, "crash {crash}: data at {pos} overwritten");
+            pos += n as u64;
+        }
+        fs.unmount().unwrap();
+        img.assert_clean();
+    }
 }

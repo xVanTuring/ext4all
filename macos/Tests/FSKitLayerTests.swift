@@ -235,6 +235,13 @@ final class FSKitLayerTests: XCTestCase {
             synced.fulfill()
         }
         wait(for: [synced], timeout: 5)
+        // a non-waiting sync only schedules a commit and replies at once
+        let scheduled = expectation(description: "sync without waiting")
+        volume.synchronize(flags: FSSyncFlags(rawValue: 0x10002)!) { error in
+            XCTAssertNil(error)
+            scheduled.fulfill()
+        }
+        wait(for: [scheduled], timeout: 1)
 
         let reclaimed = expectation(description: "reclaim")
         volume.reclaimItem(item) { error in

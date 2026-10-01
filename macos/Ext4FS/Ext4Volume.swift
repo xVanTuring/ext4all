@@ -11,11 +11,17 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     let info: Ext4VolumeInfo
     private let capabilities: FSVolume.SupportedCapabilities
     private var blockSize: UInt64
-    /// Serializes handlers so that attributes and free space are sampled
-    /// and handed to FSKit in the same critical section as the operation
-    /// that produced them, and so reclaim can exclude lookups
-    /// (`FSItem.tryReclaim`).
+    /// Serializes handlers so that attributes and free space are sampled in
+    /// the same critical section as the operation that produced them. Never
+    /// held while replying: FSKit may call other handlers synchronously
+    /// from inside a reply (activation fetches the root's attributes).
     let opLock = NSLock()
+    /// Held from handing out an item until the reply has been sent, and by
+    /// reclaim around `FSItem.tryReclaim`, so FSKit's count of returned
+    /// items is accurate when reclaim checks it. Recursive, because a reply
+    /// may re-enter the volume on the same thread. Lock order: `itemLock`
+    /// before `opLock`.
+    let itemLock = NSRecursiveLock()
     /// Set by `unmount`; a later `mount` makes the volume writable again.
     private var finished = false
     /// Regular extent-mapped files use kernel offloaded I/O
@@ -54,17 +60,24 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
 
     // MARK: helpers
 
-    /// Run `body` under the volume lock and deliver its result (or error)
-    /// to `reply`, normally after releasing the lock. Handlers that hand an
-    /// item to FSKit (lookup, create, activate) pass `replyUnderLock`:
-    /// FSKit counts an item as returned when the reply is sent, and
-    /// `reclaimItem` relies on no lookup reply being in progress while it
-    /// holds the lock (`FSItem.tryReclaim`).
+    /// Run `body` under the volume lock, release it, and deliver the result
+    /// (or error) to `reply`. Handlers that hand an item to FSKit (lookup,
+    /// create, activate) pass `handsOutItem`: FSKit counts an item as
+    /// returned when the reply is sent, so `itemLock` stays held until
+    /// then and reclaim cannot run in between (`FSItem.tryReclaim`).
     @inline(__always)
     func run<T>(
-        _ what: StaticString, replyUnderLock: Bool = false, _ reply: (T?, (any Error)?) -> Void,
+        _ what: StaticString, handsOutItem: Bool = false, _ reply: (T?, (any Error)?) -> Void,
         _ body: () throws -> T
     ) {
+        if handsOutItem {
+            itemLock.lock()
+        }
+        defer {
+            if handsOutItem {
+                itemLock.unlock()
+            }
+        }
         let result: Result<T, any Error>
         opLock.lock()
         do {
@@ -72,9 +85,7 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
         } catch {
             result = .failure(error)
         }
-        if !replyUnderLock {
-            opLock.unlock()
-        }
+        opLock.unlock()
         switch result {
         case .success(let v):
             reply(v, nil)
@@ -83,9 +94,6 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
                 Log.fs.debug("\(what): \(error.localizedDescription, privacy: .public)")
             }
             reply(nil, error)
-        }
-        if replyUnderLock {
-            opLock.unlock()
         }
     }
 
@@ -187,7 +195,7 @@ extension Ext4Volume: FSVolume.Handler {
     func activateVolume(
         options: FSTaskOptions, replyHandler reply: @escaping @Sendable (FSActivateResult?, (any Error)?) -> Void
     ) {
-        run("activate", replyUnderLock: true, reply) {
+        run("activate", handsOutItem: true, reply) {
             if kernelIO {
                 kernelIO = Ext4FileSystem.wantsKernelIO(options.taskOptions, defaultOn: true)
                 Log.fs.info("kernel offloaded I/O \(self.kernelIO ? "on" : "off (-o nokoio)", privacy: .public)")
@@ -264,7 +272,7 @@ extension Ext4Volume: FSVolume.Handler {
         named name: FSFileName, in directory: FSItem, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSLookupItemResult?, (any Error)?) -> Void
     ) {
-        run("lookup", replyUnderLock: true, reply) {
+        run("lookup", handsOutItem: true, reply) {
             let (item, attributes) = try lookupParts(named: name, in: directory)
             return try Self.unwrap(FSLookupItemResult(foundItem: item, itemName: name, itemAttributes: attributes))
         }
@@ -290,8 +298,9 @@ extension Ext4Volume: FSVolume.Handler {
             return
         }
         var failure: (any Error)?
-        // Under the volume lock no lookup can hand this item out while
-        // FSKit decides whether it is really unreferenced.
+        // While itemLock is held no lookup or create can be between handing
+        // this item out and replying, so FSKit's count is final.
+        itemLock.lock()
         opLock.lock()
         let reclaimed = it.tryReclaim { [self] in
             items.remove(it)
@@ -302,6 +311,7 @@ extension Ext4Volume: FSVolume.Handler {
             }
         }
         opLock.unlock()
+        itemLock.unlock()
         if reclaimed, let failure {
             Log.fs.error("reclaim \(it.ino): \(failure.localizedDescription, privacy: .public)")
             reply(failure)
@@ -346,7 +356,7 @@ extension Ext4Volume: FSVolume.Handler {
         attributes newAttributes: FSItem.SetAttributesRequest, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSCreateItemResult?, (any Error)?) -> Void
     ) {
-        run("create", replyUnderLock: true, reply) {
+        run("create", handsOutItem: true, reply) {
             let (item, attributes) = try createParts(named: name, type: type, in: directory, newAttributes, context)
             return try Self.unwrap(
                 FSCreateItemResult(
@@ -378,7 +388,7 @@ extension Ext4Volume: FSVolume.Handler {
         linkContents contents: FSFileName, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSCreateSymlinkResult?, (any Error)?) -> Void
     ) {
-        run("symlink", replyUnderLock: true, reply) {
+        run("symlink", handsOutItem: true, reply) {
             let dir = try ino(directory)
             let (uid, gid) = owner(newAttributes, context)
             var a = try mount.symlink(dir, name.data, target: contents.data, uid: uid, gid: gid)

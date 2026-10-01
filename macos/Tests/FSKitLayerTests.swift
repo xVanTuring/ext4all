@@ -246,32 +246,54 @@ final class FSKitLayerTests: XCTestCase {
         // so tryReclaim may decline; either way the table stays consistent.
         XCTAssertLessThanOrEqual(volume.items.count, 2)
 
-        // handlers that hand out items reply while holding the volume lock
-        // (so reclaim cannot run between the table lookup and the reply);
-        // the others reply after releasing it
-        volume.run(
-            "locked", replyUnderLock: true,
-            { (_: Int?, _) in
-                XCTAssertFalse(volume.opLock.try(), "reply must run under the lock")
+        // Replies never run under the volume lock: FSKit calls other
+        // handlers synchronously from inside a reply (activation fetches
+        // the root's attributes), which deadlocked when it was held.
+        // Handlers that hand out items keep itemLock until the reply is
+        // sent, so reclaim (on another thread) cannot run in between.
+        // (dispatch_sync may run on the calling thread, so use a real one)
+        func heldByAnotherThread(_ lock: NSRecursiveLock) -> Bool {
+            var held = false
+            let done = DispatchSemaphore(value: 0)
+            let t = Thread {
+                if lock.try() {
+                    lock.unlock()
+                } else {
+                    held = true
+                }
+                done.signal()
             }
-        ) { 1 }
+            t.start()
+            done.wait()
+            return held
+        }
+        let nested = expectation(description: "reply re-enters the volume")
+        DispatchQueue.global().async {
+            volume.run(
+                "lookup-like", handsOutItem: true,
+                { (_: Int?, _) in
+                    XCTAssertTrue(volume.opLock.try(), "volume lock released before the reply")
+                    volume.opLock.unlock()
+                    XCTAssertTrue(heldByAnotherThread(volume.itemLock), "item lock held during the reply")
+                    // what FSKit does inside the activation reply
+                    volume.run("getattr-like", { (v: Int?, _) in XCTAssertEqual(v, 2) }) { 2 }
+                    // and a nested item-handing call on the same thread
+                    volume.run("lookup-again", handsOutItem: true, { (_: Int?, _) in }) { 3 }
+                    nested.fulfill()
+                }
+            ) { 1 }
+        }
+        wait(for: [nested], timeout: 5)
         volume.run(
-            "unlocked",
-            { (_: Int?, _) in
-                XCTAssertTrue(volume.opLock.try(), "reply must run after unlocking")
-                volume.opLock.unlock()
-            }
-        ) { 1 }
-        volume.run(
-            "failing", replyUnderLock: true,
+            "failing", handsOutItem: true,
             { (v: Int?, e) in
                 XCTAssertNil(v)
                 XCTAssertNotNil(e)
-                XCTAssertFalse(volume.opLock.try())
             }
         ) { throw POSIXError(.EIO) }
-        XCTAssertTrue(volume.opLock.try(), "lock released afterwards")
+        XCTAssertTrue(volume.opLock.try(), "volume lock released afterwards")
         volume.opLock.unlock()
+        XCTAssertFalse(heldByAnotherThread(volume.itemLock), "item lock released afterwards")
 
         let checked = try volume.quickCheck()
         XCTAssertTrue(checked.contains { $0.contains("ext4 volume \"vol\"") }, "\(checked)")

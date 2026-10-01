@@ -112,7 +112,7 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
         named name: FSFileName, in directory: FSItem, packer: FSExtentPacker, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSLookupItemKOIOResult?, (any Error)?) -> Void
     ) {
-        run("lookup", replyUnderLock: true, reply) {
+        run("lookup", handsOutItem: true, reply) {
             let (item, attributes) = try lookupParts(named: name, in: directory)
             return try Self.unwrap(FSLookupItemKOIOResult(foundItem: item, itemName: name, itemAttributes: attributes))
         }
@@ -123,7 +123,7 @@ final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @
         packer: FSExtentPacker, context: FSContext,
         replyHandler reply: @escaping @Sendable (FSCreateFileKOIOResult?, (any Error)?) -> Void
     ) {
-        run("create", replyUnderLock: true, reply) {
+        run("create", handsOutItem: true, reply) {
             let (item, attributes) = try createParts(
                 named: name, type: .file, in: directory, newAttributes, context)
             return try Self.unwrap(

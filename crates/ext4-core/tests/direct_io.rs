@@ -323,26 +323,70 @@ fn overlapping_in_flight_writes_keep_each_others_data() {
 /// of file and the write read as zeros even if a failed earlier write left
 /// data on the device there, unless a write still in flight covers them.
 #[test]
-fn extending_direct_writes_zero_the_old_tail() {
+fn failed_extending_writes_leave_zeros_past_eof() {
     let (img, dev, mut fs) = setup(&["-t", "ext4", "-b", "4096"]);
     let f = fs.create(2, b"f", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
     fs.write(f, 0, &[7u8; 100]).unwrap();
-    let pblk = fs.file_extents(f).unwrap()[0].start;
-    // leftovers of a failed direct write past EOF
-    dev.write_at(pblk * 4096 + 100, &[0xEEu8; 3996]).unwrap();
-    // write in the same block, beyond EOF
+    // a direct write past EOF fails after reaching the device
+    kernel_start_exact(&mut fs, &*dev, f, 100, &[0xEEu8; 3996]);
+    fs.abort_direct_write(f, 100, 3996).unwrap();
+    // a later write in the same block, beyond EOF
     kernel_write_exact(&mut fs, &*dev, f, 1000, &[8u8; 10]);
     let mut b = vec![0xFFu8; 1010];
     fs.read(f, 0, &mut b).unwrap();
     assert!(b[..100].iter().all(|&x| x == 7));
     assert!(b[100..1000].iter().all(|&x| x == 0), "gap in the same block");
     assert!(b[1000..].iter().all(|&x| x == 8));
-    // leftovers again, then a write in a later block
-    dev.write_at(pblk * 4096 + 1010, &[0xEEu8; 3086]).unwrap();
+    // a failed write spilling into new blocks, then a write further on
+    kernel_start_exact(&mut fs, &*dev, f, 1010, &[0xEEu8; 3086 + 4096]);
+    fs.abort_direct_write(f, 1010, 3086 + 4096).unwrap();
     kernel_write_exact(&mut fs, &*dev, f, 3 * 4096, &[9u8; 4096]);
-    let mut t = vec![0xFFu8; 4096 - 1010];
+    let mut t = vec![0xFFu8; 3 * 4096 - 1010];
     fs.read(f, 1010, &mut t).unwrap();
-    assert!(t.iter().all(|&x| x == 0), "old tail of the last block");
+    assert!(t.iter().all(|&x| x == 0), "old tail and the never written blocks");
+    finish(&img, &dev, fs);
+}
+
+/// macOS writes through mappings it obtained earlier and asks only for the
+/// blocks it has no mapping for: mapping that new block, beyond the end of
+/// file, must not touch the last block the kernel may be filling (seen as
+/// zeros past the old end of file after an uncached write).
+#[test]
+fn extending_mapping_keeps_tail_written_through_earlier_mappings() {
+    let (img, dev, mut fs) = setup(&["-t", "ext4", "-b", "4096"]);
+    let f = fs.create(2, b"f", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
+    let mut want = pattern(5000, 1);
+    kernel_write_exact(&mut fs, &*dev, f, 0, &want);
+    fs.truncate(f, 10324).unwrap();
+    want.resize(10324, 0);
+    // a memory mapped write pushes the third block
+    let tail = pattern(2132, 2);
+    kernel_write_exact(&mut fs, &*dev, f, 8192, &tail);
+    want[8192..].copy_from_slice(&tail);
+    // one write of 1347..13347: the first three blocks through the
+    // mappings already known, then a mapping for the fourth only
+    let data = pattern(12000, 3);
+    let pblk = fs.file_extents(f).unwrap();
+    for (lblk, chunk) in [(0u64, 1347usize..4096), (1, 4096..8192), (2, 8192..12288)] {
+        let e = pblk
+            .iter()
+            .find(|e| (e.block as u64) <= lblk && lblk < (e.block + e.len) as u64)
+            .unwrap();
+        let phys = (e.start + lblk - e.block as u64) * 4096;
+        let src = &data[chunk.start - 1347..chunk.end - 1347];
+        dev.write_at(phys + (chunk.start as u64 % 4096), src).unwrap();
+    }
+    kernel_start_exact(&mut fs, &*dev, f, 12288, &data[12288 - 1347..]);
+    fs.complete_direct_write(f, 0, 13347).unwrap();
+    want.resize(13347, 0);
+    want[1347..].copy_from_slice(&data);
+    let mut back = vec![0u8; 13347];
+    assert_eq!(fs.read(f, 0, &mut back).unwrap(), 13347);
+    assert!(
+        back == want,
+        "first difference at {:?}",
+        back.iter().zip(&want).position(|(a, b)| a != b)
+    );
 
     // an in-flight write filling the tail is not wiped by a later
     // extending write mapped before it completes
@@ -366,7 +410,7 @@ fn aborted_direct_write_stays_invisible() {
     let f = fs.create(2, b"f", FileType::Regular, 0o644, 0, 0, 0).unwrap().ino;
     fs.write(f, 0, &[1u8; 4096]).unwrap();
     kernel_start_exact(&mut fs, &*dev, f, 4096, &[0xEEu8; 8192]);
-    fs.abort_direct_write(f, 4096, 8192);
+    fs.abort_direct_write(f, 4096, 8192).unwrap();
     assert_eq!(fs.stat(f).unwrap().size, 4096);
     let r = kernel_read(&mut fs, &*dev, f, 0, 12288);
     assert!(r[4096..].iter().all(|&x| x == 0));

@@ -871,12 +871,7 @@ pub unsafe extern "C" fn ext4_complete_write(h: *const Ext4Handle, ino: u32, off
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ext4_abort_write(h: *const Ext4Handle, ino: u32, offset: u64, len: u64) -> i32 {
     // SAFETY: caller contract
-    guard(|| {
-        unsafe { handle(h) }?.with(|fs| {
-            fs.abort_direct_write(ino, offset, len);
-            Ok(())
-        })
-    })
+    guard(|| unsafe { handle(h) }?.with(|fs| fs.abort_direct_write(ino, offset, len)))
 }
 
 // --- extended attributes (macOS names) --------------------------------------------

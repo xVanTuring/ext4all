@@ -651,22 +651,12 @@ impl Fs {
         }
         // (logical, physical) blocks to zero before the kernel writes
         let mut zero: Vec<(u64, u64)> = Vec::new();
-        // Extending past a partial last block: the bytes between the old
-        // end of file and the write become file contents, so they must be
-        // zeros even if a failed earlier write left data there (Linux
-        // zeroes the tail the same way).
-        let mut eof_gap: Option<(u64, u64)> = None;
-        if write && offset > size && size % bs != 0 {
-            let eof_blk = size / bs;
-            let gap_end = offset.min((eof_blk + 1) * bs);
-            if let Mapping::Mapped {
-                pblk, unwritten: false, ..
-            } = self.map_block(ino, &inode, eof_blk)?
-                && !self.dio_inflight_overlaps(ino, size, (eof_blk + 1) * bs)
-            {
-                eof_gap = Some((pblk * bs + size % bs, gap_end - size));
-            }
-        }
+        // The tail of a written last block past the end of file is left
+        // alone even when this write extends the file: the kernel writes
+        // through mappings it obtained earlier without asking again, so it
+        // may be filling that tail right now as part of the same request.
+        // It zero-fills the gap of an extending write itself, and a failed
+        // write's leftovers are cleared in `abort_direct_write`.
         let mut lblk = first;
         let mut allocated = false;
         while lblk < last_blk {
@@ -761,9 +751,6 @@ impl Fs {
                 self.dev.write_at(pblk * bs, &zeros)?;
             }
         }
-        if let Some((at, len)) = eof_gap {
-            self.dev.write_at(at, &vec![0u8; len as usize])?;
-        }
         if allocated {
             self.write_inode(ino, &inode)?;
             self.maybe_commit()?;
@@ -814,9 +801,26 @@ impl Fs {
     }
 
     /// The kernel reports that a direct write of `[offset, offset+len)`
-    /// failed: nothing becomes visible (the blocks stay unwritten).
-    pub fn abort_direct_write(&mut self, ino: Ino, offset: u64, len: u64) {
-        self.dio_inflight_done(ino, offset, offset.saturating_add(len));
+    /// failed: nothing becomes visible. New blocks stay unwritten; if the
+    /// write reached past the end of file into the written last block,
+    /// whatever it left there is zeroed, so a later extension of the file
+    /// shows zeros.
+    pub fn abort_direct_write(&mut self, ino: Ino, offset: u64, len: u64) -> Result<()> {
+        let end = offset.saturating_add(len);
+        self.dio_inflight_done(ino, offset, end);
+        if self.read_only {
+            return Ok(());
+        }
+        let inode = self.read_live_inode(ino)?;
+        let size = inode.size();
+        let bs = self.bs as u64;
+        if end > size
+            && offset < size.div_ceil(bs) * bs
+            && !self.dio_inflight_overlaps(ino, size, size.div_ceil(bs) * bs)
+        {
+            self.zero_tail(ino, &inode, size)?;
+        }
+        Ok(())
     }
 
     /// The kernel finished writing `[offset, offset+len)` directly to the

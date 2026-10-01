@@ -1015,3 +1015,32 @@ fn ext2_directories_and_symlinks() {
     img.assert_clean();
     assert_eq!(img.debugfs_cat("/renamed/entry-1"), b"1");
 }
+
+/// The kernel's uncached append path: read the sectors up to the end of
+/// file, add the new bytes and rewrite everything from offset 0.
+#[test]
+fn growing_rewrites_from_offset_zero_keep_every_byte() {
+    for (name, opts) in PROFILES {
+        let img = Image::new(32, opts);
+        {
+            let mut fs = img.mount();
+            let root = fs.root();
+            let ino = mkfile(&mut fs, root, "append.log", b"");
+            let mut want = Vec::new();
+            for i in 0..300 {
+                let size = fs.stat(ino).unwrap().size as usize;
+                let mut buf = vec![0u8; size.div_ceil(512) * 512 + 512];
+                let n = fs.read(ino, 0, &mut buf).unwrap();
+                assert_eq!(n, size, "{name}: line {i}");
+                buf.truncate(n);
+                let line = format!("line {i} {}\n", "x".repeat(i % 90));
+                buf.extend_from_slice(line.as_bytes());
+                want.extend_from_slice(line.as_bytes());
+                assert_eq!(fs.write(ino, 0, &buf).unwrap(), buf.len());
+                assert_eq!(read_all(&mut fs, ino), want, "{name}: after line {i}");
+            }
+            fs.unmount().unwrap();
+        }
+        img.assert_clean();
+    }
+}

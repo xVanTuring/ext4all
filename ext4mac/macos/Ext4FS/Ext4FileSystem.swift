@@ -146,14 +146,19 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
             // extension). Never for LUKS: the kernel would read ciphertext.
             let kernelIO = !isLuks && UserDefaults.standard.bool(forKey: Ext4FileSystem.kernelIODefaultsKey)
             let parallelReads = UserDefaults.standard.bool(forKey: Ext4FileSystem.parallelReadsDefaultsKey)
+            let parallelWrites = UserDefaults.standard.bool(forKey: Ext4FileSystem.parallelWritesDefaultsKey)
             let volume: Ext4Volume =
                 kernelIO
-                ? Ext4KernelIOVolume(mount: mount, info: info, resource: device, parallelReads: parallelReads)
-                : Ext4Volume(mount: mount, info: info, bsdName: device.bsdName, parallelReads: parallelReads)
+                ? Ext4KernelIOVolume(
+                    mount: mount, info: info, resource: device, parallelReads: parallelReads,
+                    parallelWrites: parallelWrites)
+                : Ext4Volume(
+                    mount: mount, info: info, bsdName: device.bsdName, parallelReads: parallelReads,
+                    parallelWrites: parallelWrites)
             loaded.withLock { $0 = volume }
             containerStatus = .ready
             Log.fs.info(
-                "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)\(kernelIO ? ", kernel offloaded I/O" : "", privacy: .public)\(parallelReads ? ", parallel reads" : "", privacy: .public)"
+                "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)\(kernelIO ? ", kernel offloaded I/O" : "", privacy: .public)\(parallelReads ? ", parallel reads" : "", privacy: .public)\(parallelWrites ? ", parallel writes" : "", privacy: .public)"
             )
             reply(volume, nil)
         } catch let locked as LuksUnavailable {
@@ -296,6 +301,9 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     /// Defaults key that lets file data reads run in parallel
     /// (`Ext4Volume.parallelReads`); read when a volume is loaded.
     static let parallelReadsDefaultsKey = "ParallelReads"
+    /// Defaults key that lets file data writes run in parallel
+    /// (`Ext4Volume.parallelWrites`); read when a volume is loaded.
+    static let parallelWritesDefaultsKey = "ParallelWrites"
 
     /// With kernel offloaded I/O available, `-o nokoio` switches it off for
     /// one mount (and `-o koio` on); otherwise `defaultOn` decides.

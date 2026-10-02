@@ -279,6 +279,42 @@ final class Ext4BridgeTests: XCTestCase {
         try TestImage.assertClean(path)
     }
 
+    func testParallelWrites() throws {
+        let path = try TestImage.make(sizeMB: 64)
+        let m = try Ext4Mount(FileBlockIO(path: path, readOnly: false), readOnly: false)
+        let f = try m.create(Ext4Mount.rootIno, Data("w".utf8), type: UInt8(EXT4_FT_REG), perm: 0o644, uid: 0, gid: 0)
+        // whole 64 KiB chunks, and odd sizes at odd offsets (the locked path)
+        let chunks: [(offset: Int, data: Data)] = (0..<16).map { i in
+            i % 4 == 3
+                ? (i * 65536 + 100, Data.pattern(1000 + i, seed: UInt8(i)))
+                : (i * 65536, Data.pattern(65536, seed: UInt8(i)))
+        }
+        let failures = NSLock()
+        var errors: [String] = []
+        DispatchQueue.concurrentPerform(iterations: chunks.count) { i in
+            let c = chunks[i]
+            do {
+                let ticket = try m.reserveWrite(f.ino, offset: UInt64(c.offset), length: c.data.count)
+                let n = try m.writeParallel(ticket: ticket, f.ino, offset: UInt64(c.offset), data: c.data)
+                if n != c.data.count { throw POSIXError(.EIO) }
+            } catch {
+                failures.lock()
+                errors.append("chunk \(i): \(error)")
+                failures.unlock()
+            }
+        }
+        XCTAssertTrue(errors.isEmpty, "\(errors)")
+        var want = Data(count: 16 * 65536)
+        for c in chunks {
+            want.replaceSubrange(c.offset..<c.offset + c.data.count, with: c.data)
+        }
+        // the last chunk is short and unaligned: the file ends with it
+        want = want.prefix(chunks[15].offset + chunks[15].data.count)
+        XCTAssertEqual(try m.read(f.ino, offset: 0, length: want.count + 10), want)
+        try m.unmount()
+        try TestImage.assertClean(path)
+    }
+
     /// Kernel offloaded I/O through the bridge: map for write, write the
     /// device directly at the mapped offsets (as the kernel would),
     /// complete, then read back through the engine and a read mapping.

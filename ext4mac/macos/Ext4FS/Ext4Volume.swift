@@ -52,13 +52,22 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     /// together reach the device together (opt-in, `ParallelReads`).
     let parallelReads: Bool
     static let readQueue = DispatchQueue(label: "tech.xvanturing.ext4.fs.read", attributes: .concurrent)
+    /// File data writes reserve their blocks in arrival order, return at
+    /// once and run on `writeQueue`, with the engine locked only to
+    /// prepare and finish (opt-in, `ParallelWrites`).
+    let parallelWrites: Bool
+    static let writeQueue = DispatchQueue(label: "tech.xvanturing.ext4.fs.write", attributes: .concurrent)
 
-    init(mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false, parallelReads: Bool = false) {
+    init(
+        mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false, parallelReads: Bool = false,
+        parallelWrites: Bool = false
+    ) {
         self.mount = mount
         self.bsdName = bsdName
         self.info = info
         self.kernelIO = kernelIO
         self.parallelReads = parallelReads
+        self.parallelWrites = parallelWrites
         self.blockSize = UInt64(info.blockSize)
         let caps = FSVolume.SupportedCapabilities()
         caps.supportsPersistentObjectIDs = true
@@ -684,12 +693,31 @@ extension Ext4Volume: FSVolume.ReadWriteHandler {
         contents: Data, to item: FSItem, at offset: off_t,
         replyHandler reply: @escaping @Sendable (FSWriteFileResult?, (any Error)?) -> Void
     ) {
+        // kernel offloaded I/O files keep the locked path: the kernel's
+        // direct writes to them are tracked separately
+        if parallelWrites, offset >= 0, let it = item as? Ext4Item, it.kernelIO != true,
+            let ticket = try? mount.reserveWrite(it.ino, offset: UInt64(offset), length: contents.count)
+        {
+            Self.writeQueue.async {
+                // only the bookkeeping takes opLock
+                let n = Result {
+                    try self.mount.writeParallel(ticket: ticket, it.ino, offset: UInt64(offset), data: contents)
+                }
+                self.run("write", reply) {
+                    let n = try Self.wholeWrite(n.get(), of: contents.count)
+                    self.countWrite(it.ino, contents.count)
+                    Log.fs.debug("write \(it.ino) \(offset)+\(contents.count)")
+                    return try Self.unwrap(
+                        FSWriteFileResult(
+                            bytesWritten: n, itemAttributes: try self.attributes(item), freeSpace: self.freeSpace()))
+                }
+            }
+            return
+        }
         run("write", reply) {
             guard offset >= 0 else { throw POSIXError(.EINVAL) }
             let i = try ino(item)
-            noteOnce("write", "first write through the extension (inode \(i))")
-            stats.add("write", bytes: contents.count)
-            stats.add("write \(IOStats.bucket(contents.count))")
+            countWrite(i, contents.count)
             if (item as? Ext4Item)?.kernelIO == true {
                 // the kernel chose this path for a kernel offloaded I/O file
                 stats.add("write to kernel I/O file", bytes: contents.count)
@@ -700,11 +728,28 @@ extension Ext4Volume: FSVolume.ReadWriteHandler {
                     )
                 }
             }
-            let n = try mount.write(i, offset: UInt64(offset), data: contents)
+            let n = try Self.wholeWrite(mount.write(i, offset: UInt64(offset), data: contents), of: contents.count)
             Log.fs.debug("write \(i) \(offset)+\(contents.count)")
             return try Self.unwrap(
                 FSWriteFileResult(bytesWritten: n, itemAttributes: try attributes(item), freeSpace: freeSpace()))
         }
+    }
+
+    /// The engine writes less than asked only when the volume fills up.
+    /// FSKit wants ENOSPC then: the kernel turns a short successful write
+    /// into EIO.
+    static func wholeWrite(_ n: Int, of count: Int) throws -> Int {
+        if n < count {
+            throw POSIXError(.ENOSPC)
+        }
+        return n
+    }
+
+    /// Statistics of a write; call with `opLock` held.
+    private func countWrite(_ i: UInt32, _ count: Int) {
+        noteOnce("write", "first write through the extension (inode \(i))")
+        stats.add("write", bytes: count)
+        stats.add("write \(IOStats.bucket(count))")
     }
 }
 

@@ -633,6 +633,37 @@ int32_t ext4_write(const struct Ext4Handle *h,
                    size_t *nwritten);
 
 /**
+ * Reserve the blocks a write of `len` bytes at `offset` touches, in the
+ * order requests arrive, for [`ext4_write_parallel`]: overlapping writes
+ * reach the disk in reservation order. Every ticket must be passed on to
+ * `ext4_write_parallel`, which releases it.
+ *
+ * # Safety
+ * `h` must be a live handle; `ticket` valid for writes.
+ */
+int32_t ext4_reserve_write(const struct Ext4Handle *h,
+                           uint32_t ino,
+                           uint64_t offset,
+                           size_t len,
+                           uint64_t *ticket);
+
+/**
+ * Like [`ext4_write`], but the file system is locked only to prepare and
+ * to finish: concurrent calls from several threads write the device in
+ * parallel. `ticket` is from [`ext4_reserve_write`] for the same range.
+ *
+ * # Safety
+ * `h` must be a live handle; `buf` valid for `len` bytes.
+ */
+int32_t ext4_write_parallel(const struct Ext4Handle *h,
+                            uint64_t ticket,
+                            uint32_t ino,
+                            uint64_t offset,
+                            const uint8_t *buf,
+                            size_t len,
+                            size_t *nwritten);
+
+/**
  * Create a node of type `file_type` (regular, fifo, socket, char/block
  * device) or a directory (`EXT4_FT_DIR`).
  *

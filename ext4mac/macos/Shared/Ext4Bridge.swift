@@ -469,6 +469,27 @@ public final class Ext4Mount: @unchecked Sendable {
         return n
     }
 
+    /// Reserve the blocks of a write, in the order requests arrive, for
+    /// `writeParallel`; every ticket must be passed on to it.
+    public func reserveWrite(_ ino: UInt32, offset: UInt64, length: Int) throws -> UInt64 {
+        var ticket: UInt64 = 0
+        try ext4Check(ext4_reserve_write(handle, ino, offset, length, &ticket))
+        return ticket
+    }
+
+    /// Like `write`, but the volume is locked only to prepare and finish:
+    /// may be called from several threads at once, and their device writes
+    /// run in parallel. `ticket` is from `reserveWrite` for the same range.
+    public func writeParallel(ticket: UInt64, _ ino: UInt32, offset: UInt64, data: Data) throws -> Int {
+        var n = 0
+        try data.withUnsafeBytes { b in
+            try ext4Check(
+                ext4_write_parallel(
+                    handle, ticket, ino, offset, b.bindMemory(to: UInt8.self).baseAddress, data.count, &n))
+        }
+        return n
+    }
+
     public func read(_ ino: UInt32, offset: UInt64, length: Int) throws -> Data {
         var d = Data(count: length)
         let n = try d.withUnsafeMutableBytes { try read(ino, offset: offset, into: $0) }

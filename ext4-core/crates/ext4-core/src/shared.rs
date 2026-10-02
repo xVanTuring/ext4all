@@ -3,8 +3,9 @@
 //! while a volume is mounted.
 
 use crate::error::errno::EIO;
-use crate::fs::read_pieces;
+use crate::fs::{read_pieces, write_pieces};
 use crate::{Error, Fs, Ino, Result};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
@@ -12,10 +13,10 @@ use std::time::Duration;
 
 struct Shared {
     fs: Mutex<Option<Fs>>,
-    /// Held shared by [`SharedFs::read_parallel`] from mapping until its
-    /// device reads finish, and exclusively around every other operation,
-    /// so no block such a read is fetching can be freed and reused
-    /// meanwhile. Taken before `fs`.
+    /// Held shared by [`SharedFs::read_parallel`] and
+    /// [`SharedFs::write_parallel`] until their device transfers finish,
+    /// and exclusively around every other operation, so no block they are
+    /// moving can be freed and reused meanwhile. Taken before `fs`.
     data: RwLock<()>,
     /// Set after a panic inside an operation: in-memory state may be
     /// inconsistent, so nothing more may be written.
@@ -28,11 +29,36 @@ pub struct SharedFs {
     shared: Arc<Shared>,
     committer: Mutex<Option<JoinHandle<()>>>,
     read_only: bool,
+    block_size: u64,
+    /// Blocks reserved by writes that have not finished, oldest first.
+    writes: Mutex<Writes>,
+    write_done: Condvar,
+}
+
+#[derive(Default)]
+struct Writes {
+    last: u64,
+    active: Vec<(u64, Ino, Range<u64>)>,
+}
+
+/// Releases a write's reserved blocks however `write_parallel` ends.
+struct Release<'a> {
+    fs: &'a SharedFs,
+    ticket: u64,
+}
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        let mut w = self.fs.writes.lock().unwrap_or_else(|e| e.into_inner());
+        w.active.retain(|r| r.0 != self.ticket);
+        self.fs.write_done.notify_all();
+    }
 }
 
 impl SharedFs {
     pub fn new(fs: Fs, commit_interval: Duration) -> SharedFs {
         let read_only = fs.is_read_only();
+        let block_size = fs.block_size() as u64;
         let shared = Arc::new(Shared {
             fs: Mutex::new(Some(fs)),
             data: RwLock::new(()),
@@ -55,6 +81,9 @@ impl SharedFs {
             shared,
             committer: Mutex::new(committer),
             read_only,
+            block_size,
+            writes: Mutex::default(),
+            write_done: Condvar::new(),
         }
     }
 
@@ -100,6 +129,67 @@ impl SharedFs {
                 Ok(len)
             }
             None => self.with_fs(|fs| fs.read(ino, offset, buf)),
+        }
+    }
+
+    /// Reserve the blocks that a write of `len` bytes at `offset` touches,
+    /// in the order requests arrive: a [`SharedFs::write_parallel`]
+    /// overlapping an earlier unfinished one waits for it, so overlapping
+    /// writes reach the disk in this order (and never read-modify-write a
+    /// block at the same time). Every ticket must be passed on to
+    /// `write_parallel`, which releases it, or to `cancel_write`; until
+    /// then later overlapping writes wait.
+    pub fn reserve_write(&self, ino: Ino, offset: u64, len: usize) -> u64 {
+        let bs = self.block_size;
+        let blocks = offset / bs..offset.saturating_add(len as u64).div_ceil(bs);
+        let mut w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        w.last += 1;
+        let ticket = w.last;
+        w.active.push((ticket, ino, blocks));
+        ticket
+    }
+
+    /// Write like [`Fs::write`], with the file system locked only to
+    /// prepare and to finish: the data goes to the device unlocked, so
+    /// concurrent calls keep several writes in flight. `ticket` is from
+    /// [`SharedFs::reserve_write`] for the same range. Writes that move
+    /// more than whole blocks (see `Fs::plan_write`) run under the lock.
+    /// When a write of whole blocks does not fit, it fails with
+    /// [`Error::NoSpace`] and writes nothing (under the lock, as much as
+    /// fits is written, like [`Fs::write`]).
+    pub fn write_parallel(&self, ticket: u64, ino: Ino, offset: u64, data: &[u8]) -> Result<usize> {
+        let _release = Release { fs: self, ticket };
+        self.wait_for_earlier_writes(ticket);
+        let shared = self.shared.data.read().unwrap_or_else(|e| e.into_inner());
+        // when not everything fits, plan_write fails with NoSpace and has
+        // changed nothing: the write as a whole fails
+        let planned = self.with_fs(|fs| Ok(fs.plan_write(ino, offset, data.len())?.map(|p| (p, fs.dev.clone()))))?;
+        let Some((plan, dev)) = planned else {
+            drop(shared);
+            return self.with(|fs| fs.write(ino, offset, data));
+        };
+        // on failure the new blocks stay unwritten: nothing becomes visible
+        write_pieces(&*dev, self.block_size, &plan.pieces, data)?;
+        self.with_fs(|fs| fs.finish_write(ino, offset, data.len(), &plan.unwritten))?;
+        Ok(data.len())
+    }
+
+    /// Release a ticket from [`SharedFs::reserve_write`] without writing.
+    pub fn cancel_write(&self, ticket: u64) {
+        drop(Release { fs: self, ticket });
+    }
+
+    fn wait_for_earlier_writes(&self, ticket: u64) {
+        let mut w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, ino, blocks)) = w.active.iter().find(|r| r.0 == ticket).cloned() else {
+            return;
+        };
+        while w
+            .active
+            .iter()
+            .any(|r| r.0 < ticket && r.1 == ino && r.2.start < blocks.end && blocks.start < r.2.end)
+        {
+            w = self.write_done.wait(w).unwrap_or_else(|e| e.into_inner());
         }
     }
 

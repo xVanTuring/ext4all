@@ -2,10 +2,12 @@
 //! debugfs, and validate them with e2fsck.
 #![allow(dead_code)]
 
-use ext4_core::{FileDevice, Fs, MountOptions};
+use ext4_core::{BlockDevice, FileDevice, Fs, MemDevice, MountOptions, SharedFs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 pub fn sbin() -> PathBuf {
     std::env::var_os("E2FSPROGS_SBIN")
@@ -270,4 +272,102 @@ pub fn sample_tree() -> tempfile::TempDir {
         std::fs::write(p.join(format!("many/file-{i:04}")), format!("{i}")).unwrap();
     }
     d
+}
+
+/// xorshift64: reproducible randomness for concurrency tests.
+pub struct Rng(pub u64);
+
+impl Rng {
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    pub fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// Writes starting with these bytes fail on a [`SlowDevice`].
+pub const FAIL_MARK: &[u8; 8] = b"FAIL-IO!";
+
+/// A memory device whose data transfers (anything larger than a block)
+/// take a while, so work done without the file system lock overlaps the
+/// operations of other threads. Counts how many data writes ran at once,
+/// and fails writes that start with [`FAIL_MARK`].
+pub struct SlowDevice {
+    pub inner: Arc<MemDevice>,
+    pub block: usize,
+    writing: AtomicUsize,
+    pub most_writes_at_once: AtomicUsize,
+    /// How long a data write takes on threads whose name starts with
+    /// "slow", in microseconds (others take 300) ...
+    pub write_micros: AtomicU64,
+    /// ... if it starts with these bytes (when set).
+    pub slow_mark: std::sync::Mutex<Vec<u8>>,
+}
+
+impl SlowDevice {
+    pub fn new(inner: Arc<MemDevice>, block: usize) -> SlowDevice {
+        SlowDevice {
+            inner,
+            block,
+            writing: AtomicUsize::new(0),
+            most_writes_at_once: AtomicUsize::new(0),
+            write_micros: AtomicU64::new(300),
+            slow_mark: Default::default(),
+        }
+    }
+}
+
+impl BlockDevice for SlowDevice {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> ext4_core::Result<()> {
+        if buf.len() > self.block {
+            std::thread::sleep(Duration::from_micros(300));
+        }
+        self.inner.read_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> ext4_core::Result<()> {
+        if buf.starts_with(FAIL_MARK) {
+            return Err(ext4_core::Error::Device(5));
+        }
+        if buf.len() > self.block {
+            let now = self.writing.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_writes_at_once.fetch_max(now, Ordering::SeqCst);
+            let slow = std::thread::current().name().is_some_and(|n| n.starts_with("slow"))
+                && buf.starts_with(&self.slow_mark.lock().unwrap());
+            let micros = if slow {
+                self.write_micros.load(Ordering::Relaxed)
+            } else {
+                300
+            };
+            std::thread::sleep(Duration::from_micros(micros));
+            self.writing.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.inner.write_at(offset, buf)
+    }
+    fn flush(&self) -> ext4_core::Result<()> {
+        self.inner.flush()
+    }
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+}
+
+/// Mount `img` from memory through a [`SlowDevice`] as a [`SharedFs`].
+pub fn shared_mount(img: &Image, block: usize) -> (Arc<MemDevice>, Arc<SlowDevice>, SharedFs) {
+    let mem = Arc::new(MemDevice::from_vec(std::fs::read(&img.path).unwrap()));
+    let dev = Arc::new(SlowDevice::new(mem.clone(), block));
+    let fs = Fs::mount(dev.clone(), MountOptions::default()).unwrap();
+    (mem, dev, SharedFs::new(fs, Duration::from_millis(20)))
+}
+
+/// Unmount, store the memory device back into `img` and run e2fsck.
+pub fn shared_finish(img: &Image, mem: &MemDevice, shared: SharedFs) {
+    shared.unmount().unwrap();
+    drop(shared);
+    std::fs::write(&img.path, mem.snapshot()).unwrap();
+    img.assert_clean();
 }

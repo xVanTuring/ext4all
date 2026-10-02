@@ -662,7 +662,8 @@ pub unsafe extern "C" fn ext4_volume_info(h: *const Ext4Handle, out: *mut Ext4Pr
 pub unsafe extern "C" fn ext4_statfs(h: *const Ext4Handle, out: *mut Ext4StatFs) -> i32 {
     guard(|| {
         // SAFETY: caller contract
-        let s = unsafe { handle(h) }?.with(|fs| Ok(fs.statfs()))?;
+        // frees nothing: runs alongside parallel reads and writes
+        let s = unsafe { handle(h) }?.with_shared(|fs| Ok(fs.statfs()))?;
         // SAFETY: caller contract
         unsafe { put(out, Ext4StatFs::from(&s)) };
         Ok(())
@@ -890,6 +891,64 @@ pub unsafe extern "C" fn ext4_write(
         let data = unsafe { bytes(buf, len) }?;
         // SAFETY: caller contract
         let n = unsafe { handle(h) }?.with(|fs| fs.write(ino, offset, data))?;
+        // SAFETY: caller contract
+        unsafe { put(nwritten, n) };
+        Ok(())
+    })
+}
+
+/// Reserve the blocks a write of `len` bytes at `offset` touches, in the
+/// order requests arrive, for [`ext4_write_parallel`]: overlapping writes
+/// reach the disk in reservation order. Every ticket must be passed on to
+/// `ext4_write_parallel`, which releases it.
+///
+/// # Safety
+/// `h` must be a live handle; `ticket` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_reserve_write(
+    h: *const Ext4Handle,
+    ino: u32,
+    offset: u64,
+    len: usize,
+    ticket: *mut u64,
+) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        let t = unsafe { handle(h) }?.reserve_write(ino, offset, len);
+        // SAFETY: caller contract
+        unsafe { put(ticket, t) };
+        Ok(())
+    })
+}
+
+/// Like [`ext4_write`], but the file system is locked only to prepare and
+/// to finish: concurrent calls from several threads write the device in
+/// parallel. `ticket` is from [`ext4_reserve_write`] for the same range.
+///
+/// # Safety
+/// `h` must be a live handle; `buf` valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_write_parallel(
+    h: *const Ext4Handle,
+    ticket: u64,
+    ino: u32,
+    offset: u64,
+    buf: *const u8,
+    len: usize,
+    nwritten: *mut usize,
+) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        let h = unsafe { handle(h) }?;
+        // SAFETY: caller contract
+        let data = match unsafe { bytes(buf, len) } {
+            Ok(d) => d,
+            Err(e) => {
+                h.cancel_write(ticket);
+                return Err(e);
+            }
+        };
+        let n = h.write_parallel(ticket, ino, offset, data)?;
         // SAFETY: caller contract
         unsafe { put(nwritten, n) };
         Ok(())

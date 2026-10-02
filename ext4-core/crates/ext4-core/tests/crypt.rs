@@ -248,6 +248,54 @@ fn parallel_reads_of_encrypted_volumes() {
 }
 
 #[test]
+fn parallel_writes_to_luks() {
+    let (img, m) = fixture("luks1-xts");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open(&img.path, false).unwrap());
+    let h = Header::read(&*dev).unwrap().expect("LUKS header");
+    let pass = m["passphrases"][0].as_str().unwrap().as_bytes();
+    let key = h.unlock(&*dev, pass).unwrap().unwrap();
+    let crypt = Arc::new(h.open(dev.clone(), &key).unwrap());
+    let shared = SharedFs::new(
+        Fs::mount(crypt, MountOptions::default()).unwrap(),
+        Duration::from_secs(5),
+    );
+    let f = shared
+        .with(|fs| {
+            Ok(fs
+                .create(fs.root(), b"parallel.bin", FileType::Regular, 0o644, 0, 0, 0)?
+                .ino)
+        })
+        .unwrap();
+    // whole blocks from several threads, and a short tail at the end
+    let chunks: Vec<(u64, Vec<u8>)> = (0..8u64)
+        .map(|i| (i * 65536, common::pattern(if i == 7 { 1000 } else { 65536 }, i)))
+        .collect();
+    std::thread::scope(|s| {
+        for (o, d) in &chunks {
+            let shared = &shared;
+            s.spawn(move || {
+                let t = shared.reserve_write(f, *o, d.len());
+                assert_eq!(shared.write_parallel(t, f, *o, d).unwrap(), d.len());
+            });
+        }
+    });
+    let want: Vec<u8> = chunks.iter().flat_map(|(_, d)| d.clone()).collect();
+    let mut back = vec![0u8; want.len() + 100];
+    let n = shared.read_parallel(f, 0, &mut back).unwrap();
+    assert!(back[..n] == want[..], "contents differ");
+    shared.unmount().unwrap();
+    drop(shared);
+    // e2fsck on a decrypted copy
+    let crypt = h.open(dev.clone(), &key).unwrap();
+    let plain = img.dir.path().join("plain.img");
+    let mut buf = vec![0u8; crypt.size() as usize];
+    crypt.read_at(0, &mut buf).unwrap();
+    std::fs::write(&plain, &buf).unwrap();
+    let out = Command::new(tool("e2fsck")).args(["-fn"]).arg(&plain).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
 fn lookups_by_shown_names() {
     let (img, m) = fixture("fscrypt-4k");
     let mut fs = mount(&img, true);

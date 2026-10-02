@@ -22,6 +22,38 @@ pub(crate) struct DataPiece {
     pub len: usize,
 }
 
+/// Where part of a planned write goes: `data` (a range of the caller's
+/// buffer) at device offset `at`, which is block aligned.
+pub(crate) struct WritePiece {
+    pub at: u64,
+    pub data: std::ops::Range<usize>,
+}
+
+/// A write prepared by [`Fs::plan_write`]: the device writes to make, then
+/// the logical block runs to mark written in [`Fs::finish_write`].
+pub(crate) struct WritePlan {
+    pub pieces: Vec<WritePiece>,
+    pub unwritten: Vec<(u32, u32)>,
+}
+
+/// Make the device writes of a plan for `data`. Only the last piece can end
+/// inside a block: the rest of that block is written as zeros.
+pub(crate) fn write_pieces(dev: &dyn BlockDevice, bs: u64, pieces: &[WritePiece], data: &[u8]) -> Result<()> {
+    for p in pieces {
+        let chunk = &data[p.data.clone()];
+        let whole = chunk.len() / bs as usize * bs as usize;
+        if whole > 0 {
+            dev.write_at(p.at, &chunk[..whole])?;
+        }
+        if whole < chunk.len() {
+            let mut tail = vec![0u8; bs as usize];
+            tail[..chunk.len() - whole].copy_from_slice(&chunk[whole..]);
+            dev.write_at(p.at + whole as u64, &tail)?;
+        }
+    }
+    Ok(())
+}
+
 /// Fill `buf` from `pieces`, which together are exactly `buf.len()` bytes.
 pub(crate) fn read_pieces(dev: &dyn BlockDevice, pieces: &[DataPiece], buf: &mut [u8]) -> Result<()> {
     let mut done = 0;
@@ -204,6 +236,155 @@ impl Fs {
         }
         let len = (size - offset).min(len as u64) as usize;
         Ok(Some((len, self.data_pieces(ino, &inode, offset, len)?)))
+    }
+
+    /// Prepare a write of `len` bytes at `offset` that moves its data
+    /// without the file system: blocks are found or allocated (new ones
+    /// *unwritten*, so they read as zeros until [`Fs::finish_write`], also
+    /// after a crash), and the plan says where the data goes. `None` when
+    /// the write must go through [`Fs::write`]: it starts inside a block,
+    /// ends inside a block that holds data after it, extends the file from
+    /// a partial last block, or the file is inline, encrypted, block
+    /// mapped or append-only, or blocks are smaller than device sectors.
+    ///
+    /// The caller must keep every other write touching these blocks, and
+    /// anything that frees blocks, away until `finish_write`.
+    pub(crate) fn plan_write(&mut self, ino: Ino, offset: u64, len: usize) -> Result<Option<WritePlan>> {
+        self.op(|fs| fs.plan_write_impl(ino, offset, len))
+    }
+
+    fn plan_write_impl(&mut self, ino: Ino, offset: u64, len: usize) -> Result<Option<WritePlan>> {
+        self.require_rw()?;
+        let mut inode = self.read_live_inode(ino)?;
+        if inode.is_dir() {
+            return Err(Error::IsDir);
+        }
+        if !inode.is_reg() {
+            return Err(Error::invalid("write to non-regular file"));
+        }
+        if inode.has_flag(flags::IMMUTABLE) {
+            return Err(Error::NotPermitted);
+        }
+        let bs = self.bs as u64;
+        let size = inode.size();
+        let end = offset.checked_add(len as u64).ok_or(Error::TooBig)?;
+        if len == 0
+            || offset % bs != 0
+            || end % bs != 0 && end < size
+            || offset > size && size % bs != 0
+            || [flags::APPEND, flags::ENCRYPT, flags::INLINE_DATA]
+                .iter()
+                .any(|&f| inode.has_flag(f))
+            || !inode.has_flag(flags::EXTENTS)
+            || self.dev.sector_size() as u64 > bs
+        {
+            return Ok(None);
+        }
+        if end > self.max_file_size(&inode) {
+            return Err(Error::TooBig);
+        }
+        self.ensure_space(len as u64 / bs + 8)?;
+        let mut plan = WritePlan {
+            pieces: Vec::new(),
+            unwritten: Vec::new(),
+        };
+        let push = |plan: &mut WritePlan, at: u64, n: usize, unwritten: Option<(u32, u32)>| {
+            let start = plan.pieces.last().map_or(0, |p| p.data.end);
+            match plan.pieces.last_mut() {
+                Some(p) if p.at + (p.data.len() as u64) == at => p.data.end += n,
+                _ => plan.pieces.push(WritePiece {
+                    at,
+                    data: start..start + n,
+                }),
+            }
+            if let Some(u) = unwritten {
+                plan.unwritten.push(u);
+            }
+        };
+        let mut allocated = false;
+        let mut lblk = offset / bs;
+        let last = end.div_ceil(bs);
+        while lblk < last {
+            let pos = lblk * bs;
+            match self.map_block(ino, &inode, lblk)? {
+                Mapping::Mapped {
+                    pblk,
+                    len: run,
+                    unwritten,
+                } => {
+                    let n = run.min(last - lblk);
+                    if pblk + n > self.sb.blocks_count() {
+                        return Err(Error::corrupt(format!("inode {ino}: block {pblk} beyond device")));
+                    }
+                    let bytes = (n * bs).min(end - pos) as usize;
+                    push(
+                        &mut plan,
+                        pblk * bs,
+                        bytes,
+                        unwritten.then_some((lblk as u32, n as u32)),
+                    );
+                    lblk += n;
+                }
+                Mapping::Hole { len: hole } => {
+                    let want = hole.min(last - lblk).min(MAX_INIT_LEN as u64) as u32;
+                    let goal = self.ext_goal(ino, &inode, lblk as u32)?;
+                    let (start, got) = self.alloc_blocks(goal, want)?;
+                    if let Err(e) = self.ext_insert(
+                        ino,
+                        &mut inode,
+                        Extent {
+                            block: lblk as u32,
+                            len: got,
+                            start,
+                            unwritten: true,
+                        },
+                    ) {
+                        self.free_blocks(start, got as u64)?;
+                        return Err(e);
+                    }
+                    let per = bs as i64 / 512;
+                    let cur = inode.sectors(self.bs, self.huge_file()) as i64;
+                    inode.set_sectors((cur + got as i64 * per) as u64);
+                    allocated = true;
+                    let n = got as u64;
+                    let bytes = (n * bs).min(end - pos) as usize;
+                    push(&mut plan, start * bs, bytes, Some((lblk as u32, got)));
+                    lblk += n;
+                }
+            }
+        }
+        if allocated {
+            self.write_inode(ino, &inode)?;
+            self.maybe_commit()?;
+        }
+        Ok(Some(plan))
+    }
+
+    /// The data of a [`Fs::plan_write`] is on the device: mark its new and
+    /// preallocated blocks written, grow the file to `offset + len` and
+    /// update the times, as [`Fs::write`] would.
+    pub(crate) fn finish_write(&mut self, ino: Ino, offset: u64, len: usize, unwritten: &[(u32, u32)]) -> Result<()> {
+        self.op(|fs| {
+            let mut inode = fs.read_live_inode(ino)?;
+            for &(first, n) in unwritten {
+                fs.ext_mark_written(ino, &mut inode, first, n)?;
+            }
+            let end = offset + len as u64;
+            if end > inode.size() {
+                inode.set_size(end);
+            }
+            let now = Timestamp::now();
+            inode.set_mtime(now);
+            inode.set_ctime(now);
+            // writing clears setuid/setgid like Linux file_remove_privs
+            let mode = inode.mode();
+            if mode & 0o6000 != 0 {
+                let clear = if mode & 0o010 != 0 { 0o6000 } else { 0o4000 };
+                inode.set_mode(mode & !clear);
+            }
+            fs.write_inode(ino, &inode)?;
+            fs.maybe_commit()
+        })
     }
 
     /// Key for the contents of a regular file (`None`: not encrypted;

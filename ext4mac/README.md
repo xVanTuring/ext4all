@@ -94,27 +94,41 @@ mount -F -t ext4 -o nokoio disk4s1 /tmp/ext4
 
 Directories, symbolic links, inline data files and the block-mapped files of ext2/ext3 always use the read/write path; a file never switches paths until the system reclaims it.
 
-### Optional: parallel reads
+### Optional: parallel reads and writes
 
-By default the extension handles read requests one at a time under the volume lock, so the drive only ever has one request to work on. With parallel reads, read requests run on background threads: the lock is held only while the blocks are looked up, the device reads run outside it, and the requests FSKit sends together reach the drive together. Operations that free blocks (truncation, deletion and the like) wait until the reads in progress have finished, so a read never returns blocks that were freed and given to another file meanwhile. Inline data files and fscrypt-encrypted files are still read under the lock; LUKS volumes work as usual, decrypting on the background threads. Writes are not affected.
+By default the extension handles read and write requests one at a time under the volume lock, so the drive only ever has one request to work on. With parallel reads and writes, the requests FSKit sends together reach the drive together:
+
+- **Reads** (`ParallelReads`): the lock is held only while the blocks are looked up; the device reads run outside it.
+- **Writes** (`ParallelWrites`): each request first reserves the blocks it will write, in the order requests arrive. Under the lock, the blocks are then found or allocated, new ones marked *unwritten* (they read as zeros until the write is done, also after a power loss); the data goes to the device outside the lock; back under the lock, the blocks are marked written and the size and times updated. A write that overlaps an earlier one still in progress waits for it, so overlapping writes still reach the disk in arrival order. Only writes that start on a block boundary and end on one (or at or past the end of file) take this path; other writes, and inline data, fscrypt-encrypted, ext2/ext3 block-mapped, append-only and kernel offloaded I/O files, are still written under the lock.
+
+Operations that free blocks (truncation, deletion and the like) wait until the reads and writes in progress have finished, so no transfer ever touches blocks that were freed and given to another file meanwhile. LUKS volumes work as usual, encrypting and decrypting on the background threads. When space runs out, a block-aligned write fails with "No space left on device" and writes nothing.
 
 Measured on the Union Memory 512 GB NVMe in an RTL9210 USB 10 Gbps enclosure (MB/s, 4 GB file):
 
-| Read pattern | Default | Parallel reads | Kernel offloaded I/O |
+| Write pattern | Default | Parallel reads and writes | Kernel offloaded I/O |
 |---|---|---|---|
-| Uncached, 5400 KB per call (how Blackmagic Disk Speed Test reads) | 542 | 641 | 808 |
+| Uncached, 1 MB per call | 424 | 997 | 938 |
+| Uncached, 5400 KB per call (how Blackmagic Disk Speed Test writes) | 437 | 993 | 932 |
+| Uncached, 8 MB per call | 435 | 998 | 835 |
+| Cached writes, then fsync | 420 | 996 | 870 |
+
+| Read pattern | Default | Parallel reads and writes | Kernel offloaded I/O |
+|---|---|---|---|
+| Uncached, 5400 KB per call | 542 | 641 | 808 |
 | Uncached, 8 MB per call | 535 | 704 | 806 |
 | Cached sequential read (cold cache) | 662 | 928 | 906 |
 
-Uncached reads of 1 MB at a time stay at 450–470 MB/s with all three: the latency of a single request on the drive is the limit.
+Uncached reads of 1 MB at a time stay at 450–470 MB/s with all three: the latency of a single request on the drive is the limit. Writes are not limited this way: the kernel part of FSKit takes the data into its own buffers and returns, and hands up to 8 write requests to the extension at once.
 
-It is off by default until it has seen some daily use:
+Both are off by default until they have seen some daily use:
 
 ```bash
 # Turn on (applies to volumes mounted afterwards; can be combined with kernel offloaded I/O)
 defaults write ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs ParallelReads -bool YES
+defaults write ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs ParallelWrites -bool YES
 # Turn off
 defaults delete ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs ParallelReads
+defaults delete ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs ParallelWrites
 ```
 
 ### Diagnostics
@@ -206,8 +220,8 @@ Distributing builds to others needs Developer ID signing and notarization.
 | End to end | With the extension installed and enabled, real mounts of images for cp / rsync / xattrs (no `._` files after cp and ditto) / links / deletion, then e2fsck | `scripts/e2e-mount-test.sh` |
 | Formatting | Geometry and journal location compared with mke2fs; many sizes (including garbage-filled devices, an existing ext4 and a 64 GiB sparse image) pass e2fsck after formatting, mount and take writes in many groups; option parsing | `cargo test -p ext4-core --test mkfs` |
 | Random operations (real volume) | On a mounted volume: random overwrites, uncached writes, appends, truncation, extension, preallocation, memory-mapped writes, renames over other files, deletion; every round compared byte by byte with an in-memory model, remount every 3 rounds; run with and without kernel offloaded I/O | `python3 scripts/fsstress.py /Volumes/X/stress 1 15 diskNsM` |
-| Parallel reads | Several threads read in parallel while another truncates, deletes and recreates, punches holes in and rewrites the same files; every 8 bytes of a file hold its inode number, so reading another file's or metadata contents fails the test (it always fails without the read-write lock); also compared byte by byte with locked reads, covering inline data, ext3, fscrypt (with and without keys) and LUKS | `cargo test -p ext4-core --test parallel_read --test crypt` |
-| Parallel reads (real volume) | With parallel reads on, several threads read a mounted volume uncached while another truncates, deletes and recreates, and rewrites; checked as above, then e2fsck | `python3 scripts/read-race.py /Volumes/X/race 60` |
+| Parallel reads and writes | Several threads read and write in parallel while another truncates, deletes and recreates, punches holes in and rewrites the same files (on a nearly full disk, so freed blocks are soon handed out again); every 8 bytes of a file hold its inode number, so reading or leaving behind another file's or metadata contents fails the test. Parallel reads compared byte by byte with locked reads, covering inline data, ext3, fscrypt (with and without keys) and LUKS; parallel writes compared byte by byte with an in-memory model (4K and 1K blocks, inline data, ext3, preallocated blocks, unaligned, extending and sparse writes), and written to a LUKS volume, read back and checked with e2fsck once decrypted; overlapping writes land in reservation order; a failed device write and a power loss after it expose no old data; a write that does not fit changes nothing. Without the read-write lock, without the ordering wait, or with new blocks not marked unwritten, the matching test fails | `cargo test -p ext4-core --test parallel_read --test parallel_write --test crypt` |
+| Parallel reads and writes (real volume) | With both on, several threads read a mounted volume uncached while several others write, truncate, delete and recreate; checked as above, then every file once more and e2fsck; also run on a nearly full volume | `python3 scripts/io-race.py /Volumes/X/race 60 6 4` |
 
 Helpers:
 

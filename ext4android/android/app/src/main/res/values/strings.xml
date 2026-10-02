@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">ext4android</string>
+    <string name="native_library">Native library: %1$s</string>
+    <string name="run_self_test">Run self test</string>
+    <string name="running">Running…</string>
+    <string name="self_test_result">Self test: %1$s</string>
+    <string name="refresh">Refresh</string>
+
+    <string name="usb_title">USB disks (experiment)</string>
+    <string name="usb_none">No USB mass storage device found</string>
+    <string name="usb_ids" translatable="false">VID %1$s · PID %2$s · %3$s</string>
+    <string name="usb_probe">Probe (read-only)</string>
+    <string name="usb_probing">Probing…</string>
+    <string name="usb_permission_denied">USB permission was not granted</string>
+    <string name="usb_open_failed">Could not open the device</string>
+    <string name="usb_claim_failed">claimInterface failed: the interface could not be taken from the system</string>
+    <string name="usb_claimed">claimInterface succeeded</string>
+    <string name="usb_set_interface_failed">setInterface failed (alternate setting 0)</string>
+</resources>

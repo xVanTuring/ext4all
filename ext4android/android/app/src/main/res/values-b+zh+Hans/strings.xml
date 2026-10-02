@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="native_library">原生库：%1$s</string>
+    <string name="run_self_test">运行自检</string>
+    <string name="running">正在运行…</string>
+    <string name="self_test_result">自检结果：%1$s</string>
+    <string name="refresh">刷新</string>
+
+    <string name="usb_title">USB 磁盘（实验）</string>
+    <string name="usb_none">没有找到 USB 大容量存储设备</string>
+    <string name="usb_probe">检测（只读）</string>
+    <string name="usb_probing">正在检测…</string>
+    <string name="usb_permission_denied">没有获得 USB 权限</string>
+    <string name="usb_open_failed">无法打开设备</string>
+    <string name="usb_claim_failed">claimInterface 失败：无法从系统取得接口</string>
+    <string name="usb_claimed">claimInterface 成功</string>
+    <string name="usb_set_interface_failed">setInterface 失败（备用设置 0）</string>
+</resources>

@@ -1,0 +1,25 @@
+[package]
+name = "ext4-jni"
+description = "JNI bindings of ext4-core for the Android app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# libext4android.so, loaded by tech.xvanturing.ext4android.jni.Native
+name = "ext4android"
+crate-type = ["cdylib"]
+
+[dependencies]
+ext4-core.workspace = true
+jni.workspace = true
+log.workspace = true
+part.workspace = true
+usb-msc.workspace = true
+
+[dev-dependencies]
+usb-msc = { workspace = true, features = ["sim"] }
+
+[lints]
+workspace = true

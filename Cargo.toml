@@ -4,8 +4,12 @@ members = [
     # platform-neutral
     "ext4-core/crates/ext4-core",
     "ext4-core/crates/ext4-tool",
+    "ext4-core/crates/part",
     # macOS (FSKit)
     "ext4mac/crates/ext4-ffi",
+    # Android
+    "ext4android/crates/ext4-jni",
+    "ext4android/crates/usb-msc",
 ]
 
 [workspace.package]
@@ -24,12 +28,18 @@ identity_op = "allow"
 
 [workspace.dependencies]
 ext4-core = { path = "ext4-core/crates/ext4-core" }
+part = { path = "ext4-core/crates/part" }
+usb-msc = { path = "ext4android/crates/usb-msc" }
+jni = "0.22.4"
+libc = "0.2.189"
+log = "0.4.34"
+thiserror = "2.0.21"
 
 [profile.release]
 debug = 1
 lto = "thin"
-# unwind (not abort): the FFI layer turns panics into EIO instead of
-# killing the file system extension
+# unwind (not abort): the FFI and JNI layers turn panics into errors
+# instead of killing the file system extension or the app
 panic = "unwind"
 
 [profile.dev]

@@ -1,0 +1,21 @@
+[package]
+name = "usb-msc"
+description = "USB mass storage devices (Bulk-Only Transport, SCSI) over Linux usbdevfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# the simulated disk of `mock`, for tests of dependent crates
+sim = []
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -124,6 +124,17 @@ impl NameView {
     }
 }
 
+/// The key a `fscrypt` tool policy names (hex v1 descriptor or v2
+/// identifier).
+fn policy_spec(hex: &str) -> Option<fscrypt::KeySpec> {
+    let b = crate::crypto::from_hex(hex)?;
+    match b.len() {
+        8 => Some(fscrypt::KeySpec::V1(b.try_into().ok()?)),
+        16 => Some(fscrypt::KeySpec::V2(b.try_into().ok()?)),
+        _ => None,
+    }
+}
+
 /// The (hash, minor hash) stored after the name of an entry in an
 /// encrypted, casefolded directory.
 pub(crate) fn entry_hash(block: &[u8], d: &DirEntry) -> Option<(u32, u32)> {
@@ -166,8 +177,9 @@ impl Fs {
     /// Unlock with the protectors the Linux `fscrypt` tool keeps in
     /// `/.fscrypt` on this volume: `secret` is a passphrase, or the 32-byte
     /// key of a raw-key protector. Adds every policy key it opens and
-    /// returns their identifiers (empty: nothing matched).
-    pub fn unlock_with_protector(&mut self, secret: &[u8]) -> Result<Vec<KeyIds>> {
+    /// returns them (empty: nothing matched). Protectors whose policies
+    /// are all unlocked already are not tried.
+    pub fn unlock_with_protector(&mut self, secret: &[u8]) -> Result<Vec<fscrypt::UnlockedKey>> {
         use fscrypt::protector as pr;
         let protectors: Vec<pr::Protector> = self
             .fscrypt_metadata("protectors")?
@@ -193,12 +205,22 @@ impl Fs {
             .collect();
         let mut added = Vec::new();
         for p in &protectors {
+            // the key derivation is slow: skip protectors whose policies
+            // are all unlocked already (or that protect no policy)
+            let pending = policies.iter().any(|pol| {
+                pol.wrapped.iter().any(|(d, _)| d == &p.descriptor)
+                    && policy_spec(&pol.key_descriptor).is_none_or(|s| self.keys.get(&s).is_none())
+            });
+            if !pending {
+                continue;
+            }
             let Some(pk) = pr::protector_key(p, secret)? else {
                 continue;
             };
             log::info!("fscrypt protector {} ({}) unlocked", p.descriptor, p.name);
             for key in pr::policy_keys(p, &pk, &policies)? {
-                added.push(self.add_encryption_key(&key)?);
+                let ids = self.add_encryption_key(&key)?;
+                added.push(fscrypt::UnlockedKey { ids, key });
             }
         }
         Ok(added)

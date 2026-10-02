@@ -247,6 +247,13 @@ pub struct KeyIds {
     pub identifier: [u8; 16],
 }
 
+/// A master key opened by a protector, so the caller can remember it.
+#[derive(Debug)]
+pub struct UnlockedKey {
+    pub ids: KeyIds,
+    pub key: Secret,
+}
+
 /// Master keys available to a mounted file system.
 #[derive(Default)]
 pub struct Keyring {

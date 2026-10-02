@@ -111,10 +111,11 @@ extension FSItem.ItemType {
 extension Ext4Attr {
     /// The file's data can be mapped for kernel offloaded I/O: a regular
     /// extent-mapped file without inline data (block-mapped ext2/ext3 files
-    /// cannot hold unwritten blocks; inline data has no device location).
+    /// cannot hold unwritten blocks; inline data has no device location)
+    /// that is not fscrypt-encrypted (the kernel would move ciphertext).
     var supportsKernelIO: Bool {
         file_type == UInt8(EXT4_FT_REG) && flags & UInt32(EXT4_FL_EXTENTS) != 0
-            && flags & UInt32(EXT4_FL_INLINE_DATA) == 0
+            && flags & UInt32(EXT4_FL_INLINE_DATA) == 0 && flags & UInt32(EXT4_FL_ENCRYPT) == 0
     }
 }
 

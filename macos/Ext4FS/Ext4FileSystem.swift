@@ -25,6 +25,8 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     /// Why the device could not be loaded as ext4 (a placeholder volume
     /// was handed out instead).
     let loadFailure = Locked<(any Error)?>(nil)
+    /// Keys for LUKS volumes and fscrypt directories.
+    let unlocker = Unlocker(store: KeychainStore.shared)
 
     override init() {
         _ = Log.installEngineLogger
@@ -39,8 +41,19 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
             reply(.notRecognized, nil)
             return
         }
+        let io = ResourceBlockIO(device, readOnly: true)
         do {
-            let info = try Ext4Mount.probe(ResourceBlockIO(device, readOnly: true))
+            if let luks = try Ext4Mount.luksProbe(io) {
+                reply(probeLuks(luks, io: io, bsdName: device.bsdName), nil)
+                return
+            }
+        } catch {
+            Log.fs.info(
+                "probe \(device.bsdName, privacy: .public): damaged LUKS header (\(error.localizedDescription, privacy: .public))"
+            )
+        }
+        do {
+            let info = try Ext4Mount.probe(io)
             let container = FSContainerIdentifier(uuid: info.uuid)
             Log.fs.info(
                 "probe \(device.bsdName, privacy: .public): ext4 \"\(info.label, privacy: .public)\" support=\(String(describing: info.support), privacy: .public)"
@@ -58,6 +71,50 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
         }
     }
 
+    /// A LUKS volume is usable when its key is remembered (named after the
+    /// ext4 inside) or when the user's secrets may open it (loading tries
+    /// them); otherwise it is only recognized and not mounted.
+    func probeLuks(_ luks: Ext4LuksVolume, io: BlockIO, bsdName: String) -> FSProbeResult {
+        let container = FSContainerIdentifier(uuid: UUID(uuidString: luks.uuid) ?? UUID())
+        let name = luks.label.isEmpty ? "LUKS" : luks.label
+        let result: FSProbeResult
+        if !luks.supported {
+            result = .recognized(name: name, containerID: container)
+        } else if let key = unlocker.rememberedLuksKey(io: io, volume: luks),
+            let inner = try? Ext4Mount.luksProbeInner(io, key: key), inner.support != .unsupported
+        {
+            result = .usable(name: inner.label.isEmpty ? name : inner.label, containerID: container)
+        } else if unlocker.mayUnlock(luks) {
+            result = .usable(name: name, containerID: container)
+        } else {
+            result = .recognized(name: name, containerID: container)
+        }
+        Log.fs.info(
+            "probe \(bsdName, privacy: .public): LUKS\(luks.version) \(luks.uuid, privacy: .public) \(String(describing: result), privacy: .public)"
+        )
+        return result
+    }
+
+    /// Mount the device: ext4 directly, or the ext4 inside a LUKS volume
+    /// (whose key must be remembered or come from the user's secrets).
+    /// Returns the mount and whether it is a LUKS volume.
+    func mountDevice(_ io: BlockIO, readOnly: Bool, bsdName: String) throws -> (Ext4Mount, Bool) {
+        guard let luks = try Ext4Mount.luksProbe(io) else {
+            return (try Ext4Mount(io, readOnly: readOnly), false)
+        }
+        guard luks.supported else {
+            Log.fs.error("\(bsdName, privacy: .public): LUKS volume with an unsupported cipher")
+            throw POSIXError(.ENOTSUP)
+        }
+        guard let key = try unlocker.luksKey(io: io, volume: luks) else {
+            Log.fs.error(
+                "\(bsdName, privacy: .public): LUKS volume \(luks.uuid, privacy: .public) is locked; add its passphrase in Ext4Kit"
+            )
+            throw POSIXError(.EACCES)
+        }
+        return (try Ext4Mount(luks: io, key: key, readOnly: readOnly), true)
+    }
+
     func loadResource(
         resource: FSResource, options: FSTaskOptions,
         replyHandler reply: @escaping @Sendable (FSVolume?, (any Error)?) -> Void
@@ -73,11 +130,15 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
         let readOnly = Ext4FileSystem.wantsReadOnly(options)
         do {
             let io = ResourceBlockIO(device, readOnly: readOnly)
-            let mount = try Ext4Mount(io, readOnly: readOnly)
+            let (mount, isLuks) = try mountDevice(io, readOnly: readOnly, bsdName: device.bsdName)
             let info = try mount.volumeInfo()
+            // keys go in before FSKit sees any name
+            if info.encrypt {
+                unlocker.unlockFscrypt(mount, info: info)
+            }
             // opt-in; read-only mounts benefit as well (reads bypass the
-            // extension)
-            let kernelIO = UserDefaults.standard.bool(forKey: Ext4FileSystem.kernelIODefaultsKey)
+            // extension). Never for LUKS: the kernel would read ciphertext.
+            let kernelIO = !isLuks && UserDefaults.standard.bool(forKey: Ext4FileSystem.kernelIODefaultsKey)
             let volume: Ext4Volume =
                 kernelIO
                 ? Ext4KernelIOVolume(mount: mount, info: info, resource: device)

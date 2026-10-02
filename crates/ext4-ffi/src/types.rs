@@ -34,6 +34,53 @@ pub const EXT4_FT_LNK: u8 = 7;
 /// file's data can be mapped for kernel offloaded I/O.
 pub const EXT4_FL_EXTENTS: u32 = 0x0008_0000;
 pub const EXT4_FL_INLINE_DATA: u32 = 0x1000_0000;
+/// fscrypt-encrypted: its data must pass through the engine to be
+/// decrypted, never through kernel offloaded I/O.
+pub const EXT4_FL_ENCRYPT: u32 = 0x0000_0800;
+
+/// The identifiers an added fscrypt key answers to.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ext4KeyIds {
+    /// v1 policy descriptor (as the Linux tools compute it).
+    pub descriptor: [u8; 8],
+    /// v2 policy key identifier.
+    pub identifier: [u8; 16],
+}
+
+/// Largest LUKS volume key (bytes).
+pub const EXT4_LUKS_MAX_KEY: usize = 64;
+
+/// Summary of a LUKS header.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Ext4LuksInfo {
+    /// 1 or 2.
+    pub version: u16,
+    /// NUL-terminated UUID string as stored in the header.
+    pub uuid: [u8; 41],
+    /// NUL-terminated LUKS2 label (empty for LUKS1).
+    pub label: [u8; 49],
+    /// Whether the data cipher is supported.
+    pub supported: bool,
+    /// Volume key size in bytes.
+    pub key_size: u32,
+    /// Usable key slots.
+    pub keyslots: u32,
+}
+
+impl Default for Ext4LuksInfo {
+    fn default() -> Self {
+        Ext4LuksInfo {
+            version: 0,
+            uuid: [0; 41],
+            label: [0; 49],
+            supported: false,
+            key_size: 0,
+            keyslots: 0,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -242,6 +289,8 @@ pub struct Ext4ProbeInfo {
     pub has_journal: bool,
     /// 0 = ext2, 1 = ext3, 2 = ext4 (by feature set).
     pub subtype: u8,
+    /// The `encrypt` feature: directories may be fscrypt-encrypted.
+    pub encrypt: bool,
 }
 
 impl Default for Ext4ProbeInfo {
@@ -255,6 +304,7 @@ impl Default for Ext4ProbeInfo {
             needs_recovery: false,
             has_journal: false,
             subtype: 2,
+            encrypt: false,
         }
     }
 }

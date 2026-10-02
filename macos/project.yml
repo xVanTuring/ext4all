@@ -35,6 +35,9 @@ targets:
     platform: macOS
     sources:
       - path: App
+      # the app manages the keychain entries the extension unlocks with
+      - path: Shared/KeyStore.swift
+        group: Shared
     settings:
       base:
         PRODUCT_NAME: Ext4Kit

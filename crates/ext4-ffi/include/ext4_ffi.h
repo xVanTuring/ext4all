@@ -8,6 +8,11 @@
 #include <stddef.h>
 
 /**
+ * Size of the master keys the Linux `fscrypt` tool creates.
+ */
+#define EXT4_FSCRYPT_KEY_SIZE 64
+
+/**
  * File types (same values as ext4 directory entry types).
  */
 #define EXT4_FT_UNKNOWN 0
@@ -33,6 +38,17 @@
 #define EXT4_FL_EXTENTS 524288
 
 #define EXT4_FL_INLINE_DATA 268435456
+
+/**
+ * fscrypt-encrypted: its data must pass through the engine to be
+ * decrypted, never through kernel offloaded I/O.
+ */
+#define EXT4_FL_ENCRYPT 2048
+
+/**
+ * Largest LUKS volume key (bytes).
+ */
+#define EXT4_LUKS_MAX_KEY 64
 
 #define UF_NODUMP 1
 
@@ -140,6 +156,10 @@ typedef struct Ext4ProbeInfo {
    * 0 = ext2, 1 = ext3, 2 = ext4 (by feature set).
    */
   uint8_t subtype;
+  /**
+   * The `encrypt` feature: directories may be fscrypt-encrypted.
+   */
+  bool encrypt;
 } Ext4ProbeInfo;
 
 /**
@@ -174,6 +194,50 @@ typedef struct Ext4MountOptions {
    */
   bool defer_unlinked;
 } Ext4MountOptions;
+
+/**
+ * Summary of a LUKS header.
+ */
+typedef struct Ext4LuksInfo {
+  /**
+   * 1 or 2.
+   */
+  uint16_t version;
+  /**
+   * NUL-terminated UUID string as stored in the header.
+   */
+  uint8_t uuid[41];
+  /**
+   * NUL-terminated LUKS2 label (empty for LUKS1).
+   */
+  uint8_t label[49];
+  /**
+   * Whether the data cipher is supported.
+   */
+  bool supported;
+  /**
+   * Volume key size in bytes.
+   */
+  uint32_t key_size;
+  /**
+   * Usable key slots.
+   */
+  uint32_t keyslots;
+} Ext4LuksInfo;
+
+/**
+ * The identifiers an added fscrypt key answers to.
+ */
+typedef struct Ext4KeyIds {
+  /**
+   * v1 policy descriptor (as the Linux tools compute it).
+   */
+  uint8_t descriptor[8];
+  /**
+   * v2 policy key identifier.
+   */
+  uint8_t identifier[16];
+} Ext4KeyIds;
 
 typedef struct Ext4StatFs {
   uint32_t block_size;
@@ -318,6 +382,97 @@ int32_t ext4_format(const struct Ext4DeviceOps *ops,
 int32_t ext4_mount(const struct Ext4DeviceOps *ops,
                    const struct Ext4MountOptions *opts,
                    struct Ext4Handle **out);
+
+/**
+ * Check whether a device holds a LUKS volume. Returns 0 and fills `out`
+ * if it does, `ENOENT` if it does not, another errno for a damaged
+ * header.
+ *
+ * # Safety
+ * `ops` must be valid; `out` valid for writes.
+ */
+int32_t ext4_luks_probe(const struct Ext4DeviceOps *ops, struct Ext4LuksInfo *out);
+
+/**
+ * Recover a LUKS volume key from a passphrase. This runs the key slots'
+ * key derivation (seconds and up to gigabytes of memory with Argon2).
+ * Returns 0 and the key in `key[..*key_len]` (`key` holds
+ * [`EXT4_LUKS_MAX_KEY`] bytes), `EACCES` if no key slot opens.
+ *
+ * # Safety
+ * `ops` must be valid; `pass` valid for `pass_len` bytes; `key` valid for
+ * [`EXT4_LUKS_MAX_KEY`] bytes; `key_len` valid for writes.
+ */
+int32_t ext4_luks_unlock(const struct Ext4DeviceOps *ops,
+                         const uint8_t *pass,
+                         size_t pass_len,
+                         uint8_t *key,
+                         size_t *key_len);
+
+/**
+ * Whether `key` is the volume key of the LUKS device: 0 if it is,
+ * `EACCES` if not.
+ *
+ * # Safety
+ * `ops` must be valid; `key` valid for `key_len` bytes.
+ */
+int32_t ext4_luks_check_key(const struct Ext4DeviceOps *ops, const uint8_t *key, size_t key_len);
+
+/**
+ * [`ext4_probe`] of the ext2/3/4 file system inside a LUKS volume.
+ *
+ * # Safety
+ * `ops` must be valid; `key` valid for `key_len` bytes; `out` valid for
+ * writes.
+ */
+int32_t ext4_luks_probe_inner(const struct Ext4DeviceOps *ops,
+                              const uint8_t *key,
+                              size_t key_len,
+                              struct Ext4ProbeInfo *out);
+
+/**
+ * [`ext4_mount`] of the file system inside a LUKS volume, given its
+ * volume key. The device's `release` callback runs as for `ext4_mount`.
+ *
+ * # Safety
+ * As [`ext4_mount`]; `key` valid for `key_len` bytes.
+ */
+int32_t ext4_mount_luks(const struct Ext4DeviceOps *ops,
+                        const uint8_t *key,
+                        size_t key_len,
+                        const struct Ext4MountOptions *opts,
+                        struct Ext4Handle **out);
+
+/**
+ * Add an fscrypt master key (16 to 64 bytes) to a mounted volume.
+ *
+ * # Safety
+ * `h` must be a live handle; `key` valid for `len` bytes; `out` valid for
+ * writes or null.
+ */
+int32_t ext4_add_key(const struct Ext4Handle *h,
+                     const uint8_t *key,
+                     size_t len,
+                     struct Ext4KeyIds *out);
+
+/**
+ * Unlock with the protectors of the Linux `fscrypt` tool on the volume:
+ * `secret` is a passphrase or a 32-byte raw protector key. The master
+ * keys it opens are added to the volume; `*added` receives how many (0:
+ * nothing matched), and the first `cap` of them are copied to `keys`
+ * ([`EXT4_FSCRYPT_KEY_SIZE`] bytes each) so they can be remembered.
+ *
+ * # Safety
+ * `h` must be a live handle; `secret` valid for `len` bytes; `keys` valid
+ * for `cap * EXT4_FSCRYPT_KEY_SIZE` bytes (or null with `cap` 0); `added`
+ * valid for writes or null.
+ */
+int32_t ext4_unlock_protector(const struct Ext4Handle *h,
+                              const uint8_t *secret,
+                              size_t len,
+                              uint8_t *keys,
+                              size_t cap,
+                              uint32_t *added);
 
 /**
  * Commit and mark the file system clean, keeping the volume open

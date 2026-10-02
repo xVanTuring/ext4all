@@ -46,6 +46,7 @@ struct ContentView: View {
                         command("hdiutil attach -nomount linux.img")
                     }
                 }
+                EncryptionView()
                 notes
             }
             .padding(28)
@@ -77,7 +78,11 @@ struct ContentView: View {
                     systemImage: "checkmark.shield")
                 Label(L("Always eject the disk before unplugging it."), systemImage: "eject")
                 Label(
-                    L("Encrypted, compressed or casefolded ext4 volumes are mounted read-only."), systemImage: "lock")
+                    L(
+                        "Encrypted folders stay locked until their key or passphrase is added under Encrypted disks; they can still be deleted."
+                    ),
+                    systemImage: "lock")
+                Label(L("Casefolded or compressed ext4 volumes are mounted read-only."), systemImage: "textformat")
             }
             .font(.callout)
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -833,3 +833,131 @@ fn commit_is_durable_and_request_commit_wakes_the_thread() {
     unsafe { ext4_close(h) };
     fsck_clean(&p);
 }
+
+/// Unpack one of ext4-core's encrypted fixture images.
+fn crypt_fixture(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let gz = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ext4-core/tests/fixtures/crypt")
+        .join(format!("{name}.img.gz"));
+    let out = Command::new("gzip").arg("-dc").arg(&gz).output().unwrap();
+    assert!(out.status.success());
+    let p = dir.join(format!("{name}.img"));
+    std::fs::write(&p, out.stdout).unwrap();
+    p
+}
+
+fn c_str(b: &[u8]) -> &str {
+    std::str::from_utf8(&b[..b.iter().position(|&c| c == 0).unwrap()]).unwrap()
+}
+
+#[test]
+fn luks_through_c_abi() {
+    let d = tempfile::tempdir().unwrap();
+    let p = crypt_fixture(d.path(), "luks2-pbkdf2-4k");
+    let releases = Arc::new(AtomicUsize::new(0));
+    let o = ops_counted(&p, false, 512, releases.clone());
+    // not ext4 on the outside, LUKS2 instead
+    let mut pi = Ext4ProbeInfo::default();
+    assert_ne!(unsafe { ext4_probe(&o, &mut pi) }, 0);
+    let mut info = Ext4LuksInfo::default();
+    assert_eq!(unsafe { ext4_luks_probe(&o, &mut info) }, 0);
+    assert_eq!(info.version, 2);
+    assert!(info.supported);
+    assert_eq!(info.key_size, 64);
+    assert_eq!(c_str(&info.uuid).len(), 36);
+    let mut key = [0u8; EXT4_LUKS_MAX_KEY];
+    let mut len = 0usize;
+    let wrong = b"wrong";
+    assert_eq!(
+        unsafe { ext4_luks_unlock(&o, wrong.as_ptr(), wrong.len(), key.as_mut_ptr(), &mut len) },
+        13
+    );
+    let pass = b"luks test passphrase";
+    assert_eq!(
+        unsafe { ext4_luks_unlock(&o, pass.as_ptr(), pass.len(), key.as_mut_ptr(), &mut len) },
+        0
+    );
+    assert_eq!(len, 64);
+    assert_eq!(unsafe { ext4_luks_check_key(&o, key.as_ptr(), len) }, 0);
+    assert_eq!(unsafe { ext4_luks_check_key(&o, [1u8; 64].as_ptr(), 64) }, 13);
+    assert_eq!(unsafe { ext4_luks_probe_inner(&o, key.as_ptr(), len, &mut pi) }, 0);
+    assert_eq!(c_str(&pi.label), "luksdata");
+    // none of the probing calls released the device
+    assert_eq!(releases.load(Ordering::SeqCst), 0);
+    let mut h: *mut Ext4Handle = std::ptr::null_mut();
+    let mo = Ext4MountOptions::default();
+    assert_eq!(unsafe { ext4_mount_luks(&o, key.as_ptr(), len, &mo, &mut h) }, 0);
+    let a = lookup(h, 2, "hello.txt").unwrap();
+    let mut buf = [0u8; 32];
+    let mut n = 0usize;
+    let rc = unsafe { ext4_read(h, a.ino, 0, buf.as_mut_ptr(), buf.len(), &mut n) };
+    assert_eq!(rc, 0);
+    assert_eq!(&buf[..n], b"hello luks\n");
+    create(h, 2, "from-ffi", EXT4_FT_REG);
+    assert_eq!(unsafe { ext4_unmount(h) }, 0);
+    unsafe { ext4_close(h) };
+    assert_eq!(releases.load(Ordering::SeqCst), 1);
+    // a wrong key does not mount, and releases the device
+    let o = ops_counted(&p, false, 512, releases.clone());
+    let mut h: *mut Ext4Handle = std::ptr::null_mut();
+    assert_eq!(unsafe { ext4_mount_luks(&o, [0u8; 64].as_ptr(), 64, &mo, &mut h) }, 13);
+    assert_eq!(releases.load(Ordering::SeqCst), 2);
+    // a plain ext4 is not LUKS
+    let plain = mkfs(d.path(), &["-t", "ext4"]);
+    let o = ops(&plain, true, 512);
+    assert_eq!(unsafe { ext4_luks_probe(&o, &mut info) }, 2);
+    unsafe { cb_release(o.ctx) };
+}
+
+#[test]
+fn fscrypt_keys_through_c_abi() {
+    let d = tempfile::tempdir().unwrap();
+    let p = crypt_fixture(d.path(), "fscrypt-tool");
+    let o = ops(&p, false, 512);
+    let mut pi = Ext4ProbeInfo::default();
+    assert_eq!(unsafe { ext4_probe(&o, &mut pi) }, 0);
+    assert!(pi.encrypt);
+    assert_eq!(pi.support, EXT4_SUPPORT_READ_WRITE);
+    let h = mount(&o, None);
+    let secret = lookup(h, 2, "secret").unwrap();
+    // locked: the plaintext name is unknown
+    assert!(lookup(h, secret.ino, "hello.txt").is_err());
+    let mut added = 0u32;
+    let mut keys = [0u8; 2 * EXT4_FSCRYPT_KEY_SIZE];
+    let bad = b"nope";
+    assert_eq!(
+        unsafe { ext4_unlock_protector(h, bad.as_ptr(), bad.len(), keys.as_mut_ptr(), 2, &mut added) },
+        0
+    );
+    assert_eq!(added, 0);
+    let pass = b"fscrypt test passphrase";
+    assert_eq!(
+        unsafe { ext4_unlock_protector(h, pass.as_ptr(), pass.len(), keys.as_mut_ptr(), 2, &mut added) },
+        0
+    );
+    assert_eq!(added, 1);
+    assert_ne!(keys[..64], [0u8; 64]);
+    let a = lookup(h, secret.ino, "hello.txt").unwrap();
+    assert_ne!(a.flags & EXT4_FL_ENCRYPT, 0);
+    // already unlocked: the protector is not tried again
+    assert_eq!(
+        unsafe { ext4_unlock_protector(h, pass.as_ptr(), pass.len(), std::ptr::null_mut(), 0, &mut added) },
+        0
+    );
+    assert_eq!(added, 0);
+    // the returned key alone unlocks the directory on the next mount
+    assert_eq!(unsafe { ext4_unmount(h) }, 0);
+    unsafe { ext4_close(h) };
+    let o = ops(&p, false, 512);
+    let h = mount(&o, None);
+    let mut ids = Ext4KeyIds::default();
+    assert_eq!(unsafe { ext4_add_key(h, keys.as_ptr(), 64, &mut ids) }, 0);
+    assert!(lookup(h, secret.ino, "hello.txt").is_ok());
+    let mut ids = Ext4KeyIds::default();
+    assert_eq!(unsafe { ext4_add_key(h, [7u8; 64].as_ptr(), 64, &mut ids) }, 0);
+    assert_ne!(ids.identifier, [0; 16]);
+    assert_eq!(unsafe { ext4_add_key(h, [7u8; 8].as_ptr(), 8, &mut ids) }, 22);
+    assert_eq!(unsafe { ext4_unmount(h) }, 0);
+    unsafe { ext4_close(h) };
+    fsck_clean(&p);
+}

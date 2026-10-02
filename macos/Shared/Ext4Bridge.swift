@@ -88,13 +88,11 @@ public struct Ext4VolumeInfo: Equatable, Sendable {
     public var hasJournal: Bool
     /// 0 = ext2, 1 = ext3, 2 = ext4.
     public var subtype: Int
+    /// The `encrypt` feature: directories may be fscrypt-encrypted.
+    public var encrypt: Bool
 
     init(_ p: Ext4ProbeInfo) {
-        var labelBytes = withUnsafeBytes(of: p.label) { Array($0) }
-        if let nul = labelBytes.firstIndex(of: 0) {
-            labelBytes.removeSubrange(nul...)
-        }
-        label = String(decoding: labelBytes, as: UTF8.self)
+        label = cString(p.label)
         uuid = withUnsafeBytes(of: p.uuid) { raw in
             UUID(uuid: raw.load(as: uuid_t.self))
         }
@@ -108,6 +106,47 @@ public struct Ext4VolumeInfo: Equatable, Sendable {
         needsRecovery = p.needs_recovery
         hasJournal = p.has_journal
         subtype = Int(p.subtype)
+        encrypt = p.encrypt
+    }
+}
+
+/// A NUL-terminated C string stored in a fixed-size byte array (imported
+/// as a tuple).
+func cString<T>(_ tuple: T) -> String {
+    var bytes = withUnsafeBytes(of: tuple) { Array($0) }
+    if let nul = bytes.firstIndex(of: 0) {
+        bytes.removeSubrange(nul...)
+    }
+    return String(decoding: bytes, as: UTF8.self)
+}
+
+/// A LUKS header found on a device.
+public struct Ext4LuksVolume: Equatable, Sendable {
+    /// 1 or 2.
+    public var version: Int
+    /// As stored in the header (lowercase, dashed).
+    public var uuid: String
+    /// LUKS2 label (empty for LUKS1).
+    public var label: String
+    /// Whether the engine has the volume's cipher.
+    public var supported: Bool
+    public var keySize: Int
+    public var keySlots: Int
+
+    init(_ i: Ext4LuksInfo) {
+        version = Int(i.version)
+        uuid = cString(i.uuid).lowercased()
+        label = cString(i.label)
+        supported = i.supported
+        keySize = Int(i.key_size)
+        keySlots = Int(i.keyslots)
+    }
+}
+
+extension Data {
+    /// Run `body` with a pointer to the bytes (null for empty data).
+    func withBytes<T>(_ body: (UnsafePointer<UInt8>?, Int) throws -> T) rethrows -> T {
+        try withUnsafeBytes { b in try body(b.bindMemory(to: UInt8.self).baseAddress, count) }
     }
 }
 
@@ -215,6 +254,92 @@ public final class Ext4Mount: @unchecked Sendable {
         try ext4Check(ext4_mount(&ops, &opts, &h))
         handle = h
         isReadOnly = ext4_is_read_only(h)
+    }
+
+    /// Mount the file system inside a LUKS volume, given its volume key.
+    public init(luks io: BlockIO, key: Data, readOnly: Bool, commitIntervalSeconds: UInt32 = 5) throws {
+        var ops = makeOps(io)
+        var opts = Ext4MountOptions(
+            read_only: readOnly || io.isReadOnly,
+            cache_blocks: 0,
+            commit_interval_secs: commitIntervalSeconds,
+            defer_unlinked: true
+        )
+        var h: OpaquePointer?
+        // on failure the engine has already released the device
+        try key.withBytes { p, n in try ext4Check(ext4_mount_luks(&ops, p, n, &opts, &h)) }
+        handle = h
+        isReadOnly = ext4_is_read_only(h)
+    }
+
+    // MARK: LUKS (no mount needed)
+
+    /// The LUKS header of a device, or nil if it has none.
+    public static func luksProbe(_ io: BlockIO) throws -> Ext4LuksVolume? {
+        var ops = makeOps(io)
+        defer { releaseOps(ops) }
+        var info = Ext4LuksInfo()
+        let rc = ext4_luks_probe(&ops, &info)
+        if rc == ENOENT { return nil }
+        try ext4Check(rc)
+        return Ext4LuksVolume(info)
+    }
+
+    /// The volume key a passphrase (or key file contents) opens, or nil.
+    /// Runs the key slots' key derivation: seconds, and up to gigabytes of
+    /// memory with Argon2.
+    public static func luksUnlock(_ io: BlockIO, passphrase: Data) throws -> Data? {
+        var ops = makeOps(io)
+        defer { releaseOps(ops) }
+        var key = [UInt8](repeating: 0, count: Int(EXT4_LUKS_MAX_KEY))
+        var len = 0
+        let rc = passphrase.withBytes { p, n in ext4_luks_unlock(&ops, p, n, &key, &len) }
+        defer { key.withUnsafeMutableBytes { _ = memset_s($0.baseAddress, $0.count, 0, $0.count) } }
+        if rc == EACCES { return nil }
+        try ext4Check(rc)
+        return Data(key[..<len])
+    }
+
+    /// Whether `key` is the volume key of the LUKS device.
+    public static func luksCheckKey(_ io: BlockIO, key: Data) throws -> Bool {
+        var ops = makeOps(io)
+        defer { releaseOps(ops) }
+        let rc = key.withBytes { p, n in ext4_luks_check_key(&ops, p, n) }
+        if rc == EACCES { return false }
+        try ext4Check(rc)
+        return true
+    }
+
+    /// `probe` of the file system inside a LUKS volume.
+    public static func luksProbeInner(_ io: BlockIO, key: Data) throws -> Ext4VolumeInfo {
+        var ops = makeOps(io)
+        defer { releaseOps(ops) }
+        var info = Ext4ProbeInfo()
+        try key.withBytes { p, n in try ext4Check(ext4_luks_probe_inner(&ops, p, n, &info)) }
+        return Ext4VolumeInfo(info)
+    }
+
+    // MARK: fscrypt keys
+
+    /// Add an fscrypt master key (16 to 64 bytes).
+    public func addKey(_ key: Data) throws {
+        var ids = Ext4KeyIds()
+        try key.withBytes { p, n in try ext4Check(ext4_add_key(handle, p, n, &ids)) }
+    }
+
+    /// Unlock with the Linux `fscrypt` tool's protectors on the volume
+    /// (passphrase, or 32-byte raw protector key). Returns the master keys
+    /// it opened (already added); empty if nothing matched.
+    public func unlockProtector(_ secret: Data) throws -> [Data] {
+        let size = Int(EXT4_FSCRYPT_KEY_SIZE)
+        let cap = 16
+        var buf = [UInt8](repeating: 0, count: cap * size)
+        defer { buf.withUnsafeMutableBytes { _ = memset_s($0.baseAddress, $0.count, 0, $0.count) } }
+        var added: UInt32 = 0
+        try secret.withBytes { p, n in
+            try ext4Check(ext4_unlock_protector(handle, p, n, &buf, cap, &added))
+        }
+        return (0..<min(Int(added), cap)).map { Data(buf[$0 * size..<($0 + 1) * size]) }
     }
 
     deinit {

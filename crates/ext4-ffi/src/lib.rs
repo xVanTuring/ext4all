@@ -128,6 +128,7 @@ fn fill_probe(sb: &ext4_core::ondisk::superblock::Superblock) -> Ext4ProbeInfo {
         use ext4_core::ondisk::superblock::{compat, incompat, ro_compat};
         info.needs_recovery = sb.has_incompat(incompat::RECOVER);
         info.has_journal = sb.has_compat(compat::HAS_JOURNAL);
+        info.encrypt = sb.has_incompat(incompat::ENCRYPT);
         let ext4_only = incompat::EXTENTS | incompat::BIT64 | incompat::FLEX_BG | incompat::INLINE_DATA;
         info.subtype = if sb.feature_incompat() & ext4_only != 0
             || sb.has_ro_compat(ro_compat::HUGE_FILE | ro_compat::DIR_NLINK | ro_compat::METADATA_CSUM)
@@ -264,23 +265,280 @@ pub unsafe extern "C" fn ext4_mount(
         };
         // SAFETY: callbacks valid until release
         let dev = AlignedDevice::new(unsafe { CallbackDevice::new(o)? });
-        let mut mopts = MountOptions {
-            read_only: mo.read_only,
-            ..Default::default()
-        };
-        if mo.cache_blocks > 0 {
-            mopts.cache_blocks = mo.cache_blocks as usize;
-        }
-        let mut fs = Fs::mount(Arc::new(dev), mopts)?;
-        fs.set_defer_unlinked(mo.defer_unlinked);
-        let interval = Duration::from_secs(if mo.commit_interval_secs == 0 {
-            5
-        } else {
-            mo.commit_interval_secs as u64
-        });
-        let h = Box::new(Ext4Handle::new(fs, interval));
+        let h = mount_on(Arc::new(dev), &mo)?;
         // SAFETY: checked non-null
         unsafe { *out = Box::into_raw(h) };
+        Ok(())
+    })
+}
+
+fn mount_on(dev: Arc<dyn ext4_core::BlockDevice>, mo: &Ext4MountOptions) -> Result<Box<Ext4Handle>> {
+    let mut mopts = MountOptions {
+        read_only: mo.read_only,
+        ..Default::default()
+    };
+    if mo.cache_blocks > 0 {
+        mopts.cache_blocks = mo.cache_blocks as usize;
+    }
+    let mut fs = Fs::mount(dev, mopts)?;
+    fs.set_defer_unlinked(mo.defer_unlinked);
+    let interval = Duration::from_secs(if mo.commit_interval_secs == 0 {
+        5
+    } else {
+        mo.commit_interval_secs as u64
+    });
+    Ok(Box::new(Ext4Handle::new(fs, interval)))
+}
+
+// --- encryption ----------------------------------------------------------------------
+
+/// A device for probing and unlocking: no release callback, read-only.
+///
+/// # Safety
+/// `ops` must be valid for the duration of the call.
+unsafe fn probe_device(ops: *const Ext4DeviceOps) -> Result<Arc<dyn ext4_core::BlockDevice>> {
+    if ops.is_null() {
+        return Err(Error::invalid("null ops"));
+    }
+    // SAFETY: caller contract
+    let mut o = unsafe { *ops };
+    o.release = None;
+    o.read_only = true;
+    // SAFETY: callbacks valid for the duration of the call
+    Ok(Arc::new(AlignedDevice::new(unsafe { CallbackDevice::new(o)? })))
+}
+
+fn luks_header(dev: &dyn ext4_core::BlockDevice) -> Result<ext4_core::luks::Header> {
+    ext4_core::luks::Header::read(dev)?.ok_or(Error::NotFound)
+}
+
+fn copy_c_string(dst: &mut [u8], s: &str) {
+    let n = s.len().min(dst.len() - 1);
+    dst[..n].copy_from_slice(&s.as_bytes()[..n]);
+    dst[n] = 0;
+}
+
+/// Check whether a device holds a LUKS volume. Returns 0 and fills `out`
+/// if it does, `ENOENT` if it does not, another errno for a damaged
+/// header.
+///
+/// # Safety
+/// `ops` must be valid; `out` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_luks_probe(ops: *const Ext4DeviceOps, out: *mut Ext4LuksInfo) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        let dev = unsafe { probe_device(ops) }?;
+        let h = luks_header(&*dev)?;
+        let mut info = Ext4LuksInfo {
+            version: h.version,
+            supported: h.check_supported().is_ok(),
+            key_size: h.key_size as u32,
+            keyslots: h.keyslots.len() as u32,
+            ..Default::default()
+        };
+        copy_c_string(&mut info.uuid, &h.uuid);
+        copy_c_string(&mut info.label, &h.label);
+        // SAFETY: caller contract
+        unsafe { put(out, info) };
+        Ok(())
+    })
+}
+
+/// Recover a LUKS volume key from a passphrase. This runs the key slots'
+/// key derivation (seconds and up to gigabytes of memory with Argon2).
+/// Returns 0 and the key in `key[..*key_len]` (`key` holds
+/// [`EXT4_LUKS_MAX_KEY`] bytes), `EACCES` if no key slot opens.
+///
+/// # Safety
+/// `ops` must be valid; `pass` valid for `pass_len` bytes; `key` valid for
+/// [`EXT4_LUKS_MAX_KEY`] bytes; `key_len` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_luks_unlock(
+    ops: *const Ext4DeviceOps,
+    pass: *const u8,
+    pass_len: usize,
+    key: *mut u8,
+    key_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        if key.is_null() {
+            return Err(Error::invalid("null key buffer"));
+        }
+        // SAFETY: caller contract
+        let dev = unsafe { probe_device(ops) }?;
+        // SAFETY: caller contract
+        let p = unsafe { bytes(pass, pass_len) }?;
+        let h = luks_header(&*dev)?;
+        h.check_supported()?;
+        let k = h.unlock(&*dev, p)?.ok_or(Error::NoKey)?;
+        if k.len() > EXT4_LUKS_MAX_KEY {
+            return Err(Error::unsupported("LUKS key longer than 64 bytes"));
+        }
+        // SAFETY: caller contract (64 writable bytes)
+        unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), key, k.len()) };
+        // SAFETY: caller contract
+        unsafe { put(key_len, k.len()) };
+        Ok(())
+    })
+}
+
+/// Whether `key` is the volume key of the LUKS device: 0 if it is,
+/// `EACCES` if not.
+///
+/// # Safety
+/// `ops` must be valid; `key` valid for `key_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_luks_check_key(ops: *const Ext4DeviceOps, key: *const u8, key_len: usize) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        let dev = unsafe { probe_device(ops) }?;
+        // SAFETY: caller contract
+        let k = unsafe { bytes(key, key_len) }?;
+        if luks_header(&*dev)?.verify_key(k) {
+            Ok(())
+        } else {
+            Err(Error::NoKey)
+        }
+    })
+}
+
+/// Open a LUKS device with its volume key.
+fn luks_open(dev: Arc<dyn ext4_core::BlockDevice>, key: &[u8]) -> Result<Arc<dyn ext4_core::BlockDevice>> {
+    let h = luks_header(&*dev)?;
+    if !h.verify_key(key) {
+        return Err(Error::NoKey);
+    }
+    Ok(Arc::new(h.open(dev, key)?))
+}
+
+/// [`ext4_probe`] of the ext2/3/4 file system inside a LUKS volume.
+///
+/// # Safety
+/// `ops` must be valid; `key` valid for `key_len` bytes; `out` valid for
+/// writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_luks_probe_inner(
+    ops: *const Ext4DeviceOps,
+    key: *const u8,
+    key_len: usize,
+    out: *mut Ext4ProbeInfo,
+) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        let dev = unsafe { probe_device(ops) }?;
+        // SAFETY: caller contract
+        let k = unsafe { bytes(key, key_len) }?;
+        let inner = luks_open(dev, k)?;
+        let sb = Fs::probe(&*inner)?;
+        // SAFETY: caller contract
+        unsafe { put(out, fill_probe(&sb)) };
+        Ok(())
+    })
+}
+
+/// [`ext4_mount`] of the file system inside a LUKS volume, given its
+/// volume key. The device's `release` callback runs as for `ext4_mount`.
+///
+/// # Safety
+/// As [`ext4_mount`]; `key` valid for `key_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_mount_luks(
+    ops: *const Ext4DeviceOps,
+    key: *const u8,
+    key_len: usize,
+    opts: *const Ext4MountOptions,
+    out: *mut *mut Ext4Handle,
+) -> i32 {
+    guard(|| {
+        if ops.is_null() || out.is_null() {
+            return Err(Error::invalid("null argument"));
+        }
+        // SAFETY: caller contract
+        let o = unsafe { *ops };
+        let mo = if opts.is_null() {
+            Ext4MountOptions::default()
+        } else {
+            // SAFETY: caller contract
+            unsafe { *opts }
+        };
+        // SAFETY: callbacks valid until release
+        let dev = AlignedDevice::new(unsafe { CallbackDevice::new(o)? });
+        // SAFETY: caller contract
+        let k = unsafe { bytes(key, key_len) }?;
+        let inner = luks_open(Arc::new(dev), k)?;
+        let h = mount_on(inner, &mo)?;
+        // SAFETY: checked non-null
+        unsafe { *out = Box::into_raw(h) };
+        Ok(())
+    })
+}
+
+/// Add an fscrypt master key (16 to 64 bytes) to a mounted volume.
+///
+/// # Safety
+/// `h` must be a live handle; `key` valid for `len` bytes; `out` valid for
+/// writes or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_add_key(h: *const Ext4Handle, key: *const u8, len: usize, out: *mut Ext4KeyIds) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        let k = unsafe { bytes(key, len) }?;
+        // SAFETY: caller contract
+        let ids = unsafe { handle(h) }?.with(|fs| fs.add_encryption_key(k))?;
+        // SAFETY: caller contract
+        unsafe {
+            put(
+                out,
+                Ext4KeyIds {
+                    descriptor: ids.descriptor,
+                    identifier: ids.identifier,
+                },
+            )
+        };
+        Ok(())
+    })
+}
+
+/// Size of the master keys the Linux `fscrypt` tool creates.
+pub const EXT4_FSCRYPT_KEY_SIZE: usize = 64;
+
+/// Unlock with the protectors of the Linux `fscrypt` tool on the volume:
+/// `secret` is a passphrase or a 32-byte raw protector key. The master
+/// keys it opens are added to the volume; `*added` receives how many (0:
+/// nothing matched), and the first `cap` of them are copied to `keys`
+/// ([`EXT4_FSCRYPT_KEY_SIZE`] bytes each) so they can be remembered.
+///
+/// # Safety
+/// `h` must be a live handle; `secret` valid for `len` bytes; `keys` valid
+/// for `cap * EXT4_FSCRYPT_KEY_SIZE` bytes (or null with `cap` 0); `added`
+/// valid for writes or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_unlock_protector(
+    h: *const Ext4Handle,
+    secret: *const u8,
+    len: usize,
+    keys: *mut u8,
+    cap: usize,
+    added: *mut u32,
+) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract
+        let s = unsafe { bytes(secret, len) }?;
+        // SAFETY: caller contract
+        let opened = unsafe { handle(h) }?.with(|fs| fs.unlock_with_protector(s))?;
+        if !keys.is_null() {
+            for (i, k) in opened.iter().take(cap).enumerate() {
+                if k.key.len() == EXT4_FSCRYPT_KEY_SIZE {
+                    // SAFETY: caller contract (cap keys of 64 bytes)
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(k.key.as_ptr(), keys.add(i * EXT4_FSCRYPT_KEY_SIZE), k.key.len())
+                    };
+                }
+            }
+        }
+        // SAFETY: caller contract
+        unsafe { put(added, opened.len() as u32) };
         Ok(())
     })
 }

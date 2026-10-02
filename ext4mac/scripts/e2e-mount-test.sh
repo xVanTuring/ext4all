@@ -96,14 +96,14 @@ run_profile() {
     check "append" sh -c "printf more >> '$MNT/x/moved'" || ok=1
     check "delete tree" rm -rf "$MNT/rsynced" || ok=1
     check "unlink open file" sh -c "exec 3<'$MNT/x/hard'; rm '$MNT/x/hard'; cat <&3 >/dev/null" || ok=1
-    check "df reports" df -k "$MNT" >/dev/null || ok=1
+    check "df reports" sh -c "df -k '$MNT' >/dev/null" || ok=1
     check "sync" sync || ok=1
 
     umount "$MNT"
     hdiutil detach "$DEV" >/dev/null
     DEV=""
     MNT=""
-    check "e2fsck -fn clean" "$SBIN/e2fsck" -fn "$img" >/dev/null || ok=1
+    check "e2fsck -fn clean" sh -c "'$SBIN/e2fsck' -fn '$img' >/dev/null" || ok=1
     if [ $ok -eq 0 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 }
 

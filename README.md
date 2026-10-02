@@ -142,7 +142,7 @@ Two kinds of Linux encryption are supported:
 - a passphrase opens the passphrase protectors that the `fscrypt` tool keeps in `/.fscrypt` on that disk; a 32-byte key file opens its raw-key protectors;
 - a key file holding a 16 to 64-byte fscrypt master key (binary, or as hexadecimal text, as made by `fscryptctl`) is added as is.
 
-What opens a disk is then remembered for that disk (the LUKS volume key, or the fscrypt master keys), so later mounts need no key derivation; the first unlock of a LUKS disk takes seconds (about 5.6 s and 870 MB of memory with cryptsetup's default Argon2id settings, measured on Apple Silicon; the derivation runs single-threaded). Keys are loaded when a disk is mounted: after adding a key to a disk that is already connected, eject and reconnect it. The same works from Terminal:
+What opens a disk is then remembered for that disk (the LUKS volume key, or the fscrypt master keys), so later mounts need no key derivation; the first unlock of a LUKS disk takes seconds (about 5.6 s and 870 MB of memory with cryptsetup's default Argon2id settings, measured on Apple Silicon; the derivation runs single-threaded). Keys are loaded when a disk is mounted: a LUKS disk that stayed locked can be mounted right after adding its passphrase (reconnect it, or `diskutil mount diskNsM`); a disk with fscrypt folders that is already mounted must be ejected and reconnected. A passphrase that failed on a LUKS disk is not tried on it again, and such a disk is then only recognized, not mounted, until a new passphrase is added. The same works from Terminal:
 
 ```bash
 APP=/Applications/Ext4Kit.app/Contents/MacOS/Ext4Kit
@@ -158,7 +158,8 @@ Notes:
 - Login passphrase protectors of a Linux system disk are stored on that system's root file system, not on the external disk, so they cannot be used here; add a custom passphrase protector on Linux (`fscrypt metadata add-protector-to-policy`) or use the raw key. Android keeps its file encryption keys in the device's hardware: such folders stay locked.
 - File data of encrypted files and of LUKS volumes always passes through the extension (never kernel offloaded I/O, which would move ciphertext).
 - Extended attributes are not encrypted by fscrypt (as on Linux).
-- Not yet tested in an installed, signed build: the keychain storage and the extension's unlocking at mount time (the unlocking logic itself is tested with an in-memory store; see TODO.md).
+- Erasing a locked LUKS disk as ext4 works with `diskutil` and Disk Utility (they wipe it first); `newfs_fskit` on a locked LUKS device is refused, because the extension cannot load it.
+- Tested in the installed extension with disk images: fscrypt folders locked and unlocked (passphrase, raw-key protector file, remembered keys), LUKS2 locked, unlocked, remounted from the remembered key and mounted automatically when attached; files written through FSKit read back on Linux.
 
 `ext4-tool` accepts the same keys for images: `--key HEX`, `--key-file FILE`, `--passphrase TEXT` (fscrypt protectors), `--luks-passphrase TEXT`, `--luks-key HEX`, plus `crypt-status PATH`, `encrypt PATH` (encrypt an empty folder) and `luks-dump`.
 
@@ -177,7 +178,7 @@ Distributing builds to others needs Developer ID signing and notarization.
 | FFI / CLI | Full C ABI lifecycle, sector alignment, concurrency, periodic commits; the command-line tool | `cargo test -p ext4-ffi -p ext4-tool` |
 | Encryption | Images encrypted by Linux 7.2.8, the `fscrypt` tool and cryptsetup 2.8.8 (`scripts/make-crypt-fixtures.py`, run as root on Linux): every name shown without the key and every file with it match Linux, for seven fscrypt policies on 4K and 1K blocks, the tool's protectors and five LUKS volumes; our writes pass `e2fsck`; AES, XTS, CTS, SipHash and Argon2 reference vectors | `cargo test -p ext4-core --test crypt` |
 | Swift | Bridge, FSKit attribute conversion, handler calls, LUKS and fscrypt unlocking | `xcodebuild ... -scheme Ext4KitTests test` |
-| End to end | With the extension installed and enabled, real mounts of images for cp / rsync / xattrs / links / deletion, then e2fsck | `scripts/e2e-mount-test.sh` |
+| End to end | With the extension installed and enabled, real mounts of images for cp / rsync / xattrs (no `._` files after cp and ditto) / links / deletion, then e2fsck | `scripts/e2e-mount-test.sh` |
 | Formatting | Geometry and journal location compared with mke2fs; many sizes (including garbage-filled devices, an existing ext4 and a 64 GiB sparse image) pass e2fsck after formatting, mount and take writes in many groups; option parsing | `cargo test -p ext4-core --test mkfs` |
 | Random operations (real volume) | On a mounted volume: random overwrites, uncached writes, appends, truncation, extension, preallocation, memory-mapped writes, renames over other files, deletion; every round compared byte by byte with an in-memory model, remount every 3 rounds; run with and without kernel offloaded I/O | `python3 scripts/fsstress.py /Volumes/X/stress 1 15 diskNsM` |
 
@@ -264,6 +265,7 @@ mkdir -p ~/mnt/sd && mount -F -t ext4 disk4s9 ~/mnt/sd
   ```
 - `fcntl(F_LOG2PHYS)` / `F_LOG2PHYS_EXT` return "not supported" on FSKit volumes (the kernel does not forward them to the extension), with kernel offloaded I/O as well.
 - Files on ext2/ext3 cannot be preallocated (`fallocate`; as on Linux, block maps cannot express unwritten blocks).
+- Extended attributes are native, so copies never get AppleDouble `._` files; but ext4 keeps all attributes of a file in the inode and one block, so a value longer than about a block (e.g. an 8 KB `com.apple.ResourceFork`) cannot be stored: `cp` copies the file without it and reports "No space left on device", `ditto` fails. Values in separate inodes (`ea_inode`) are read but not written.
 - Read-only: volumes with features such as `bigalloc`, `quota`, `casefold`, `verity`, `ea_inode` or `mmp` can be read but not written. Planned work is listed in [TODO.md](TODO.md) (in Chinese).
 
 ## License

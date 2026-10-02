@@ -142,7 +142,7 @@ cargo run -p ext4-tool -- disk.img mkfs -L DATA
 - 口令，用来打开 `fscrypt` 工具保存在该磁盘 `/.fscrypt` 里的口令保护器；32 字节的密钥文件，用来打开原始密钥保护器；
 - 内容是 16 到 64 字节 fscrypt 主密钥的密钥文件（二进制，或十六进制文本，例如 `fscryptctl` 生成的），直接作为密钥使用。
 
-打开某块磁盘的密钥会按磁盘记住（LUKS 的卷密钥，或 fscrypt 的主密钥），以后挂载不再需要运行密钥派生。LUKS 磁盘第一次解锁需要几秒钟：在 Apple Silicon 上实测，cryptsetup 默认的 Argon2id 参数约需 5.6 秒、870 MB 内存，因为密钥派生是单线程的。密钥在挂载时加载：给已经连接的磁盘添加密钥后，需要推出再重新连接。终端里也可以操作：
+打开某块磁盘的密钥会按磁盘记住（LUKS 的卷密钥，或 fscrypt 的主密钥），以后挂载不再需要运行密钥派生。LUKS 磁盘第一次解锁需要几秒钟：在 Apple Silicon 上实测，cryptsetup 默认的 Argon2id 参数约需 5.6 秒、870 MB 内存，因为密钥派生是单线程的。密钥在挂载时加载：一直没能解锁的 LUKS 磁盘，添加口令后就可以挂载（重新连接，或执行 `diskutil mount diskNsM`）；已经挂载的、带 fscrypt 文件夹的磁盘需要推出再重新连接。在某块 LUKS 磁盘上失败过的口令不会再对它重试，这块盘之后只会被识别、不会挂载，直到添加了新的口令。终端里也可以操作：
 
 ```bash
 APP=/Applications/Ext4Kit.app/Contents/MacOS/Ext4Kit
@@ -158,7 +158,8 @@ $APP remove secret:…                  # 删除口令、密钥文件或记住�
 - Linux 系统盘的登录口令保护器保存在那台系统的根文件系统里，不在外接盘上，所以这里无法使用；请在 Linux 上为策略添加一个自定义口令保护器（`fscrypt metadata add-protector-to-policy`），或使用原始密钥。安卓的文件加密密钥由设备硬件保管，这类文件夹会保持锁定。
 - 加密文件和 LUKS 卷的数据始终经过扩展处理，不使用内核直通 I/O（否则内核读写的是密文）。
 - fscrypt 不加密扩展属性（与 Linux 相同）。
-- 尚未在安装好的签名版本中实测：钥匙串存取，以及扩展在挂载时解锁（解锁逻辑本身用内存存储做了测试；见 TODO.md）。
+- 用 `diskutil` 和磁盘工具可以把解不开的 LUKS 磁盘抹成 ext4（它们会先清除原有内容的标识）；对解不开的 LUKS 设备直接运行 `newfs_fskit` 会被拒绝，因为扩展无法加载它。
+- 已在安装好的扩展里用磁盘镜像实测：fscrypt 文件夹的锁定与解锁（口令、原始密钥保护器文件、记住的密钥），LUKS2 的锁定、解锁、用记住的卷密钥再次挂载、附加时自动挂载；经 FSKit 写入的文件在 Linux 上读出正确。
 
 `ext4-tool` 对镜像文件也接受同样的密钥：`--key HEX`、`--key-file FILE`、`--passphrase TEXT`（fscrypt 保护器）、`--luks-passphrase TEXT`、`--luks-key HEX`，另有 `crypt-status PATH`、`encrypt PATH`（加密一个空文件夹）、`luks-dump` 命令。
 
@@ -177,7 +178,7 @@ $APP remove secret:…                  # 删除口令、密钥文件或记住�
 | FFI / CLI | C ABI 全流程、扇区对齐、并发、定时提交；命令行工具 | `cargo test -p ext4-ffi -p ext4-tool` |
 | 加密 | 由 Linux 7.2.8、`fscrypt` 工具和 cryptsetup 2.8.8 生成的加密镜像（`scripts/make-crypt-fixtures.py`，在 Linux 上以 root 运行）：没有密钥时显示的每个名字、有密钥时的每个文件都与 Linux 一致，覆盖 4K、1K 块上的 7 种 fscrypt 策略、该工具的保护器和 5 个 LUKS 卷；我们写入后 `e2fsck` 干净；AES、XTS、CTS、SipHash、Argon2 公开测试向量 | `cargo test -p ext4-core --test crypt` |
 | Swift | 桥接层、FSKit 属性转换、Handler 调用、LUKS 与 fscrypt 解锁 | `xcodebuild ... -scheme Ext4KitTests test` |
-| 端到端 | 安装并启用扩展后，真实挂载镜像做 cp/rsync/xattr/链接/删除等，卸载后 e2fsck | `scripts/e2e-mount-test.sh` |
+| 端到端 | 安装并启用扩展后，真实挂载镜像做 cp/rsync/xattr（cp 和 ditto 之后不产生 `._` 文件）/链接/删除等，卸载后 e2fsck | `scripts/e2e-mount-test.sh` |
 | 格式化 | 与 mke2fs 对比几何参数和日志位置；各种大小（含随机数据填充、已有 ext4、64 GB 稀疏镜像）格式化后 e2fsck 干净、可挂载并在多个组里写入；选项解析 | `cargo test -p ext4-core --test mkfs` |
 | 随机操作（真实卷） | 在已挂载的卷上随机覆盖写、不经缓存写、追加、截断、扩展、预分配、内存映射写、改名覆盖、删除，每轮与内存模型逐字节比对，每 3 轮重新挂载；默认方式和内核直通 I/O 各跑一遍 | `python3 scripts/fsstress.py /Volumes/X/stress 1 15 diskNsM` |
 
@@ -264,6 +265,7 @@ mkdir -p ~/mnt/sd && mount -F -t ext4 disk4s9 ~/mnt/sd
   ```
 - FSKit 卷上 `fcntl(F_LOG2PHYS)` / `F_LOG2PHYS_EXT` 返回“不支持”（内核没有转发给扩展），开启内核直通 I/O 时也一样。
 - ext2/ext3 的文件不支持预分配（`fallocate`，与 Linux 相同，块映射无法表示未写入块）。
+- 扩展属性是原生支持的，拷贝时不会产生 AppleDouble 的 `._` 文件；但 ext4 把一个文件的全部属性存放在 inode 和一个块里，超过约一个块大小的属性值（例如 8 KB 的 `com.apple.ResourceFork`）无法保存：`cp` 会复制文件但丢掉这个属性，并报“No space left on device”，`ditto` 则直接失败。存放在独立 inode 里的属性值（`ea_inode`）只能读取，不能写入。
 - 只读支持：`bigalloc`、`quota`、`casefold`、`verity`、`ea_inode`、`mmp` 等特性的卷可以读取，但不写入。后续计划见 [TODO.md](TODO.md)。
 
 ## 许可证

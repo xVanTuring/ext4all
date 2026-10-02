@@ -459,6 +459,16 @@ public final class Ext4Mount: @unchecked Sendable {
         return n
     }
 
+    /// Like `read`, but the volume is locked only while the range is
+    /// mapped: may be called from several threads at once, and their
+    /// device reads run in parallel.
+    public func readParallel(_ ino: UInt32, offset: UInt64, into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        var n = 0
+        try ext4Check(
+            ext4_read_parallel(handle, ino, offset, buffer.bindMemory(to: UInt8.self).baseAddress, buffer.count, &n))
+        return n
+    }
+
     public func read(_ ino: UInt32, offset: UInt64, length: Int) throws -> Data {
         var d = Data(count: length)
         let n = try d.withUnsafeMutableBytes { try read(ino, offset: offset, into: $0) }

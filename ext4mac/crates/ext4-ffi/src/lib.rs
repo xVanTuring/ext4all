@@ -692,7 +692,8 @@ pub unsafe extern "C" fn ext4_set_label(h: *const Ext4Handle, name: *const u8, l
 pub unsafe extern "C" fn ext4_stat(h: *const Ext4Handle, ino: u32, out: *mut Ext4Attr) -> i32 {
     guard(|| {
         // SAFETY: caller contract
-        let a = unsafe { handle(h) }?.with(|fs| fs.stat(ino))?;
+        // frees nothing: runs alongside parallel reads
+        let a = unsafe { handle(h) }?.with_shared(|fs| fs.stat(ino))?;
         // SAFETY: caller contract
         unsafe { put(out, Ext4Attr::from(&a)) };
         Ok(())
@@ -834,6 +835,39 @@ pub unsafe extern "C" fn ext4_read(
         };
         // SAFETY: caller contract
         let n = unsafe { handle(h) }?.with(|fs| fs.read(ino, offset, out))?;
+        // SAFETY: caller contract
+        unsafe { put(nread, n) };
+        Ok(())
+    })
+}
+
+/// Like [`ext4_read`], but the file system is locked only while the range
+/// is mapped: concurrent calls from several threads read the device in
+/// parallel.
+///
+/// # Safety
+/// `h` must be a live handle; `buf` valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ext4_read_parallel(
+    h: *const Ext4Handle,
+    ino: u32,
+    offset: u64,
+    buf: *mut u8,
+    len: usize,
+    nread: *mut usize,
+) -> i32 {
+    guard(|| {
+        if len > 0 && buf.is_null() {
+            return Err(Error::invalid("null buffer"));
+        }
+        let out: &mut [u8] = if len == 0 {
+            &mut []
+        } else {
+            // SAFETY: caller contract
+            unsafe { std::slice::from_raw_parts_mut(buf, len) }
+        };
+        // SAFETY: caller contract
+        let n = unsafe { handle(h) }?.read_parallel(ino, offset, out)?;
         // SAFETY: caller contract
         unsafe { put(nread, n) };
         Ok(())

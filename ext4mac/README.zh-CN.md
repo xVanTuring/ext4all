@@ -94,6 +94,29 @@ mount -F -t ext4 -o nokoio disk4s1 /tmp/ext4
 
 目录、符号链接、内联数据文件和 ext2/ext3 的块映射文件始终走普通读写路径；同一个文件在被系统回收前不会切换路径。
 
+### 可选：并行读取
+
+默认情况下，扩展收到的读请求在卷锁里逐个处理，硬盘同一时刻只收到一个请求。打开并行读取后，读请求交给后台线程处理：只在查找块位置时持锁，读盘在锁外进行，FSKit 同时发来的多个请求可以一起交给硬盘。截断、删除等会释放块的操作要等正在进行的读取全部结束才执行，所以读取不会拿到已被释放、又分给别的文件的块。内联数据文件和 fscrypt 加密文件仍在锁内读取；LUKS 卷照常可用，解密在后台线程里进行。写入不受影响。
+
+在 Union Memory 512 GB NVMe（RTL9210 USB 10 Gbps 硬盘盒）上实测（MB/s，4 GB 文件）：
+
+| 读取方式 | 默认 | 并行读取 | 内核直通 I/O |
+|---|---|---|---|
+| 不经缓存，每次 5400 KB（Blackmagic Disk Speed Test 的读法） | 542 | 641 | 808 |
+| 不经缓存，每次 8 MB | 535 | 704 | 806 |
+| 经缓存顺序读（冷缓存） | 662 | 928 | 906 |
+
+不经缓存、每次只读 1 MB 时，三种方式都在 450～470 MB/s，受硬盘单个请求的延迟限制。
+
+它默认关闭，日常使用一段时间没有问题再改默认值：
+
+```bash
+# 打开（之后新挂载的卷生效，与内核直通 I/O 可以同时打开）
+defaults write ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs ParallelReads -bool YES
+# 关闭
+defaults delete ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs ParallelReads
+```
+
 ### 诊断
 
 - 每次卸载时，系统日志里会记录这次挂载收到的文件数据请求（读写、块映射、完成、同步的次数、字节数和大小分布），可以看出内核实际走了哪条路径：
@@ -183,6 +206,8 @@ $APP remove secret:…                  # 删除口令、密钥文件或记住�
 | 端到端 | 安装并启用扩展后，真实挂载镜像做 cp/rsync/xattr（cp 和 ditto 之后不产生 `._` 文件）/链接/删除等，卸载后 e2fsck | `scripts/e2e-mount-test.sh` |
 | 格式化 | 与 mke2fs 对比几何参数和日志位置；各种大小（含随机数据填充、已有 ext4、64 GB 稀疏镜像）格式化后 e2fsck 干净、可挂载并在多个组里写入；选项解析 | `cargo test -p ext4-core --test mkfs` |
 | 随机操作（真实卷） | 在已挂载的卷上随机覆盖写、不经缓存写、追加、截断、扩展、预分配、内存映射写、改名覆盖、删除，每轮与内存模型逐字节比对，每 3 轮重新挂载；默认方式和内核直通 I/O 各跑一遍 | `python3 scripts/fsstress.py /Volumes/X/stress 1 15 diskNsM` |
+| 并行读取 | 多个线程并行读取，同时另一个线程截断、删除重建、打洞、改写同一批文件；文件里每 8 字节都写着它自己的 inode 号，读到别的文件或元数据的内容即失败（去掉读写锁时这个测试必然失败）；另外与锁内读取逐字节比对，覆盖内联数据、ext3、fscrypt（有无密钥）和 LUKS | `cargo test -p ext4-core --test parallel_read --test crypt` |
+| 并行读取（真实卷） | 打开并行读取后，在已挂载的卷上用多个线程不经缓存读取，同时另一个线程截断、删除重建、改写，检查方法同上，结束后 e2fsck | `python3 scripts/read-race.py /Volumes/X/race 60` |
 
 辅助工具：
 

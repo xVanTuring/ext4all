@@ -47,12 +47,18 @@ class Ext4Volume: FSVolume, @unchecked Sendable {
     /// be switched off, at activation (`-o nokoio`), before any item is
     /// handed out.
     private(set) var kernelIO: Bool
+    /// File data reads return at once and run on `readQueue`, with the
+    /// engine locked only while mapping, so the requests FSKit sends
+    /// together reach the device together (opt-in, `ParallelReads`).
+    let parallelReads: Bool
+    static let readQueue = DispatchQueue(label: "tech.xvanturing.ext4.fs.read", attributes: .concurrent)
 
-    init(mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false) {
+    init(mount: Ext4Mount, info: Ext4VolumeInfo, bsdName: String, kernelIO: Bool = false, parallelReads: Bool = false) {
         self.mount = mount
         self.bsdName = bsdName
         self.info = info
         self.kernelIO = kernelIO
+        self.parallelReads = parallelReads
         self.blockSize = UInt64(info.blockSize)
         let caps = FSVolume.SupportedCapabilities()
         caps.supportsPersistentObjectIDs = true
@@ -634,21 +640,44 @@ extension Ext4Volume: FSVolume.ReadWriteHandler {
         from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer,
         replyHandler reply: @escaping @Sendable (FSReadFileResult?, (any Error)?) -> Void
     ) {
-        run("read", reply) {
-            guard offset >= 0 else { throw POSIXError(.EINVAL) }
-            let i = try ino(item)
-            noteOnce("read", "first read through the extension (inode \(i))")
-            let n = try buffer.withUnsafeMutableBytes { raw -> Int in
-                let len = min(length, raw.count)
-                guard len > 0 else { return 0 }
-                return try mount.read(
-                    i, offset: UInt64(offset), into: UnsafeMutableRawBufferPointer(rebasing: raw[0..<len]))
+        if parallelReads {
+            Self.readQueue.async {
+                // only the bookkeeping takes opLock
+                let n = Result { try self.readData(item, at: offset, length: length, into: buffer, parallel: true) }
+                self.run("read", reply) { try self.readResult(item, at: offset, length: length, n: n.get()) }
             }
-            stats.add("read", bytes: n)
-            stats.add("read \(IOStats.bucket(length))")
-            Log.fs.debug("read \(i) \(offset)+\(length) -> \(n)")
-            return try Self.unwrap(FSReadFileResult(bytesRead: n, itemAttributes: try attributes(item)))
+            return
         }
+        run("read", reply) {
+            let n = try readData(item, at: offset, length: length, into: buffer, parallel: false)
+            return try readResult(item, at: offset, length: length, n: n)
+        }
+    }
+
+    private func readData(
+        _ item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer, parallel: Bool
+    ) throws -> Int {
+        guard offset >= 0 else { throw POSIXError(.EINVAL) }
+        let i = try ino(item)
+        return try buffer.withUnsafeMutableBytes { raw -> Int in
+            let len = min(length, raw.count)
+            guard len > 0 else { return 0 }
+            let dst = UnsafeMutableRawBufferPointer(rebasing: raw[0..<len])
+            return parallel
+                ? try mount.readParallel(i, offset: UInt64(offset), into: dst)
+                : try mount.read(i, offset: UInt64(offset), into: dst)
+        }
+    }
+
+    /// Statistics and the reply for a read of `n` bytes; call with
+    /// `opLock` held.
+    private func readResult(_ item: FSItem, at offset: off_t, length: Int, n: Int) throws -> FSReadFileResult {
+        let i = try ino(item)
+        noteOnce("read", "first read through the extension (inode \(i))")
+        stats.add("read", bytes: n)
+        stats.add("read \(IOStats.bucket(length))")
+        Log.fs.debug("read \(i) \(offset)+\(length) -> \(n)")
+        return try Self.unwrap(FSReadFileResult(bytesRead: n, itemAttributes: try attributes(item)))
     }
 
     func write(

@@ -16,9 +16,9 @@ import Foundation
 final class Ext4KernelIOVolume: Ext4Volume, FSVolume.KernelOffloadedIOHandler, @unchecked Sendable {
     let resource: FSBlockDeviceResource
 
-    init(mount: Ext4Mount, info: Ext4VolumeInfo, resource: FSBlockDeviceResource) {
+    init(mount: Ext4Mount, info: Ext4VolumeInfo, resource: FSBlockDeviceResource, parallelReads: Bool = false) {
         self.resource = resource
-        super.init(mount: mount, info: info, bsdName: resource.bsdName, kernelIO: true)
+        super.init(mount: mount, info: info, bsdName: resource.bsdName, kernelIO: true, parallelReads: parallelReads)
     }
 
     /// Largest extent length the packer accepts (`UINT32_MAX`), rounded

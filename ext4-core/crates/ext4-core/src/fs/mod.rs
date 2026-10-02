@@ -23,6 +23,7 @@ mod zone;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use file::read_pieces;
 pub use types::*;
 
 use crate::cache::BlockCache;

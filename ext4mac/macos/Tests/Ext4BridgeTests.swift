@@ -241,6 +241,44 @@ final class Ext4BridgeTests: XCTestCase {
         try TestImage.assertClean(path)
     }
 
+    func testParallelReads() throws {
+        let path = try TestImage.make(sizeMB: 64)
+        let m = try Ext4Mount(FileBlockIO(path: path, readOnly: false), readOnly: false)
+        var files: [(ino: UInt32, data: Data)] = []
+        for i in 0..<4 {
+            let a = try m.create(
+                Ext4Mount.rootIno, Data("p\(i)".utf8), type: UInt8(EXT4_FT_REG), perm: 0o644, uid: 0, gid: 0)
+            let data = Data.pattern(300_000 + i * 1000, seed: UInt8(i + 1))
+            _ = try m.write(a.ino, offset: 0, data: data)
+            files.append((a.ino, data))
+        }
+        let failures = NSLock()
+        var errors: [String] = []
+        DispatchQueue.concurrentPerform(iterations: 8) { t in
+            for k in 0..<50 {
+                let f = files[(t + k) % files.count]
+                let offset = (t * 7919 + k * 104_729) % (f.data.count + 100)
+                var buf = Data(count: 65536)
+                do {
+                    let n = try buf.withUnsafeMutableBytes { try m.readParallel(f.ino, offset: UInt64(offset), into: $0) }
+                    let want = offset < f.data.count ? f.data.subdata(in: offset..<min(offset + 65536, f.data.count)) : Data()
+                    if buf.prefix(n) != want {
+                        failures.lock()
+                        errors.append("inode \(f.ino) at \(offset): \(n) bytes differ")
+                        failures.unlock()
+                    }
+                } catch {
+                    failures.lock()
+                    errors.append("inode \(f.ino) at \(offset): \(error)")
+                    failures.unlock()
+                }
+            }
+        }
+        XCTAssertTrue(errors.isEmpty, "\(errors)")
+        try m.unmount()
+        try TestImage.assertClean(path)
+    }
+
     /// Kernel offloaded I/O through the bridge: map for write, write the
     /// device directly at the mapped offsets (as the kernel would),
     /// complete, then read back through the engine and a read mapping.

@@ -145,14 +145,15 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
             // opt-in; read-only mounts benefit as well (reads bypass the
             // extension). Never for LUKS: the kernel would read ciphertext.
             let kernelIO = !isLuks && UserDefaults.standard.bool(forKey: Ext4FileSystem.kernelIODefaultsKey)
+            let parallelReads = UserDefaults.standard.bool(forKey: Ext4FileSystem.parallelReadsDefaultsKey)
             let volume: Ext4Volume =
                 kernelIO
-                ? Ext4KernelIOVolume(mount: mount, info: info, resource: device)
-                : Ext4Volume(mount: mount, info: info, bsdName: device.bsdName)
+                ? Ext4KernelIOVolume(mount: mount, info: info, resource: device, parallelReads: parallelReads)
+                : Ext4Volume(mount: mount, info: info, bsdName: device.bsdName, parallelReads: parallelReads)
             loaded.withLock { $0 = volume }
             containerStatus = .ready
             Log.fs.info(
-                "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)\(kernelIO ? ", kernel offloaded I/O" : "", privacy: .public)"
+                "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)\(kernelIO ? ", kernel offloaded I/O" : "", privacy: .public)\(parallelReads ? ", parallel reads" : "", privacy: .public)"
             )
             reply(volume, nil)
         } catch let locked as LuksUnavailable {
@@ -292,6 +293,9 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     /// the volume's class decides which FSKit protocols it implements and
     /// `-o` mount options only arrive later, at activation.
     static let kernelIODefaultsKey = "KernelOffloadedIO"
+    /// Defaults key that lets file data reads run in parallel
+    /// (`Ext4Volume.parallelReads`); read when a volume is loaded.
+    static let parallelReadsDefaultsKey = "ParallelReads"
 
     /// With kernel offloaded I/O available, `-o nokoio` switches it off for
     /// one mount (and `-o koio` on); otherwise `defaultOn` decides.

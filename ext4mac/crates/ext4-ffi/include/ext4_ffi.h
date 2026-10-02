@@ -607,6 +607,21 @@ int32_t ext4_read(const struct Ext4Handle *h,
                   size_t *nread);
 
 /**
+ * Like [`ext4_read`], but the file system is locked only while the range
+ * is mapped: concurrent calls from several threads read the device in
+ * parallel.
+ *
+ * # Safety
+ * `h` must be a live handle; `buf` valid for `len` bytes.
+ */
+int32_t ext4_read_parallel(const struct Ext4Handle *h,
+                           uint32_t ino,
+                           uint64_t offset,
+                           uint8_t *buf,
+                           size_t len,
+                           size_t *nread);
+
+/**
  * # Safety
  * `h` must be a live handle; `buf` valid for `len` bytes.
  */

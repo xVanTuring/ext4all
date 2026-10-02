@@ -3,14 +3,20 @@
 //! while a volume is mounted.
 
 use crate::error::errno::EIO;
-use crate::{Error, Fs, Result};
+use crate::fs::read_pieces;
+use crate::{Error, Fs, Ino, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 struct Shared {
     fs: Mutex<Option<Fs>>,
+    /// Held shared by [`SharedFs::read_parallel`] from mapping until its
+    /// device reads finish, and exclusively around every other operation,
+    /// so no block such a read is fetching can be freed and reused
+    /// meanwhile. Taken before `fs`.
+    data: RwLock<()>,
     /// Set after a panic inside an operation: in-memory state may be
     /// inconsistent, so nothing more may be written.
     broken: AtomicBool,
@@ -29,6 +35,7 @@ impl SharedFs {
         let read_only = fs.is_read_only();
         let shared = Arc::new(Shared {
             fs: Mutex::new(Some(fs)),
+            data: RwLock::new(()),
             broken: AtomicBool::new(false),
             stop: Mutex::new(false),
             wake: Condvar::new(),
@@ -69,6 +76,35 @@ impl SharedFs {
 
     /// Run `f` with the file system locked. Panics mark the handle broken.
     pub fn with<T>(&self, f: impl FnOnce(&mut Fs) -> Result<T>) -> Result<T> {
+        let _data = self.shared.data.write().unwrap_or_else(|e| e.into_inner());
+        self.with_fs(f)
+    }
+
+    /// [`SharedFs::with`] for operations that free no blocks (`stat`):
+    /// they need not wait for parallel reads to finish.
+    pub fn with_shared<T>(&self, f: impl FnOnce(&mut Fs) -> Result<T>) -> Result<T> {
+        let _data = self.shared.data.read().unwrap_or_else(|e| e.into_inner());
+        self.with_fs(f)
+    }
+
+    /// Read file data like [`Fs::read`], but hold the file system only
+    /// while mapping the range: the device reads run unlocked, so
+    /// concurrent calls keep several requests in flight on the device.
+    /// Inline and encrypted files are read entirely under the lock.
+    pub fn read_parallel(&self, ino: Ino, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let _data = self.shared.data.read().unwrap_or_else(|e| e.into_inner());
+        let (plan, dev) = self.with_fs(|fs| Ok((fs.plan_read(ino, offset, buf.len())?, fs.dev.clone())))?;
+        match plan {
+            Some((len, pieces)) => {
+                read_pieces(&*dev, &pieces, &mut buf[..len])?;
+                Ok(len)
+            }
+            None => self.with_fs(|fs| fs.read(ino, offset, buf)),
+        }
+    }
+
+    /// [`SharedFs::with`] for callers holding `data` already.
+    fn with_fs<T>(&self, f: impl FnOnce(&mut Fs) -> Result<T>) -> Result<T> {
         let mut g = self.lock()?;
         let fs = g.as_mut().ok_or(Error::Busy)?;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(fs)));
@@ -109,6 +145,8 @@ impl SharedFs {
     /// Commit, restore the clean on-disk state and release the device.
     pub fn unmount(&self) -> Result<()> {
         self.stop_committer();
+        // let parallel reads still on the device finish
+        let _data = self.shared.data.write().unwrap_or_else(|e| e.into_inner());
         let mut g = self.shared.fs.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut fs) = g.take() else {
             return Ok(());

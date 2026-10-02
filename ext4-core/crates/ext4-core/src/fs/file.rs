@@ -2,6 +2,7 @@
 
 use super::extent::Mapping;
 use super::{Fs, Ino};
+use crate::device::BlockDevice;
 use crate::error::{Error, Result};
 use crate::fscrypt::InodeCrypt;
 use crate::ondisk::extent::{Extent, MAX_INIT_LEN};
@@ -13,6 +14,27 @@ use std::sync::Arc;
 /// Direct writes tracked per inode between mapping and completion (the
 /// kernel keeps far fewer in flight; the cap only bounds lost completions).
 const MAX_INFLIGHT: usize = 4096;
+
+/// A run of file data: `len` bytes at device offset `at`, or zeros (holes,
+/// unwritten blocks) when `at` is `None`.
+pub(crate) struct DataPiece {
+    pub at: Option<u64>,
+    pub len: usize,
+}
+
+/// Fill `buf` from `pieces`, which together are exactly `buf.len()` bytes.
+pub(crate) fn read_pieces(dev: &dyn BlockDevice, pieces: &[DataPiece], buf: &mut [u8]) -> Result<()> {
+    let mut done = 0;
+    for p in pieces {
+        let dst = &mut buf[done..done + p.len];
+        match p.at {
+            Some(at) => dev.read_at(at, dst)?,
+            None => dst.fill(0),
+        }
+        done += p.len;
+    }
+    Ok(())
+}
 
 impl Fs {
     /// Largest file size supported for this inode's mapping scheme.
@@ -65,6 +87,11 @@ impl Fs {
             }
             return Ok(len);
         }
+        let Some(c) = crypt else {
+            let pieces = self.data_pieces(ino, inode, offset, len)?;
+            read_pieces(&*self.dev, &pieces, buf)?;
+            return Ok(len);
+        };
         let bs = self.bs as u64;
         let mut done = 0usize;
         while done < len {
@@ -85,17 +112,12 @@ impl Fs {
                         if pblk + run > self.sb.blocks_count() {
                             return Err(Error::corrupt(format!("inode {ino}: block {pblk} beyond device")));
                         }
-                        match &crypt {
-                            None => self.dev.read_at(pblk * bs + in_blk, dst)?,
-                            Some(c) => {
-                                // whole data units, decrypted, then the part asked for
-                                let n = (in_blk + avail as u64).div_ceil(bs);
-                                let mut img = vec![0u8; (n * bs) as usize];
-                                self.dev.read_at(pblk * bs, &mut img)?;
-                                c.crypt_data(self.first_data_unit(c, lblk), &mut img, false)?;
-                                dst.copy_from_slice(&img[in_blk as usize..in_blk as usize + avail]);
-                            }
-                        }
+                        // whole data units, decrypted, then the part asked for
+                        let n = (in_blk + avail as u64).div_ceil(bs);
+                        let mut img = vec![0u8; (n * bs) as usize];
+                        self.dev.read_at(pblk * bs, &mut img)?;
+                        c.crypt_data(self.first_data_unit(&c, lblk), &mut img, false)?;
+                        dst.copy_from_slice(&img[in_blk as usize..in_blk as usize + avail]);
                     }
                     done += avail;
                 }
@@ -107,6 +129,81 @@ impl Fs {
             }
         }
         Ok(len)
+    }
+
+    /// Where the bytes `[offset, offset + len)` of an unencrypted,
+    /// block-mapped or extent-mapped inode come from, in order; `len` must
+    /// not reach past the end of file.
+    fn data_pieces(&mut self, ino: Ino, inode: &Inode, offset: u64, len: usize) -> Result<Vec<DataPiece>> {
+        let bs = self.bs as u64;
+        let mut pieces: Vec<DataPiece> = Vec::new();
+        let mut push = |p: DataPiece| {
+            if let Some(last) = pieces.last_mut() {
+                let joins = match (last.at, p.at) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a + last.len as u64 == b,
+                    _ => false,
+                };
+                if joins {
+                    last.len += p.len;
+                    return;
+                }
+            }
+            pieces.push(p);
+        };
+        let mut done = 0usize;
+        while done < len {
+            let pos = offset + done as u64;
+            let lblk = pos / bs;
+            let in_blk = pos % bs;
+            match self.map_block(ino, inode, lblk)? {
+                Mapping::Mapped {
+                    pblk,
+                    len: run,
+                    unwritten,
+                } => {
+                    let avail = (run * bs - in_blk).min((len - done) as u64) as usize;
+                    if unwritten {
+                        push(DataPiece { at: None, len: avail });
+                    } else {
+                        if pblk + run > self.sb.blocks_count() {
+                            return Err(Error::corrupt(format!("inode {ino}: block {pblk} beyond device")));
+                        }
+                        push(DataPiece {
+                            at: Some(pblk * bs + in_blk),
+                            len: avail,
+                        });
+                    }
+                    done += avail;
+                }
+                Mapping::Hole { len: run } => {
+                    let avail = run.saturating_mul(bs).saturating_sub(in_blk).min((len - done) as u64) as usize;
+                    push(DataPiece { at: None, len: avail });
+                    done += avail;
+                }
+            }
+        }
+        Ok(pieces)
+    }
+
+    /// Plan a read of `[offset, offset + len)` of `ino` that can run
+    /// without the file system: the bytes to return and where they come
+    /// from. `None` when the data must be read with [`Fs::read`] (inline
+    /// data, encrypted contents).
+    pub(crate) fn plan_read(&mut self, ino: Ino, offset: u64, len: usize) -> Result<Option<(usize, Vec<DataPiece>)>> {
+        let inode = self.read_live_inode(ino)?;
+        if inode.is_dir() {
+            return Err(Error::IsDir);
+        }
+        if inode.has_flag(flags::INLINE_DATA) || inode.is_reg() && inode.has_flag(flags::ENCRYPT) {
+            return Ok(None);
+        }
+        let size = inode.size();
+        if offset >= size || len == 0 {
+            return Ok(Some((0, Vec::new())));
+        }
+        let len = (size - offset).min(len as u64) as usize;
+        Ok(Some((len, self.data_pieces(ino, &inode, offset, len)?)))
     }
 
     /// Key for the contents of a regular file (`None`: not encrypted;

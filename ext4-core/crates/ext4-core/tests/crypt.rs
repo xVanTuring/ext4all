@@ -8,13 +8,14 @@ mod common;
 use common::{Image, tool};
 use ext4_core::crypto::from_hex;
 use ext4_core::luks::Header;
-use ext4_core::{BlockDevice, Error, FileDevice, FileType, Fs, Ino, MountOptions};
+use ext4_core::{BlockDevice, Error, FileDevice, FileType, Fs, Ino, MountOptions, SharedFs};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn fixture_dir() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypt")
@@ -184,6 +185,66 @@ fn contents_with_key_match_linux() {
         add_keys(&mut fs, &m);
         assert_same(&walk(&mut fs), &expected(&m["with_key"]), &format!("{name} with key"));
     }
+}
+
+/// `SharedFs::read_parallel` from several threads returns what `Fs::read`
+/// does for every file of `fs`, including the errors of locked files.
+fn compare_parallel_reads(mut fs: Fs, what: &str) {
+    let files: Vec<(String, Ino, u64)> = walk(&mut fs)
+        .into_iter()
+        .filter(|(_, e)| e.kind == "file")
+        .map(|(p, e)| (p, e.ino as Ino, e.size.unwrap()))
+        .collect();
+    assert!(!files.is_empty(), "{what}");
+    let shared = SharedFs::new(fs, Duration::from_secs(5));
+    std::thread::scope(|s| {
+        for t in 0..4u64 {
+            let (shared, files) = (&shared, &files);
+            s.spawn(move || {
+                for (path, ino, size) in files {
+                    for offset in [0, 1 + t, size / 3, size.saturating_sub(5000 + t)] {
+                        let (mut a, mut b) = (vec![0u8; 70_000], vec![1u8; 70_000]);
+                        let ra = shared.read_parallel(*ino, offset, &mut a);
+                        let rb = shared.with(|fs| fs.read(*ino, offset, &mut b));
+                        match (ra, rb) {
+                            (Ok(x), Ok(y)) => {
+                                assert_eq!(x, y, "{what}: {path} at {offset}");
+                                assert!(a[..x] == b[..y], "{what}: {path} at {offset}: contents differ");
+                            }
+                            (Err(Error::NoKey), Err(Error::NoKey)) => {}
+                            (x, y) => panic!("{what}: {path} at {offset}: {x:?} / {y:?}"),
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn parallel_reads_of_encrypted_volumes() {
+    for name in FSCRYPT {
+        let (img, m) = fixture(name);
+        compare_parallel_reads(mount(&img, true), &format!("{name} without key"));
+        let mut fs = mount(&img, true);
+        add_keys(&mut fs, &m);
+        compare_parallel_reads(fs, &format!("{name} with key"));
+    }
+    let (img, m) = fixture("luks1-xts");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open(&img.path, true).unwrap());
+    let h = Header::read(&*dev).unwrap().expect("LUKS header");
+    let pass = m["passphrases"][0].as_str().unwrap().as_bytes();
+    let key = h.unlock(&*dev, pass).unwrap().unwrap();
+    let crypt = Arc::new(h.open(dev.clone(), &key).unwrap());
+    let fs = Fs::mount(
+        crypt,
+        MountOptions {
+            read_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    compare_parallel_reads(fs, "luks1-xts");
 }
 
 #[test]

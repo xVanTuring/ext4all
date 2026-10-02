@@ -94,6 +94,29 @@ mount -F -t ext4 -o nokoio disk4s1 /tmp/ext4
 
 Directories, symbolic links, inline data files and the block-mapped files of ext2/ext3 always use the read/write path; a file never switches paths until the system reclaims it.
 
+### Optional: parallel reads
+
+By default the extension handles read requests one at a time under the volume lock, so the drive only ever has one request to work on. With parallel reads, read requests run on background threads: the lock is held only while the blocks are looked up, the device reads run outside it, and the requests FSKit sends together reach the drive together. Operations that free blocks (truncation, deletion and the like) wait until the reads in progress have finished, so a read never returns blocks that were freed and given to another file meanwhile. Inline data files and fscrypt-encrypted files are still read under the lock; LUKS volumes work as usual, decrypting on the background threads. Writes are not affected.
+
+Measured on the Union Memory 512 GB NVMe in an RTL9210 USB 10 Gbps enclosure (MB/s, 4 GB file):
+
+| Read pattern | Default | Parallel reads | Kernel offloaded I/O |
+|---|---|---|---|
+| Uncached, 5400 KB per call (how Blackmagic Disk Speed Test reads) | 542 | 641 | 808 |
+| Uncached, 8 MB per call | 535 | 704 | 806 |
+| Cached sequential read (cold cache) | 662 | 928 | 906 |
+
+Uncached reads of 1 MB at a time stay at 450–470 MB/s with all three: the latency of a single request on the drive is the limit.
+
+It is off by default until it has seen some daily use:
+
+```bash
+# Turn on (applies to volumes mounted afterwards; can be combined with kernel offloaded I/O)
+defaults write ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs ParallelReads -bool YES
+# Turn off
+defaults delete ~/Library/Containers/tech.xvanturing.ext4.fs/Data/Library/Preferences/tech.xvanturing.ext4.fs ParallelReads
+```
+
 ### Diagnostics
 
 - At every unmount the system log records the file data requests the mount received (count, bytes and size distribution of reads, writes, block mappings, completions and syncs), showing which path the kernel actually used:
@@ -183,6 +206,8 @@ Distributing builds to others needs Developer ID signing and notarization.
 | End to end | With the extension installed and enabled, real mounts of images for cp / rsync / xattrs (no `._` files after cp and ditto) / links / deletion, then e2fsck | `scripts/e2e-mount-test.sh` |
 | Formatting | Geometry and journal location compared with mke2fs; many sizes (including garbage-filled devices, an existing ext4 and a 64 GiB sparse image) pass e2fsck after formatting, mount and take writes in many groups; option parsing | `cargo test -p ext4-core --test mkfs` |
 | Random operations (real volume) | On a mounted volume: random overwrites, uncached writes, appends, truncation, extension, preallocation, memory-mapped writes, renames over other files, deletion; every round compared byte by byte with an in-memory model, remount every 3 rounds; run with and without kernel offloaded I/O | `python3 scripts/fsstress.py /Volumes/X/stress 1 15 diskNsM` |
+| Parallel reads | Several threads read in parallel while another truncates, deletes and recreates, punches holes in and rewrites the same files; every 8 bytes of a file hold its inode number, so reading another file's or metadata contents fails the test (it always fails without the read-write lock); also compared byte by byte with locked reads, covering inline data, ext3, fscrypt (with and without keys) and LUKS | `cargo test -p ext4-core --test parallel_read --test crypt` |
+| Parallel reads (real volume) | With parallel reads on, several threads read a mounted volume uncached while another truncates, deletes and recreates, and rewrites; checked as above, then e2fsck | `python3 scripts/read-race.py /Volumes/X/race 60` |
 
 Helpers:
 

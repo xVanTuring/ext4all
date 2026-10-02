@@ -4,7 +4,7 @@
 
 ## M0 工具链与骨架
 
-- 在 iQOO 15（未 root，OriginOS）和红米 Note 11 Pro 上安装，跑自检和 USB 检测。
+- 在红米 Note 11 Pro 上安装，跑自检和 USB 检测（iQOO 15、小米 Pad 6 已通过）。
 - `openProxyFileDescriptor` 的读写速度，以及视频播放器拖动进度、编辑器保存是否正常。
 
 ## M1 镜像文件模式，只读

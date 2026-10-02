@@ -14,6 +14,12 @@
 
 ## M0 已有结论
 
+在 iQOO 15 上（未 root，OriginOS 6，Android 16，内核 6.12）：
+
+- 自检通过；App 能对 `UsbDeviceConnection` 的文件描述符执行 usbdevfs ioctl，`claimInterface(intf, true)` 能取得接口。在同一块 RTL9210 NVMe 硬盘盒上完成了识别、读 GPT、只读挂载 ext4、列出根目录、刷新缓存。
+- 16 到 128 KiB 的同步传输都没有出现 ENOMEM；传输越大越快，128 KiB 时约 230–260 MB/s，64 KiB 时 170–300 MB/s。
+- 检测时没有出现 USB 权限弹窗（小米 Pad 6 上也没有），和原版 Android 的行为不同，做正式插盘流程时再确认。
+
 在小米 Pad 6 上（HyperOS 2.0，Android 14，内核 4.19；App 没有使用 root）：
 
 - 原生库加载正常，自检（在内存里格式化、写入、重新挂载、读回）通过。

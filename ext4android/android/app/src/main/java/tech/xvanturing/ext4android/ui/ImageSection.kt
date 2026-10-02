@@ -112,12 +112,14 @@ fun ImageSection() {
             OutlinedButton(enabled = !busy && exists, onClick = { importer.launch(arrayOf("*/*")) }) {
                 Text(stringResource(R.string.image_import))
             }
-            Button(enabled = !busy && exists, onClick = {
-                run {
-                    mounted = withContext(Dispatchers.IO) { Volumes.mountImage(context, image, readOnly = true) }
-                    context.getString(R.string.image_mounted_done)
-                }
-            }) { Text(stringResource(R.string.image_mount)) }
+            for (readOnly in listOf(true, false)) {
+                Button(enabled = !busy && exists, onClick = {
+                    run {
+                        mounted = withContext(Dispatchers.IO) { Volumes.mountImage(context, image, readOnly) }
+                        context.getString(R.string.image_mounted_done)
+                    }
+                }) { Text(stringResource(if (readOnly) R.string.image_mount else R.string.image_mount_rw)) }
+            }
         } else {
             Button(enabled = !busy, onClick = {
                 picker.initial = DocumentsContract.buildDocumentUri(Volumes.AUTHORITY, DocumentIds.root(volume.rootId))
@@ -147,9 +149,10 @@ fun ImageSection() {
 
 private fun mountedText(context: Context, volume: MountedVolume): String {
     val info = runCatching { Volumes.info(volume) }.getOrNull()
-        ?: return context.getString(R.string.image_mounted, "?", "?")
+        ?: return context.getString(R.string.image_mounted, "?", "?", "?")
     return context.getString(
         R.string.image_mounted,
+        context.getString(if (info.readOnly) R.string.mode_read_only else R.string.mode_read_write),
         info.label.ifEmpty { context.getString(R.string.root_untitled) },
         Formatter.formatShortFileSize(context, info.availableBytes),
     )

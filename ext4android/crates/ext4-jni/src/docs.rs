@@ -35,7 +35,7 @@ pub struct Entry {
     pub perm: u16,
 }
 
-fn entry(name: &[u8], a: &Attr) -> Option<Entry> {
+pub(crate) fn entry(name: &[u8], a: &Attr) -> Option<Entry> {
     let kind = match a.file_type {
         FileType::Regular => Kind::File,
         FileType::Directory => Kind::Dir,
@@ -56,7 +56,7 @@ fn entry(name: &[u8], a: &Attr) -> Option<Entry> {
 /// the root down), following symbolic links in the middle of the path and,
 /// with `follow_last`, at its end. Returns the attributes of the result,
 /// which is then at the top of `stack`.
-fn walk(fs: &mut Fs, stack: &mut Vec<Ino>, comps: Vec<Vec<u8>>, follow_last: bool) -> Result<Attr> {
+pub(crate) fn walk(fs: &mut Fs, stack: &mut Vec<Ino>, comps: Vec<Vec<u8>>, follow_last: bool) -> Result<Attr> {
     let mut queue: VecDeque<Vec<u8>> = comps.into();
     let mut links = 0;
     let mut attr = fs.stat(*stack.last().expect("root on the stack"))?;

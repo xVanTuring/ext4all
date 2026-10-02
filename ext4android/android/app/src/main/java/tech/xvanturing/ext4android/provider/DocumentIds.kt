@@ -21,6 +21,15 @@ object DocumentIds {
         return documentId.substring(0, i) to documentId.substring(i + 1)
     }
 
+    /** The directory holding [documentId], or null for a root directory. */
+    fun parent(documentId: String): String? {
+        val (rootId, path) = parse(documentId) ?: return null
+        if (path.isEmpty()) {
+            return null
+        }
+        return "$rootId:" + path.substringBeforeLast('/', "")
+    }
+
     /** Whether [documentId] is inside [parentId], at any depth. */
     fun isDescendant(parentId: String, documentId: String): Boolean {
         val (parentRoot, parentPath) = parse(parentId) ?: return false

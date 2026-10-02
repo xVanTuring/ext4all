@@ -1,7 +1,7 @@
 //! Mounted volumes, known to Kotlin by number.
 
-use ext4_core::{BlockDevice, Error, FileDevice, Fs, MountOptions, Result, SharedFs, Slice};
-use std::collections::BTreeMap;
+use ext4_core::{BlockDevice, Error, FileDevice, Fs, Ino, MountOptions, Result, SharedFs, Slice};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -13,6 +13,62 @@ pub struct Volume {
     pub fs: SharedFs,
     pub label: String,
     pub uuid: [u8; 16],
+    /// Open file descriptors per inode. The volume is mounted with
+    /// deferred unlinking: a deleted inode is freed only once no
+    /// descriptor uses it (Linux semantics).
+    open: Mutex<HashMap<Ino, u32>>,
+}
+
+impl Volume {
+    fn open_table(&self) -> std::sync::MutexGuard<'_, HashMap<Ino, u32>> {
+        self.open.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn is_open(&self, ino: Ino) -> bool {
+        self.open_table().contains_key(&ino)
+    }
+
+    /// A descriptor for `ino` was handed out.
+    pub fn opened(&self, ino: Ino) {
+        *self.open_table().entry(ino).or_insert(0) += 1;
+    }
+
+    /// A descriptor for `ino` was closed: free the inode if it was deleted
+    /// meanwhile and this was its last descriptor; commit what was written.
+    pub fn closed(&self, ino: Ino, written: bool) -> Result<()> {
+        let last = {
+            let mut t = self.open_table();
+            match t.get_mut(&ino) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                Some(_) => {
+                    t.remove(&ino);
+                    true
+                }
+                None => false,
+            }
+        };
+        // the table lock is released before the file system lock is taken
+        self.fs.with(|fs| {
+            if last {
+                fs.reclaim(ino)?;
+            }
+            if written { fs.commit() } else { Ok(()) }
+        })
+    }
+
+    /// Free inodes an operation unlinked, unless a descriptor still uses
+    /// them (then [`Volume::closed`] frees them).
+    pub fn reclaim(&self, fs: &mut Fs, inos: &[Ino]) -> Result<()> {
+        for &ino in inos {
+            if !self.is_open(ino) {
+                fs.reclaim(ino)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 struct Registry {
@@ -90,7 +146,14 @@ fn mount_on(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
         fs: SharedFs::new(fs, COMMIT_INTERVAL),
         label,
         uuid,
+        open: Mutex::new(HashMap::new()),
     }))
+}
+
+/// Mount the file system of a device (tests: an in-memory device).
+#[cfg(test)]
+pub fn mount_device(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
+    mount_on(dev, read_only)
 }
 
 /// Mount the ext4 volume in an image file (a file system image, or a disk

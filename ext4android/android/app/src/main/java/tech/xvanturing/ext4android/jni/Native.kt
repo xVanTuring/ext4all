@@ -7,7 +7,7 @@ package tech.xvanturing.ext4android.jni
  * bytes, so `%`, control characters and bytes that are not UTF-8 appear as
  * `%XX`; components are joined with `/` and the root is "". File system
  * errors are thrown as [java.io.FileNotFoundException] (missing, not a
- * directory) or [java.io.IOException].
+ * directory) or [Ext4Exception] (with the Linux errno).
  */
 object Native {
     init {
@@ -55,11 +55,52 @@ object Native {
     @JvmStatic
     external fun list(volume: Int, path: String): ByteArray
 
-    /** Inode and size of the regular file at [path]: `[ino, size]`. */
+    /**
+     * Opens the regular file at [path] for a descriptor, emptied first with
+     * [truncate]: `[ino, size]`. Every open is paired with [closeFile].
+     */
     @JvmStatic
-    external fun openFile(volume: Int, path: String): LongArray
+    external fun openFile(volume: Int, path: String, truncate: Boolean): LongArray
+
+    /** A descriptor from [openFile] was closed; [written] commits the changes. */
+    @JvmStatic
+    external fun closeFile(volume: Int, ino: Int, written: Boolean)
 
     /** Reads up to [len] bytes at [offset] of inode [ino] into [buf]; 0 at the end of the file. */
     @JvmStatic
     external fun read(volume: Int, ino: Int, offset: Long, buf: ByteArray, len: Int): Int
+
+    /** Writes [len] bytes of [buf] at [offset] of inode [ino]. */
+    @JvmStatic
+    external fun write(volume: Int, ino: Int, offset: Long, buf: ByteArray, len: Int)
+
+    @JvmStatic
+    external fun fileSize(volume: Int, ino: Int): Long
+
+    /** fsync: commits what was written so far. */
+    @JvmStatic
+    external fun syncVolume(volume: Int)
+
+    /**
+     * Creates a file or directory named [name] in the directory at [parent];
+     * a taken name gets a number. One record of [Records.entries].
+     */
+    @JvmStatic
+    external fun createDocument(volume: Int, parent: String, name: String, directory: Boolean): ByteArray
+
+    /** Deletes a document; a directory with everything in it. */
+    @JvmStatic
+    external fun deleteDocument(volume: Int, path: String)
+
+    /** Renames in place; returns the new path. */
+    @JvmStatic
+    external fun renameDocument(volume: Int, path: String, name: String): String
+
+    /** Moves into the directory at [target]; returns the new path. */
+    @JvmStatic
+    external fun moveDocument(volume: Int, path: String, target: String): String
+
+    /** Copies into the directory at [target] (a taken name gets a number); returns the copy's path. */
+    @JvmStatic
+    external fun copyDocument(volume: Int, path: String, target: String): String
 }

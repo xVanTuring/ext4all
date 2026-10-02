@@ -23,7 +23,10 @@
     <string name="image_title">测试镜像（调试）</string>
     <string name="image_none">还没有测试镜像</string>
     <string name="image_ready">测试镜像：%1$s</string>
-    <string name="image_mounted">已只读挂载：“%1$s”，可用 %2$s。现在系统文件选择器里能看到它。</string>
+    <string name="image_mounted">已%1$s挂载：“%2$s”，可用 %3$s。现在系统文件选择器里能看到它。</string>
+    <string name="mode_read_only">只读</string>
+    <string name="mode_read_write">可写</string>
+    <string name="image_mount_rw">挂载（可写）</string>
     <string name="image_create">创建测试镜像（%1$d MiB）</string>
     <string name="image_created">测试镜像已创建</string>
     <string name="image_import">导入文件到镜像…</string>

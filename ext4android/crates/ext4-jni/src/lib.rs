@@ -7,13 +7,15 @@
 //! - structured results are little-endian byte arrays (see
 //!   [`docs::encode_entries`], [`volumes::info`]);
 //! - errors and panics never cross the boundary: file system errors become
-//!   `FileNotFoundException` (missing, not a directory) or `IOException`,
-//!   panics a `RuntimeException`.
+//!   `FileNotFoundException` (missing, not a directory) or `Ext4Exception`
+//!   (an IOException with the Linux errno), panics a `RuntimeException`.
 
 mod docs;
+mod errors;
 #[cfg(target_os = "android")]
 mod logger;
 mod names;
+mod ops;
 mod sample;
 mod selftest;
 // usbdevfs is Linux only; the probe is tested on any host
@@ -49,12 +51,16 @@ impl From<jni::errors::Error> for Failure {
 }
 
 fn throw(env: &mut Env<'_>, e: &ext4_core::Error) -> jni::errors::Result<()> {
-    let msg = JNIString::from(e.to_string());
     match e {
-        ext4_core::Error::NotFound | ext4_core::Error::NotDir => {
-            env.throw_new(jni_str!("java/io/FileNotFoundException"), &msg)
-        }
-        _ => env.throw_new(jni_str!("java/io/IOException"), &msg),
+        ext4_core::Error::NotFound | ext4_core::Error::NotDir => env.throw_new(
+            jni_str!("java/io/FileNotFoundException"),
+            JNIString::from(e.to_string()),
+        ),
+        // "<errno> <message>": Ext4Exception splits it
+        _ => env.throw_new(
+            jni_str!("tech/xvanturing/ext4android/jni/Ext4Exception"),
+            JNIString::from(format!("{} {e}", errors::linux_errno(e))),
+        ),
     }
 }
 
@@ -246,21 +252,181 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_list<'caller>
     .resolve::<ThrowRuntimeExAndDefault>()
 }
 
-/// Inode and size of a regular file: `[ino, size]`.
+/// Open a regular file for a descriptor (emptied first with `truncate`):
+/// `[ino, size]`. Every open is paired with `closeFile`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_openFile<'caller>(
     mut env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     id: jint,
     path: JString<'caller>,
+    truncate: jboolean,
 ) -> JLongArray<'caller> {
     env.with_env(|env| {
         call(env, |env| {
             let path = string(env, &path)?;
-            let (ino, size) = volume(id)?.fs.with(|fs| docs::open(fs, &path))?;
+            let (ino, size) = ops::open(&*volume(id)?, &path, truncate)?;
             let out = env.new_long_array(2)?;
             out.set_region(env, 0, &[ino as jlong, size as jlong])?;
             Ok(out)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// A descriptor from `openFile` was closed; `written` commits.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_closeFile<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    ino: jint,
+    written: jboolean,
+) {
+    env.with_env(|env| call(env, |_| Ok(volume(id)?.closed(ino as u32, written)?)))
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// Write `len` bytes of `buf` at `offset` of inode `ino`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_write<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    ino: jint,
+    offset: jlong,
+    buf: JByteArray<'caller>,
+    len: jint,
+) {
+    env.with_env(|env| {
+        call(env, |env| {
+            let mut signed = vec![0i8; len.max(0) as usize];
+            buf.get_region(env, 0, &mut signed)?;
+            // SAFETY: i8 and u8 have the same size and alignment
+            let data = unsafe { std::slice::from_raw_parts(signed.as_ptr() as *const u8, signed.len()) };
+            Ok(ops::write(&*volume(id)?, ino as u32, offset.max(0) as u64, data)?)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_fileSize<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    ino: jint,
+) -> jlong {
+    env.with_env(|env| call(env, |_| Ok(ops::size(&*volume(id)?, ino as u32)? as jlong)))
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// fsync: commit what was written so far.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_syncVolume<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+) {
+    env.with_env(|env| call(env, |_| Ok(ops::sync(&*volume(id)?)?)))
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// Create a file or directory (a taken name gets a number); one entry
+/// record, its name is the new last path component.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_createDocument<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    parent: JString<'caller>,
+    name: JString<'caller>,
+    directory: jboolean,
+) -> JByteArray<'caller> {
+    env.with_env(|env| {
+        call(env, |env| {
+            let parent = string(env, &parent)?;
+            let name = string(env, &name)?;
+            let (entry, _) = ops::create(&*volume(id)?, &parent, &name, directory)?;
+            Ok(env.byte_array_from_slice(&docs::encode_entries(&[entry]))?)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// Delete a document (a directory with everything in it).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_deleteDocument<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    path: JString<'caller>,
+) {
+    env.with_env(|env| {
+        call(env, |env| {
+            let path = string(env, &path)?;
+            Ok(ops::delete(&*volume(id)?, &path)?)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// Rename in place; returns the new encoded path.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_renameDocument<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    path: JString<'caller>,
+    name: JString<'caller>,
+) -> JString<'caller> {
+    env.with_env(|env| {
+        call(env, |env| {
+            let path = string(env, &path)?;
+            let name = string(env, &name)?;
+            let new = ops::rename(&*volume(id)?, &path, &name)?;
+            Ok(JString::from_str(env, new)?)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// Move into another directory; returns the new encoded path.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_moveDocument<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    path: JString<'caller>,
+    target: JString<'caller>,
+) -> JString<'caller> {
+    env.with_env(|env| {
+        call(env, |env| {
+            let path = string(env, &path)?;
+            let target = string(env, &target)?;
+            let new = ops::move_to(&*volume(id)?, &path, &target)?;
+            Ok(JString::from_str(env, new)?)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// Copy into a directory (a taken name gets a number); returns the copy's
+/// encoded path.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_copyDocument<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    path: JString<'caller>,
+    target: JString<'caller>,
+) -> JString<'caller> {
+    env.with_env(|env| {
+        call(env, |env| {
+            let path = string(env, &path)?;
+            let target = string(env, &target)?;
+            let new = ops::copy(&*volume(id)?, &path, &target)?;
+            Ok(JString::from_str(env, new)?)
         })
     })
     .resolve::<ThrowRuntimeExAndDefault>()

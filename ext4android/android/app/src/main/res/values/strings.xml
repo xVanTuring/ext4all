@@ -17,4 +17,26 @@
     <string name="usb_claim_failed">claimInterface failed: the interface could not be taken from the system</string>
     <string name="usb_claimed">claimInterface succeeded</string>
     <string name="usb_set_interface_failed">setInterface failed (alternate setting 0)</string>
+
+    <string name="failed">Failed: %1$s</string>
+    <string name="root_untitled">ext4 disk</string>
+    <string name="root_summary">ext4 · %1$s free</string>
+
+    <string name="image_title">Sample image (debug)</string>
+    <string name="image_none">No sample image yet</string>
+    <string name="image_ready">Sample image: %1$s</string>
+    <string name="image_mounted">Mounted read-only: \"%1$s\", %2$s free. It now appears in the system file picker.</string>
+    <string name="image_create">Create a sample image (%1$d MiB)</string>
+    <string name="image_created">Sample image created</string>
+    <string name="image_import">Import a file into the image…</string>
+    <string name="image_imported">Imported %1$s (%2$s)</string>
+    <string name="image_mount">Mount (read-only)</string>
+    <string name="image_mounted_done">Mounted</string>
+    <string name="image_unmount">Unmount</string>
+    <string name="image_unmounted_done">Unmounted</string>
+    <string name="image_pick_open">Pick a file and open it with another app</string>
+    <string name="image_speed">Measure reads through the documents provider</string>
+    <string name="image_speed_result">Sequential read of %1$s: %2$.1f MB/s\n%3$d random reads of 4 KiB: %4$.2f ms each\nData: %5$s</string>
+    <string name="data_ok">correct</string>
+    <string name="data_bad">WRONG</string>
 </resources>

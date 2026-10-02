@@ -15,4 +15,26 @@
     <string name="usb_claim_failed">claimInterface 失败：无法从系统取得接口</string>
     <string name="usb_claimed">claimInterface 成功</string>
     <string name="usb_set_interface_failed">setInterface 失败（备用设置 0）</string>
+
+    <string name="failed">失败：%1$s</string>
+    <string name="root_untitled">ext4 磁盘</string>
+    <string name="root_summary">ext4 · 可用 %1$s</string>
+
+    <string name="image_title">测试镜像（调试）</string>
+    <string name="image_none">还没有测试镜像</string>
+    <string name="image_ready">测试镜像：%1$s</string>
+    <string name="image_mounted">已只读挂载：“%1$s”，可用 %2$s。现在系统文件选择器里能看到它。</string>
+    <string name="image_create">创建测试镜像（%1$d MiB）</string>
+    <string name="image_created">测试镜像已创建</string>
+    <string name="image_import">导入文件到镜像…</string>
+    <string name="image_imported">已导入 %1$s（%2$s）</string>
+    <string name="image_mount">挂载（只读）</string>
+    <string name="image_mounted_done">已挂载</string>
+    <string name="image_unmount">卸载</string>
+    <string name="image_unmounted_done">已卸载</string>
+    <string name="image_pick_open">选择文件并用其他 App 打开</string>
+    <string name="image_speed">通过文档提供者测读取速度</string>
+    <string name="image_speed_result">顺序读 %1$s：%2$.1f MB/s\n随机读 %3$d 次，每次 4 KiB：平均 %4$.2f ms\n数据：%5$s</string>
+    <string name="data_ok">正确</string>
+    <string name="data_bad">有误</string>
 </resources>

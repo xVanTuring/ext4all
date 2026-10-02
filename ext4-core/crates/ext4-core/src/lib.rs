@@ -22,7 +22,7 @@ pub mod mkfs;
 pub mod ondisk;
 pub mod shared;
 
-pub use device::{AlignedDevice, BlockDevice, FileDevice, MemDevice};
+pub use device::{AlignedDevice, BlockDevice, FileDevice, MemDevice, Slice};
 pub use error::{Error, Result};
 pub mod fs;
 

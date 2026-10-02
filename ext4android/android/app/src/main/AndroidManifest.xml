@@ -19,5 +19,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- mounted volumes in the system file picker (Storage Access Framework) -->
+        <provider
+            android:name=".provider.Ext4DocumentsProvider"
+            android:authorities="tech.xvanturing.ext4android.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
     </application>
 </manifest>

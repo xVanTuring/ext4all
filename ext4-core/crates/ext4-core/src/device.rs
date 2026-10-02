@@ -285,6 +285,69 @@ impl<T: BlockDevice + ?Sized> BlockDevice for std::sync::Arc<T> {
     }
 }
 
+/// A byte range of another device, such as one partition of a disk.
+pub struct Slice<D: BlockDevice> {
+    inner: D,
+    start: u64,
+    len: u64,
+    read_only: bool,
+}
+
+impl<D: BlockDevice> Slice<D> {
+    /// `start` must be a multiple of the inner device's sector size, and
+    /// `start + len` within it.
+    pub fn new(inner: D, start: u64, len: u64, read_only: bool) -> Result<Self> {
+        let sector = inner.sector_size().max(1) as u64;
+        if start % sector != 0 || start.checked_add(len).is_none_or(|end| end > inner.size()) {
+            return Err(Error::invalid(format!(
+                "slice {start}+{len} does not fit a device of {} bytes with {sector}-byte sectors",
+                inner.size()
+            )));
+        }
+        let read_only = read_only || inner.is_read_only();
+        Ok(Slice {
+            inner,
+            start,
+            len,
+            read_only,
+        })
+    }
+}
+
+impl<D: BlockDevice> BlockDevice for Slice<D> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        check_range(offset, buf.len(), self.len)?;
+        self.inner.read_at(self.start + offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        check_range(offset, buf.len(), self.len)?;
+        self.inner.write_at(self.start + offset, buf)
+    }
+
+    fn flush(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        self.inner.flush()
+    }
+
+    fn size(&self) -> u64 {
+        self.len
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +486,25 @@ mod tests {
         assert_eq!(&r, b"xy");
         assert_eq!(b.size(), 64);
         assert_eq!(d.sector_size(), 512);
+    }
+
+    #[test]
+    fn slice_offsets_and_bounds() {
+        let disk = Arc::new(MemDevice::new(8192));
+        let s = Slice::new(disk.clone(), 1024, 2048, false).unwrap();
+        assert_eq!(s.size(), 2048);
+        s.write_at(0, b"ab").unwrap();
+        s.write_at(2046, b"yz").unwrap();
+        assert!(s.write_at(2047, b"yz").is_err());
+        let mut r = [0u8; 2];
+        disk.read_at(1024, &mut r).unwrap();
+        assert_eq!(&r, b"ab");
+        disk.read_at(3070, &mut r).unwrap();
+        assert_eq!(&r, b"yz");
+
+        assert!(Slice::new(disk.clone(), 1000, 512, false).is_err(), "unaligned start");
+        assert!(Slice::new(disk.clone(), 7680, 1024, false).is_err(), "past the end");
+        let ro = Slice::new(disk, 0, 512, true).unwrap();
+        assert!(matches!(ro.write_at(0, b"x"), Err(Error::ReadOnly)));
     }
 }

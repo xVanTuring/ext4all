@@ -19,6 +19,7 @@ part.workspace = true
 usb-msc.workspace = true
 
 [dev-dependencies]
+tempfile = "3.27.0"
 usb-msc = { workspace = true, features = ["sim"] }
 
 [lints]

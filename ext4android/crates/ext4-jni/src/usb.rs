@@ -2,38 +2,32 @@
 //! what the app sees on a disk through its own USB access.
 
 use ext4_core::error::errno;
-use ext4_core::{AlignedDevice, BlockDevice, Fs, MountOptions};
+use ext4_core::{AlignedDevice, BlockDevice, Fs, MountOptions, Slice};
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
 use usb_msc::{Disk, Transport};
 
-/// A byte range of a disk (one partition, or all of it).
-pub struct Window<T: Transport> {
+/// A whole USB disk as a block device; partitions are [`Slice`]s of it.
+/// Offsets and lengths must be whole blocks: wrap in [`AlignedDevice`].
+pub struct UsbDisk<T: Transport> {
     disk: Arc<Disk<T>>,
-    start: u64,
-    len: u64,
     read_only: bool,
 }
 
-impl<T: Transport> Window<T> {
-    pub fn new(disk: Arc<Disk<T>>, start: u64, len: u64, read_only: bool) -> Window<T> {
-        Window {
-            disk,
-            start,
-            len,
-            read_only,
-        }
+impl<T: Transport> UsbDisk<T> {
+    pub fn new(disk: Arc<Disk<T>>, read_only: bool) -> UsbDisk<T> {
+        UsbDisk { disk, read_only }
     }
 
     fn lba(&self, offset: u64, len: usize) -> ext4_core::Result<u64> {
-        if offset.checked_add(len as u64).is_none_or(|end| end > self.len) {
+        if offset.checked_add(len as u64).is_none_or(|end| end > self.size()) {
             return Err(ext4_core::Error::invalid(format!(
-                "I/O beyond the end of the volume: offset {offset} len {len} size {}",
-                self.len
+                "I/O beyond the end of the disk: offset {offset} len {len} size {}",
+                self.size()
             )));
         }
-        Ok((self.start + offset) / self.disk.info().block_size as u64)
+        Ok(offset / self.disk.info().block_size as u64)
     }
 }
 
@@ -42,9 +36,7 @@ fn fs_error(e: usb_msc::Error) -> ext4_core::Error {
     ext4_core::Error::Device(if e.is_disconnected() { errno::ENXIO } else { errno::EIO })
 }
 
-/// Offsets and lengths arrive aligned to the block size: wrap in
-/// [`AlignedDevice`].
-impl<T: Transport> BlockDevice for Window<T> {
+impl<T: Transport> BlockDevice for UsbDisk<T> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ext4_core::Result<()> {
         let lba = self.lba(offset, buf.len())?;
         self.disk.read(lba, buf).map_err(fs_error)
@@ -66,7 +58,7 @@ impl<T: Transport> BlockDevice for Window<T> {
     }
 
     fn size(&self) -> u64 {
-        self.len
+        self.disk.info().size()
     }
 
     fn is_read_only(&self) -> bool {
@@ -118,7 +110,7 @@ pub fn probe<T: Transport + 'static>(t: T) -> String {
         info.max_lun as u32 + 1
     );
 
-    let whole = AlignedDevice::new(Window::new(disk.clone(), 0, info.size(), true));
+    let whole = AlignedDevice::new(UsbDisk::new(disk.clone(), true));
     let mut read = |o: u64, b: &mut [u8]| whole.read_at(o, b);
     let volumes: Vec<(String, u64, u64)> = match part::read(&mut read, bs, info.size()) {
         Err(e) => {
@@ -167,12 +159,12 @@ pub fn probe<T: Transport + 'static>(t: T) -> String {
             start / MIB,
             len as f64 / (1u64 << 30) as f64
         );
-        if start % bs as u64 != 0 {
-            let _ = writeln!(out, "  not aligned to the {bs}-byte block size, skipped");
-            continue;
+        match Slice::new(UsbDisk::new(disk.clone(), true), start, len, true) {
+            Ok(slice) => describe_volume(&mut out, Arc::new(AlignedDevice::new(slice))),
+            Err(e) => {
+                let _ = writeln!(out, "  skipped: {e}");
+            }
         }
-        let dev: Arc<dyn BlockDevice> = Arc::new(AlignedDevice::new(Window::new(disk.clone(), start, len, true)));
-        describe_volume(&mut out, dev);
     }
 
     let _ = writeln!(out, "\nSYNCHRONIZE CACHE: {}", match disk.sync() {
@@ -379,17 +371,18 @@ mod tests {
     }
 
     #[test]
-    fn window_rejects_writes_when_read_only_and_io_past_the_end() {
+    fn usb_disk_rejects_writes_when_read_only_and_io_past_the_end() {
         let disk = Arc::new(Disk::open(SimDisk::new(64, 512)).unwrap());
-        let w = Window::new(disk.clone(), 512, 8 * 512, true);
-        assert!(matches!(w.write_at(0, &[0; 512]), Err(ext4_core::Error::ReadOnly)));
+        let ro = UsbDisk::new(disk.clone(), true);
+        assert!(matches!(ro.write_at(0, &[0; 512]), Err(ext4_core::Error::ReadOnly)));
         let mut b = [0u8; 512];
-        assert!(w.read_at(8 * 512, &mut b).is_err());
-        w.read_at(7 * 512, &mut b).unwrap();
-        let w = Window::new(disk, 512, 8 * 512, false);
-        w.write_at(0, &[9; 512]).unwrap();
+        assert!(ro.read_at(64 * 512, &mut b).is_err());
+        ro.read_at(63 * 512, &mut b).unwrap();
+
+        let part = Slice::new(UsbDisk::new(disk.clone(), false), 512, 8 * 512, false).unwrap();
+        part.write_at(0, &[9; 512]).unwrap();
         let mut back = [0u8; 512];
-        w.read_at(0, &mut back).unwrap();
+        ro.read_at(512, &mut back).unwrap();
         assert_eq!(back, [9; 512]);
     }
 }

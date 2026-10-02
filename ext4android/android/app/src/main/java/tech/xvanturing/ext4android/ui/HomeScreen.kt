@@ -61,6 +61,8 @@ fun HomeScreen() {
                 Text(stringResource(R.string.self_test_result, result))
             }
             HorizontalDivider()
+            ImageSection()
+            HorizontalDivider()
             UsbSection()
         }
     }

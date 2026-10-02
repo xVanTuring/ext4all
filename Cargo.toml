@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/ext4-core", "crates/ext4-ffi", "crates/ext4-tool"]
+members = [
+    # platform-neutral
+    "ext4-core/crates/ext4-core",
+    "ext4-core/crates/ext4-tool",
+    # macOS (FSKit)
+    "ext4mac/crates/ext4-ffi",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,7 +23,7 @@ unusual_byte_groupings = "allow"
 identity_op = "allow"
 
 [workspace.dependencies]
-ext4-core = { path = "crates/ext4-core" }
+ext4-core = { path = "ext4-core/crates/ext4-core" }
 
 [profile.release]
 debug = 1

@@ -15,7 +15,8 @@ Produces OUTDIR/<name>.img.gz and OUTDIR/<name>.json for:
   passphrase protector and a raw-key protector.
 - luks*: cryptsetup LUKS1/LUKS2 volumes (several ciphers and key
   derivations) holding a small ext4.
-The ext4 tests in crates/ext4-core/tests/crypt.rs compare against these.
+The ext4 tests in ext4-core/crates/ext4-core/tests/crypt.rs compare against
+these.
 """
 
 import errno

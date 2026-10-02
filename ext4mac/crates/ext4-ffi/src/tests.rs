@@ -837,7 +837,7 @@ fn commit_is_durable_and_request_commit_wakes_the_thread() {
 /// Unpack one of ext4-core's encrypted fixture images.
 fn crypt_fixture(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let gz = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../ext4-core/tests/fixtures/crypt")
+        .join("../../../ext4-core/crates/ext4-core/tests/fixtures/crypt")
         .join(format!("{name}.img.gz"));
     let out = Command::new("gzip").arg("-dc").arg(&gz).output().unwrap();
     assert!(out.status.success());

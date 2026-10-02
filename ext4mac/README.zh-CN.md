@@ -22,7 +22,7 @@ FSKit ──XPC──▶ Ext4FS.appex (Swift, macOS/Ext4FS)
                   │  Ext4KernelIOVolume : 可选的内核直通 I/O（KernelOffloadedIOHandler）
                   │  ResourceBlockIO : FSBlockDeviceResource 读写
                   ▼  C ABI（crates/ext4-ffi，cbindgen 生成头文件，静态库）
-               ext4-core（纯 Rust，crates/ext4-core）
+               ext4-core（纯 Rust，../ext4-core/crates/ext4-core）
                   ├─ ondisk/   superblock、组描述符、inode、extent、目录项、xattr（含校验和）
                   ├─ journal/  jbd2 回放（csum v2/v3、revoke）与提交
                   ├─ cache.rs  元数据块缓存（脏块钉住到提交）
@@ -33,11 +33,13 @@ FSKit ──XPC──▶ Ext4FS.appex (Swift, macOS/Ext4FS)
                   └─ fs/       挂载、分配器、extent 树、目录（线性 + htree）、文件读写、孤儿 inode
 ```
 
+本目录是 ext4all 仓库中的 macOS 部分；Cargo workspace 在仓库根目录。
+
 | 目录 | 内容 |
 |---|---|
-| `crates/ext4-core` | ext4 实现本体，只依赖 `BlockDevice` trait |
+| `../ext4-core/crates/ext4-core` | ext4 实现本体，只依赖 `BlockDevice` trait |
+| `../ext4-core/crates/ext4-tool` | 命令行工具，直接读写镜像文件，便于调试 |
 | `crates/ext4-ffi` | 给 Swift 用的 C ABI（`include/ext4_ffi.h`） |
-| `crates/ext4-tool` | 命令行工具，直接读写镜像文件，便于调试 |
 | `macos/` | xcodegen 工程：宿主 App `Ext4Kit`、FSKit 扩展 `Ext4FS`、XCTest |
 | `scripts/` | Rust 构建、测试镜像生成、端到端挂载测试 |
 
@@ -46,7 +48,7 @@ FSKit ──XPC──▶ Ext4FS.appex (Swift, macOS/Ext4FS)
 依赖：Xcode 27、Rust（`aarch64-apple-darwin`）、cbindgen、xcodegen、e2fsprogs（测试用）。
 
 ```bash
-# Rust 部分（测试需要 e2fsprogs 的 mke2fs / e2fsck / debugfs）
+# Rust 部分，在仓库根目录执行（测试需要 e2fsprogs 的 mke2fs / e2fsck / debugfs）
 cargo test --workspace
 
 # 生成 Xcode 工程并构建（构建阶段会自动调用 scripts/build-rust.sh）
@@ -176,7 +178,7 @@ $APP remove secret:…                  # 删除口令、密钥文件或记住�
 | 随机模型测试 | proptest 随机操作序列对照内存模型，大目录 htree 分裂 | `cargo test -p ext4-core --test random` |
 | 长时间浸泡 | 800 个随机断电种子 | `cargo test --release -p ext4-core --test crash -- --ignored` |
 | FFI / CLI | C ABI 全流程、扇区对齐、并发、定时提交；命令行工具 | `cargo test -p ext4-ffi -p ext4-tool` |
-| 加密 | 由 Linux 7.2.8、`fscrypt` 工具和 cryptsetup 2.8.8 生成的加密镜像（`scripts/make-crypt-fixtures.py`，在 Linux 上以 root 运行）：没有密钥时显示的每个名字、有密钥时的每个文件都与 Linux 一致，覆盖 4K、1K 块上的 7 种 fscrypt 策略、该工具的保护器和 5 个 LUKS 卷；我们写入后 `e2fsck` 干净；AES、XTS、CTS、SipHash、Argon2 公开测试向量 | `cargo test -p ext4-core --test crypt` |
+| 加密 | 由 Linux 7.2.8、`fscrypt` 工具和 cryptsetup 2.8.8 生成的加密镜像（`../ext4-core/scripts/make-crypt-fixtures.py`，在 Linux 上以 root 运行）：没有密钥时显示的每个名字、有密钥时的每个文件都与 Linux 一致，覆盖 4K、1K 块上的 7 种 fscrypt 策略、该工具的保护器和 5 个 LUKS 卷；我们写入后 `e2fsck` 干净；AES、XTS、CTS、SipHash、Argon2 公开测试向量 | `cargo test -p ext4-core --test crypt` |
 | Swift | 桥接层、FSKit 属性转换、Handler 调用、LUKS 与 fscrypt 解锁 | `xcodebuild ... -scheme Ext4KitTests test` |
 | 端到端 | 安装并启用扩展后，真实挂载镜像做 cp/rsync/xattr（cp 和 ditto 之后不产生 `._` 文件）/链接/删除等，卸载后 e2fsck | `scripts/e2e-mount-test.sh` |
 | 格式化 | 与 mke2fs 对比几何参数和日志位置；各种大小（含随机数据填充、已有 ext4、64 GB 稀疏镜像）格式化后 e2fsck 干净、可挂载并在多个组里写入；选项解析 | `cargo test -p ext4-core --test mkfs` |

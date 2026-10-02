@@ -6,6 +6,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# the Cargo workspace (and its target directory) is the ext4all root
+WORKSPACE="$(cd "$ROOT/.." && pwd)"
+FFI="$ROOT/crates/ext4-ffi"
 VENDOR="$ROOT/macos/Vendor"
 TARGET="aarch64-apple-darwin"
 PROFILE="${EXT4_RUST_PROFILE:-release}"
@@ -23,26 +26,26 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-cd "$ROOT"
+cd "$WORKSPACE"
 if [ "$PROFILE" = "release" ]; then
     cargo build -p ext4-ffi --release --target "$TARGET"
-    OUT_DIR="$ROOT/target/$TARGET/release"
+    OUT_DIR="$WORKSPACE/target/$TARGET/release"
 else
     cargo build -p ext4-ffi --target "$TARGET"
-    OUT_DIR="$ROOT/target/$TARGET/debug"
+    OUT_DIR="$WORKSPACE/target/$TARGET/debug"
 fi
 
 mkdir -p "$VENDOR/lib" "$VENDOR/include"
 
 if command -v cbindgen >/dev/null 2>&1; then
-    cbindgen --quiet --config crates/ext4-ffi/cbindgen.toml --crate ext4-ffi \
-        --output crates/ext4-ffi/include/ext4_ffi.h
+    cbindgen --quiet --config "$FFI/cbindgen.toml" --crate ext4-ffi \
+        --output "$FFI/include/ext4_ffi.h"
 else
     echo "warning: cbindgen not found; using the checked-in header" >&2
 fi
 
 cp -f "$OUT_DIR/libext4_ffi.a" "$VENDOR/lib/libext4_ffi.a"
-cp -f crates/ext4-ffi/include/ext4_ffi.h "$VENDOR/include/ext4_ffi.h"
+cp -f "$FFI/include/ext4_ffi.h" "$VENDOR/include/ext4_ffi.h"
 cat > "$VENDOR/include/module.modulemap" <<'EOF'
 module Ext4FFI {
     header "ext4_ffi.h"

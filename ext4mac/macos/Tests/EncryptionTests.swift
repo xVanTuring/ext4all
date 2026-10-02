@@ -3,13 +3,13 @@ import XCTest
 
 /// LUKS volumes and fscrypt folders through the Swift bridge and the
 /// extension's `Unlocker`, with the images Linux made for the engine's
-/// tests (crates/ext4-core/tests/fixtures/crypt).
+/// tests (ext4-core/crates/ext4-core/tests/fixtures/crypt).
 final class EncryptionTests: XCTestCase {
     /// Unpack a fixture into a temporary file.
     func fixture(_ name: String) throws -> String {
         let src = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("../../crates/ext4-core/tests/fixtures/crypt/\(name).img.gz")
+            .appendingPathComponent("../../../ext4-core/crates/ext4-core/tests/fixtures/crypt/\(name).img.gz")
             .standardizedFileURL
         try XCTSkipUnless(FileManager.default.fileExists(atPath: src.path), "fixtures not found")
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ext4kit-crypt-\(UUID().uuidString)")

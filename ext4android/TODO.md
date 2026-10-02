@@ -6,17 +6,14 @@
 
 - 在红米 Note 11 Pro 上安装，跑自检和 USB 检测（iQOO 15、小米 Pad 6 已通过）。
 
-## M1、M2 剩下的真机测试（iQOO 15）
+## M1、M2 的后续
 
-- 导入一个视频，用其他播放器打开，拖动进度正常；图片能被相册类 App 打开。
-- 在系统文件管理器（DocumentsUI）的界面里新建文件夹、改名、删除、移动、复制；从手机存储复制文件进来，再复制出去。
-- 用文本编辑器打开文件、修改、保存。
 - `androidTest` 仪器测试：需要模拟器镜像或真机，以及 AndroidX Test 依赖（要下载）。
 - 写入时 `onGetSize` 每次都查询 Rust；如果代理文件描述符因此太慢，改为在 Kotlin 里缓存大小。
 
 ## 厂商选择器（M3 之后处理）
 
-- vivo OriginOS 6 用自己的选择器响应其他 App 的“打开文件”（`ACTION_OPEN_DOCUMENT`、`ACTION_GET_CONTENT`），里面看不到第三方存储。可选做法：App 内加文件浏览，用“打开方式”“分享”把文件交给其他 App；或实测能否把默认选择器改回 DocumentsUI。小米 HyperOS 也要实测。
+- vivo OriginOS 6 用自己的选择器响应其他 App 的“打开文件”（`ACTION_OPEN_DOCUMENT`、`ACTION_GET_CONTENT`），里面看不到第三方存储；只指定 DocumentsUI 包名的 intent 也被改送到它，只有写明 DocumentsUI 的 Activity 才行。可选做法：App 内加文件浏览，用“打开方式”“分享”把文件交给其他 App；或实测能否把默认选择器改回 DocumentsUI。小米 HyperOS 也要实测。
 
 ## M3 USB
 

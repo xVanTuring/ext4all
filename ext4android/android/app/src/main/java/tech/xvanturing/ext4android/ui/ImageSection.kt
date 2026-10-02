@@ -1,6 +1,7 @@
 package tech.xvanturing.ext4android.ui
 
 import android.content.ActivityNotFoundException
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -46,7 +47,9 @@ private const val RANDOM_READ_BYTES = 4096
 /**
  * OpenDocument that starts in a given folder, in the system's own picker
  * (DocumentsUI): some vendors answer ACTION_OPEN_DOCUMENT with a picker of
- * their own that leaves out other apps' storage (vivo OriginOS 6).
+ * their own that leaves out other apps' storage. vivo OriginOS 6 does so
+ * even for an intent limited to the DocumentsUI package; only naming the
+ * activity reaches DocumentsUI.
  */
 private class OpenDocumentAt : ActivityResultContracts.OpenDocument() {
     var initial: Uri? = null
@@ -54,13 +57,16 @@ private class OpenDocumentAt : ActivityResultContracts.OpenDocument() {
     override fun createIntent(context: Context, input: Array<String>): Intent =
         super.createIntent(context, input).apply {
             initial?.let { putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) }
-            documentsUi(context)?.let { setPackage(it) }
+            documentsUi(context)?.let { component = it }
         }
 }
 
-/** The package of the system's DocumentsUI: the one picking folders. */
-private fun documentsUi(context: Context): String? =
-    Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).resolveActivity(context.packageManager)?.packageName
+/**
+ * The picker activity of the system's DocumentsUI: the one answering
+ * ACTION_OPEN_DOCUMENT_TREE also answers ACTION_OPEN_DOCUMENT.
+ */
+private fun documentsUi(context: Context): ComponentName? =
+    Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).resolveActivity(context.packageManager)
 
 /**
  * Debug tools for milestone M1 and experiment 3: a sample image, mounted

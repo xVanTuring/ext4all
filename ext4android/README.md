@@ -4,7 +4,7 @@
 
 文件系统部分复用同仓库的 [`ext4-core`](../ext4-core)（纯 Rust，macOS 版 [Ext4Kit](../ext4mac) 也用它）。
 
-状态：M0–M2 完成，并在 iQOO 15 上测过（视频播放器、文本编辑器、系统文件管理器界面的手动测试还没做）；下一步是 M3（USB 盘接入文档提供者）。见 [docs/design.md](docs/design.md) 和 [TODO.md](TODO.md)。
+状态：M0–M2 完成，并在 iQOO 15 上测过；下一步是 M3（USB 盘接入文档提供者）。见 [docs/design.md](docs/design.md) 和 [TODO.md](TODO.md)。
 
 ## 已完成的部分
 
@@ -29,6 +29,8 @@
 - DocumentsUI 里出现卷（标题为卷标，副标题“ext4 · 可用 …”），目录列表、特殊文件名（`100%.txt`、非 UTF-8 的名字显示为 U+FFFD）、经过链接的目录和文件都正常，断开的、指向绝对路径的、循环的链接和 FIFO 不显示。
 - 写操作测试 14 步全部通过：新建文件夹和文件（按 MIME 类型补扩展名）、`wt` 写入 3 MiB 并读回、`w` 截断、`rw` 原地改写、`wt` 截断、`wa` 追加、中文改名、复制、移动、列目录、递归删除。
 - 写过的镜像拉回 Mac，`e2fsck -fn` 干净。
+- 导入卷里的 38 MB 视频，在 DocumentsUI 里选中后用其他播放器打开，播放和来回拖动进度都流畅，日志里没有读取错误。
+- Material Files 通过“授权文件夹”（`ACTION_OPEN_DOCUMENT_TREE`）接入卷：从手机存储复制照片进来、删除文件、用它的文本编辑器修改并保存 `README.txt` 都正常；之后 `e2fsck -fn` 干净，`debugfs` 读出的内容和改动一致。
 - vivo OriginOS 6 上，其他 App 的“打开文件”默认弹出 vivo 自己的选择器，看不到本 App 的卷（见 TODO）。
 
 ## M0 已有结论

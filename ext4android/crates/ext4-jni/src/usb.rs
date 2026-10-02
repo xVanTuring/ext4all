@@ -81,14 +81,12 @@ impl<T: Transport> BlockDevice for Window<T> {
 const MIB: u64 = 1 << 20;
 /// Bytes read for each speed measurement.
 const SPEED_BYTES: u64 = 16 * MIB;
-/// (bytes per READ command, bytes per bulk transfer)
-const SPEED_CASES: [(usize, usize); 5] = [
-    (64 << 10, 64 << 10),
-    (256 << 10, 64 << 10),
-    (1 << 20, 64 << 10),
-    (1 << 20, 256 << 10),
-    (1 << 20, 1 << 20),
-];
+/// Bytes per READ command while measuring.
+const SPEED_COMMAND: usize = 1 << 20;
+/// Bulk transfer sizes to measure, each [`SPEED_RUNS`] times: whether
+/// ENOMEM comes every time or only now and then.
+const SPEED_TRANSFERS: [usize; 4] = [16 << 10, 32 << 10, 64 << 10, 128 << 10];
+const SPEED_RUNS: usize = 3;
 const LIST_LIMIT: usize = 12;
 
 /// Identify the disk, read its partition table, mount every ext2/3/4
@@ -183,21 +181,35 @@ pub fn probe<T: Transport + 'static>(t: T) -> String {
         Err(e) => format!("failed: {e}"),
     });
 
-    let _ = writeln!(out, "\nread speed ({} MiB from the start of the disk):", SPEED_BYTES / MIB);
+    let _ = writeln!(
+        out,
+        "transfers so far: {} KiB, halved {} times after ENOMEM",
+        disk.max_transfer() >> 10,
+        disk.transfer_shrinks()
+    );
+
+    let _ = writeln!(
+        out,
+        "\nread speed ({} MiB from the start of the disk per run, {} KiB commands):",
+        SPEED_BYTES / MIB,
+        SPEED_COMMAND >> 10
+    );
     let total = SPEED_BYTES.min(info.size() / bs as u64 * bs as u64);
-    for (command, transfer) in SPEED_CASES {
-        disk.set_command_bytes(command);
-        disk.set_max_transfer(transfer);
-        let _ = writeln!(
-            out,
-            "  {:>4} KiB commands, {:>4} KiB transfers: {}",
-            command >> 10,
-            transfer >> 10,
-            match read_speed(&disk, total) {
-                Ok(mbs) => format!("{mbs:.1} MB/s"),
-                Err(e) => format!("failed: {e}"),
-            }
-        );
+    disk.set_command_bytes(SPEED_COMMAND);
+    for transfer in SPEED_TRANSFERS {
+        let runs: Vec<String> = (0..SPEED_RUNS)
+            .map(|_| {
+                disk.set_max_transfer(transfer);
+                match read_speed(&disk, total) {
+                    Ok(mbs) if disk.max_transfer() < transfer => {
+                        format!("{mbs:.1} MB/s (ENOMEM, ran at {} KiB)", disk.max_transfer() >> 10)
+                    }
+                    Ok(mbs) => format!("{mbs:.1} MB/s"),
+                    Err(e) => format!("failed: {e}"),
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "  {:>3} KiB transfers: {}", transfer >> 10, runs.join(" | "));
     }
     out
 }
@@ -340,7 +352,20 @@ mod tests {
         assert!(report.contains("mounted read-only"), "{report}");
         assert!(report.contains("movie.mkv"), "{report}");
         assert!(report.contains("SYNCHRONIZE CACHE: supported"), "{report}");
-        assert_eq!(report.matches(" MB/s").count(), SPEED_CASES.len(), "{report}");
+        assert!(report.contains("halved 0 times"), "{report}");
+        assert_eq!(report.matches(" MB/s").count(), SPEED_TRANSFERS.len() * SPEED_RUNS, "{report}");
+        assert!(!report.contains("ENOMEM,"), "{report}");
+    }
+
+    #[test]
+    fn probe_falls_back_when_the_kernel_has_no_memory_for_large_transfers() {
+        let mut sim = sim_disk();
+        sim.enomem_above = Some(40 << 10);
+        let report = probe(sim);
+        assert!(report.contains("movie.mkv"), "{report}");
+        // 16 and 32 KiB work; 64 and 128 KiB fall back to 32 KiB every run
+        assert!(report.contains("  16 KiB transfers: ") && !report.contains("failed"), "{report}");
+        assert_eq!(report.matches("ENOMEM, ran at 32 KiB").count(), 2 * SPEED_RUNS, "{report}");
     }
 
     #[test]

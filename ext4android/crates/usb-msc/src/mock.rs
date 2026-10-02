@@ -27,8 +27,18 @@ pub struct MockTransport {
     queue: VecDeque<Item>,
     out_error: Option<Error>,
     class_in_stall: bool,
+    /// Bulk transfers longer than this fail with ENOMEM, like usbdevfs
+    /// when the kernel cannot allocate their buffer.
+    pub enomem_above: Option<usize>,
     pub events: Vec<Event>,
     pub written: Vec<u8>,
+}
+
+fn no_memory(limit: Option<usize>, len: usize) -> Result<()> {
+    match limit {
+        Some(l) if len > l => Err(Error::Os(12)),
+        _ => Ok(()),
+    }
 }
 
 impl MockTransport {
@@ -38,6 +48,7 @@ impl MockTransport {
             queue: VecDeque::new(),
             out_error: None,
             class_in_stall: false,
+            enomem_above: None,
             events: Vec::new(),
             written: Vec::new(),
         }
@@ -70,12 +81,14 @@ impl Transport for MockTransport {
         if let Some(e) = self.out_error.take() {
             return Err(e);
         }
+        no_memory(self.enomem_above, data.len())?;
         self.events.push(Event::Out(data.len()));
         self.written.extend_from_slice(data);
         Ok(data.len())
     }
 
     fn bulk_in(&mut self, buf: &mut [u8], _timeout: Duration) -> Result<usize> {
+        no_memory(self.enomem_above, buf.len())?;
         match self.queue.front_mut() {
             None => Err(Error::Timeout),
             Some(Item::Stall) => {
@@ -116,6 +129,10 @@ impl Transport for MockTransport {
     fn max_transfer(&self) -> usize {
         self.max
     }
+
+    fn set_max_transfer(&mut self, bytes: usize) {
+        self.max = bytes;
+    }
 }
 
 enum Phase {
@@ -144,6 +161,9 @@ pub struct SimDisk {
     pub attention_on_io: bool,
     /// Capacity to report in place of the size of `data`.
     pub capacity_override: Option<u64>,
+    /// Bulk transfers longer than this fail with ENOMEM.
+    pub enomem_above: Option<usize>,
+    max_transfer: usize,
     pub commands: Vec<u8>,
 }
 
@@ -163,6 +183,8 @@ impl SimDisk {
             syncs: 0,
             attention_on_io: false,
             capacity_override: None,
+            enomem_above: None,
+            max_transfer: 16 * 1024,
             commands: Vec::new(),
         }
     }
@@ -285,6 +307,7 @@ impl SimDisk {
 
 impl Transport for SimDisk {
     fn bulk_out(&mut self, data: &[u8], _timeout: Duration) -> Result<usize> {
+        no_memory(self.enomem_above, data.len())?;
         match &mut self.phase {
             Phase::Command => {
                 assert_eq!(data.len(), CBW_LEN, "expected a CBW");
@@ -310,6 +333,7 @@ impl Transport for SimDisk {
     }
 
     fn bulk_in(&mut self, buf: &mut [u8], _timeout: Duration) -> Result<usize> {
+        no_memory(self.enomem_above, buf.len())?;
         match &mut self.phase {
             Phase::DataIn(b) => {
                 let n = buf.len().min(b.len());
@@ -344,6 +368,10 @@ impl Transport for SimDisk {
     }
 
     fn max_transfer(&self) -> usize {
-        16 * 1024
+        self.max_transfer
+    }
+
+    fn set_max_transfer(&mut self, bytes: usize) {
+        self.max_transfer = bytes;
     }
 }

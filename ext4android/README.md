@@ -6,6 +6,12 @@
 
 状态：M0（工具链、骨架、先行实验）进行中，见 [docs/design.md](docs/design.md) 和 [TODO.md](TODO.md)。
 
+## 已完成的部分
+
+- `crates/usb-msc`：USB 大容量存储（Bulk-Only 传输 + SCSI），经 usbdevfs 收发；ENOMEM 时自动减小单次传输。用模拟传输和模拟磁盘做单元测试。
+- `../ext4-core/crates/part`：GPT（主表头损坏时用备份）、MBR（含逻辑分区）、无分区表。
+- `crates/ext4-jni`：自检和 USB 检测（只读）。
+
 ## M0 已有结论
 
 在小米 Pad 6 上（HyperOS 2.0，Android 14，内核 4.19；App 没有使用 root）：
@@ -13,7 +19,8 @@
 - 原生库加载正常，自检（在内存里格式化、写入、重新挂载、读回）通过。
 - App 能对 `UsbDeviceConnection` 的文件描述符执行 usbdevfs ioctl：在一块 RTL9210 NVMe 硬盘盒上完成了识别、读 GPT、只读挂载 ext4、列出根目录、刷新缓存。
 - 系统已检测到这个盘并发出通知后，`claimInterface(intf, true)` 仍能取得接口。
-- 单次 64 KiB 以上的同步传输失败，返回 ENOMEM；小块读取正常。原因和对策见 TODO。
+- 同步传输越大，越容易返回 ENOMEM（内核每次要为传输申请一块连续内存）：每种大小测 3 次，128 KiB 每次都失败，64 KiB 失败 1 次，16、32 KiB 没有失败过。遇到 ENOMEM 时自动把单次传输减半重试，读取不再出错。
+- 读速度约 100–200 MB/s（RTL9210 NVMe 硬盘盒，每次测量读 16 MiB，波动较大）。
 
 ## 构建
 

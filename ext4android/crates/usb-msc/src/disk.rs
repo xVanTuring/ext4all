@@ -94,6 +94,17 @@ impl<T: Transport> Disk<T> {
         self.lock().transport_mut().set_max_transfer(n);
     }
 
+    /// The transfer size in use: smaller than the one set after the
+    /// kernel ran out of memory for it.
+    pub fn max_transfer(&self) -> usize {
+        self.lock().transport().max_transfer()
+    }
+
+    /// Times a transfer was halved after ENOMEM.
+    pub fn transfer_shrinks(&self) -> u32 {
+        self.lock().shrinks()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Bot<T>> {
         self.bot.lock().unwrap_or_else(|e| e.into_inner())
     }

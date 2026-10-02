@@ -26,6 +26,13 @@ impl Error {
         // ENODEV, ESHUTDOWN
         matches!(self, Error::Os(19) | Error::Os(108))
     }
+
+    /// ENOMEM: the kernel could not allocate the buffer of a transfer
+    /// (usbdevfs needs one contiguous buffer per synchronous transfer);
+    /// nothing was sent or received.
+    pub fn is_out_of_memory(&self) -> bool {
+        matches!(self, Error::Os(12))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

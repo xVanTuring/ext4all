@@ -5,7 +5,8 @@
 //! Errors follow the specification's recovery: a stalled data phase clears
 //! the halt and still reads the status; a broken exchange (bad CSW, phase
 //! error, failed transfer) runs the reset recovery so the next command
-//! starts clean.
+//! starts clean. A data transfer the kernel has no buffer for (ENOMEM) has
+//! not started, so it is retried at half the size instead.
 
 use crate::{Error, Result, Transport};
 use std::time::Duration;
@@ -25,6 +26,10 @@ const STATUS_FAILED: u8 = 1;
 
 /// Timeout of the command and status transfers.
 const WRAPPER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Smallest data transfer to fall back to after ENOMEM: one page, a
+/// multiple of every bulk packet size.
+pub const MIN_TRANSFER: usize = 4096;
 
 pub fn encode_cbw(tag: u32, data_len: u32, inbound: bool, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
     assert!((1..=16).contains(&cdb.len()), "CDB length {}", cdb.len());
@@ -78,11 +83,32 @@ pub struct Bot<T: Transport> {
     t: T,
     tag: u32,
     lun: u8,
+    /// Times a data transfer was halved after ENOMEM.
+    shrinks: u32,
 }
 
 impl<T: Transport> Bot<T> {
     pub fn new(t: T) -> Bot<T> {
-        Bot { t, tag: 0, lun: 0 }
+        Bot {
+            t,
+            tag: 0,
+            lun: 0,
+            shrinks: 0,
+        }
+    }
+
+    pub fn shrinks(&self) -> u32 {
+        self.shrinks
+    }
+
+    /// Half of `want` (whole pages, at least [`MIN_TRANSFER`]), also used
+    /// for later commands.
+    fn shrink(&mut self, want: usize) -> usize {
+        let n = (want / 2 / MIN_TRANSFER * MIN_TRANSFER).max(MIN_TRANSFER);
+        log::warn!("no kernel memory for a {want}-byte transfer; using {n}-byte transfers");
+        self.t.set_max_transfer(n);
+        self.shrinks += 1;
+        n
     }
 
     pub fn transport(&self) -> &T {
@@ -145,7 +171,7 @@ impl<T: Transport> Bot<T> {
             Err(e) => return self.fail(e),
         }
 
-        let max = self.t.max_transfer().max(512);
+        let mut max = self.t.max_transfer().max(512);
         let mut transferred = 0;
         let mut early = None;
         match data {
@@ -176,6 +202,7 @@ impl<T: Transport> Bot<T> {
                             }
                             break;
                         }
+                        Err(e) if e.is_out_of_memory() && want > MIN_TRANSFER => max = self.shrink(want),
                         Err(e) => return self.fail(e),
                     }
                 }
@@ -196,6 +223,7 @@ impl<T: Transport> Bot<T> {
                             }
                             break;
                         }
+                        Err(e) if e.is_out_of_memory() && want > MIN_TRANSFER => max = self.shrink(want),
                         Err(e) => return self.fail(e),
                     }
                 }
@@ -257,6 +285,41 @@ mod tests {
         b.extend_from_slice(&residue.to_le_bytes());
         b.push(status);
         b
+    }
+
+    #[test]
+    fn out_of_kernel_memory_halves_transfers_within_the_command() {
+        let mut m = MockTransport::new(65536);
+        m.enomem_above = Some(20_000);
+        m.push_in((0..100_000u32).map(|i| i as u8).collect());
+        m.push_csw(csw(1, 0, 0));
+        let mut bot = Bot::new(m);
+        let mut buf = vec![0u8; 100_000];
+        let o = bot.command(&[0x28; 10], Data::In(&mut buf), WRAPPER_TIMEOUT).unwrap();
+        assert_eq!(o, Outcome { transferred: 100_000, passed: true });
+        assert_eq!(buf[99_999], 99_999u32 as u8);
+        assert_eq!((bot.shrinks(), bot.t.max_transfer()), (2, 16384));
+        assert!(!bot.t.events.contains(&Event::Reset));
+
+        // the smaller size is kept for the next command, writes too
+        bot.t.push_csw(csw(2, 0, 0));
+        bot.t.enomem_above = Some(9000);
+        let data = vec![5u8; 20_000];
+        let o = bot.command(&[0x2A; 10], Data::Out(&data), WRAPPER_TIMEOUT).unwrap();
+        assert_eq!(o, Outcome { transferred: 20_000, passed: true });
+        assert_eq!((bot.shrinks(), bot.t.max_transfer()), (3, 8192));
+    }
+
+    #[test]
+    fn out_of_kernel_memory_at_the_smallest_transfer_fails() {
+        let mut m = MockTransport::new(8192);
+        m.enomem_above = Some(1000);
+        let mut bot = Bot::new(m);
+        let mut buf = vec![0u8; 8192];
+        let e = bot.command(&[0x28; 10], Data::In(&mut buf), WRAPPER_TIMEOUT).unwrap_err();
+        assert!(e.is_out_of_memory(), "{e}");
+        assert_eq!(bot.t.max_transfer(), MIN_TRANSFER);
+        assert!(bot.t.events.contains(&Event::Reset));
     }
 
     #[test]

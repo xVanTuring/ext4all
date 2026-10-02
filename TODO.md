@@ -14,9 +14,13 @@
 
 ## 加密
 
-- **ext4 目录加密（fscrypt）的无密钥显示**：现在加密目录里的文件名是密文字节，可能含有 macOS 不允许的字符。应像 Linux 一样显示为 Base64 编码的名字，加密文件的内容读取返回“无权限”而不是密文。
-- **fscrypt 解密**（可选）：用户提供密钥（Linux 桌面 `fscrypt` 工具的口令或原始密钥）后可读写。安卓的密钥由硬件保管，无法支持。
-- **LUKS 整盘加密**：识别 LUKS1/LUKS2 分区，输入口令后解密并挂载里面的 ext4。需要实现 LUKS2 头解析、Argon2id/PBKDF2 密钥派生和 AES-XTS，还要解决口令输入方式（宿主 App 或钥匙串）。工作量大。
+- **加密功能的系统实测**：引擎、C 接口、Swift 桥接和解锁逻辑都已测试，但还没在安装好的签名版本里试过。App 和扩展新增了钥匙串共享权限，签名需要 Xcode 里登录开发者账号（目前账号有新协议待同意）。安装后用磁盘镜像（`crates/ext4-core/tests/fixtures/crypt`）验证：
+  - 扩展能否读写共享钥匙串；
+  - 没有密钥的 LUKS 盘探测为“可识别”后，添加口令再推出、重新连接（或 `diskutil mount`）能否挂载；
+  - fscrypt 文件夹在 Finder 里的显示，加密文件确实不走内核直通 I/O；
+  - 顺便确认拷贝带扩展属性的文件后不产生 `._` 文件，以及超过 4 KB 的资源分支的表现。
+- **添加口令后自动重新挂载**：现在需要用户推出再重新连接。实测确定沙盒 App 能否通过 DiskArbitration 让系统重新探测、挂载已连接的磁盘。
+- **LUKS 首次解锁提速**：Argon2 目前单线程，cryptsetup 默认参数约 5.6 秒；按 lane 并行（cryptsetup 用 4 线程）可缩短到约一半以下。
 
 ## 只读特性改为可写
 
@@ -25,8 +29,9 @@
 - **mmp**（多机挂载保护）：挂载期间定期更新 MMP 块。
 - **bigalloc**（簇分配）：分配器按簇工作。
 - **fast_commit 回放**：Linux 开启快速提交且未正常卸载的盘目前只能只读。
-- **casefold**（大小写不敏感目录）：可写需要 Unicode 规范化与大小写折叠表。
+- **casefold**（大小写不敏感目录）：可写需要 Unicode 规范化与大小写折叠表；同时加密的目录还要在目录项里写入 SipHash 哈希。
 
 ## 不计划支持
 
-- encrypt 卷在没有密钥时写入、verity 写入（Linux 也只读）、外部日志设备、compression、Linux ACL 与 macOS ACL 的相互转换（目前原样保留，对 macOS 隐藏）。
+- 没有密钥时在加密文件夹里新建、改名、建链接（Linux 也不允许；删除已支持）、verity 写入（Linux 也只读）、外部日志设备、compression、Linux ACL 与 macOS ACL 的相互转换（目前原样保留，对 macOS 隐藏）。
+- fscrypt 的 Adiantum、HCTR2、SM4 算法（安卓低端设备使用，其密钥本来就由硬件保管）；LUKS 的分离头、完整性校验（`--integrity`）、serpent/twofish 等算法。

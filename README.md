@@ -7,8 +7,9 @@ Mount, read and write Linux ext4 disks on macOS 27, built on **FSKit (Swift) and
 - Full read/write: create, delete, rename, hard links, symbolic links, device nodes; read, write, truncate, preallocate, punch holes; extended attributes; volume label
 - Crash consistency: a jbd2 journal (the same format Linux uses). Every metadata change is committed atomically as a transaction, and unfinished journals are replayed automatically at mount
 - Compatible with the defaults of modern Linux distributions: `metadata_csum`, `64bit`, `flex_bg`, `extent`, htree directories, `orphan_file`, `inline_data` and more
-- ext3 and ext2 (indirect block maps) are read/write as well; volumes with features such as `bigalloc`, `quota`, `encrypt` or `casefold` are mounted **read-only**
+- ext3 and ext2 (indirect block maps) are read/write as well; volumes with features such as `bigalloc`, `quota` or `casefold` are mounted **read-only**
 - Formatting: erase disks as ext4 right on the Mac (`diskutil`, Disk Utility, `newfs_fskit`), with the same result as Linux's mke2fs
+- Encryption: folders encrypted with fscrypt (the Linux `fscrypt` tool, `fscryptctl`, Android) and whole disks encrypted with LUKS1/LUKS2 (cryptsetup). Without the key, encrypted folders show the same coded names as on Linux; passphrases and keys are added in the app and kept in the keychain
 
 ## Architecture
 
@@ -26,6 +27,9 @@ FSKit ──XPC──▶ Ext4FS.appex (Swift, macos/Ext4FS)
                   ├─ journal/  jbd2 replay (csum v2/v3, revoke) and commits
                   ├─ cache.rs  metadata block cache (dirty blocks pinned until commit)
                   ├─ mkfs.rs   creating new file systems
+                  ├─ crypto/   AES modes (XTS, CBC-CTS, CBC-ESSIV), SipHash, base64
+                  ├─ fscrypt/  encryption contexts, key derivation, names, fscrypt tool protectors
+                  ├─ luks/     LUKS1/LUKS2 headers, key slots, decrypting block device
                   └─ fs/       mounting, allocator, extent trees, directories (linear + htree), file I/O, orphan inodes
 ```
 
@@ -123,6 +127,41 @@ cargo run -p ext4-tool -- disk.img mkfs -L DATA
 - Inode tables are not zeroed except in group 0 (the same lazy initialization mke2fs uses on Linux), so large disks take seconds; most of the time goes into zeroing the journal (at most 1 GiB).
 - After `newfs_fskit` the system may still remember an earlier "not recognized" probe result, so the disk mounts automatically only after replugging it; erasing with `diskutil` mounts by itself.
 
+### Encrypted disks
+
+Two kinds of Linux encryption are supported:
+
+- **fscrypt** (the `encrypt` feature): single folders are encrypted; the rest of the disk is plain. Used by the Linux `fscrypt` tool, `fscryptctl` and Android. Supported: v1 and v2 policies, AES-256-XTS and AES-128-CBC-ESSIV contents, AES-256-CTS and AES-128-CTS names, every name padding, the IV_INO_LBLK_64/32 flags and data units smaller than a block. Adiantum, HCTR2 and SM4 behave as if the key were missing.
+- **LUKS1 and LUKS2** (cryptsetup): the whole partition is encrypted, with the ext4 inside. Supported: `aes-xts-plain64` (the cryptsetup default), `aes-xts-plain`, `aes-cbc-essiv:sha256` and `aes-cbc-plain64`, 512 to 4096-byte sectors, key slots with PBKDF2, Argon2i or Argon2id, key files. Not supported: detached headers, authenticated encryption (`--integrity`), a re-encryption in progress, other ciphers (serpent, twofish).
+
+**Without the key** an fscrypt folder looks as it does on Linux without the key: names are shown in coded form (base64url of the encrypted name, identical to what `ls` shows on Linux), symlink targets likewise, reading a file fails with "Permission denied", and files and empty folders can be deleted. Creating, renaming and linking inside need the key. A LUKS disk without its key is recognized but not mounted.
+
+**Adding keys**: open Ext4Kit and add passphrases or key files under "Encrypted disks". When an encrypted disk is mounted, the extension tries them:
+
+- a LUKS passphrase or key file opens the matching key slot;
+- a passphrase opens the passphrase protectors that the `fscrypt` tool keeps in `/.fscrypt` on that disk; a 32-byte key file opens its raw-key protectors;
+- a key file holding a 16 to 64-byte fscrypt master key (binary, or as hexadecimal text, as made by `fscryptctl`) is added as is.
+
+What opens a disk is then remembered for that disk (the LUKS volume key, or the fscrypt master keys), so later mounts need no key derivation; the first unlock of a LUKS disk takes seconds (about 5.6 s and 870 MB of memory with cryptsetup's default Argon2id settings, measured on Apple Silicon; the derivation runs single-threaded). Keys are loaded when a disk is mounted: after adding a key to a disk that is already connected, eject and reconnect it. The same works from Terminal:
+
+```bash
+APP=/Applications/Ext4Kit.app/Contents/MacOS/Ext4Kit
+$APP add-passphrase                   # asks for the passphrase without showing it
+$APP add-key-file mykey < ~/mykey.bin # key files come on standard input
+$APP list                             # entries, with ids
+$APP remove secret:…                  # remove a passphrase, key file or remembered disk key
+```
+
+Notes:
+
+- Everything is kept in the data protection keychain, in an access group shared only by the app and its extension, for this Mac only (never synchronized). A remembered LUKS volume key keeps opening the disk even after its passphrase is changed on Linux; remove it in the app to forget the disk.
+- Login passphrase protectors of a Linux system disk are stored on that system's root file system, not on the external disk, so they cannot be used here; add a custom passphrase protector on Linux (`fscrypt metadata add-protector-to-policy`) or use the raw key. Android keeps its file encryption keys in the device's hardware: such folders stay locked.
+- File data of encrypted files and of LUKS volumes always passes through the extension (never kernel offloaded I/O, which would move ciphertext).
+- Extended attributes are not encrypted by fscrypt (as on Linux).
+- Not yet tested in an installed, signed build: the keychain storage and the extension's unlocking at mount time (the unlocking logic itself is tested with an in-memory store; see TODO.md).
+
+`ext4-tool` accepts the same keys for images: `--key HEX`, `--key-file FILE`, `--passphrase TEXT` (fscrypt protectors), `--luks-passphrase TEXT`, `--luks-key HEX`, plus `crypt-status PATH`, `encrypt PATH` (encrypt an empty folder) and `luks-dump`.
+
 Distributing builds to others needs Developer ID signing and notarization.
 
 ## Testing
@@ -136,7 +175,8 @@ Distributing builds to others needs Developer ID signing and notarization.
 | Random model tests | proptest operation sequences against an in-memory model, htree splits of large directories | `cargo test -p ext4-core --test random` |
 | Soak | 800 random power-loss seeds | `cargo test --release -p ext4-core --test crash -- --ignored` |
 | FFI / CLI | Full C ABI lifecycle, sector alignment, concurrency, periodic commits; the command-line tool | `cargo test -p ext4-ffi -p ext4-tool` |
-| Swift | Bridge, FSKit attribute conversion, handler calls | `xcodebuild ... -scheme Ext4KitTests test` |
+| Encryption | Images encrypted by Linux 7.2.8, the `fscrypt` tool and cryptsetup 2.8.8 (`scripts/make-crypt-fixtures.py`, run as root on Linux): every name shown without the key and every file with it match Linux, for seven fscrypt policies on 4K and 1K blocks, the tool's protectors and five LUKS volumes; our writes pass `e2fsck`; AES, XTS, CTS, SipHash and Argon2 reference vectors | `cargo test -p ext4-core --test crypt` |
+| Swift | Bridge, FSKit attribute conversion, handler calls, LUKS and fscrypt unlocking | `xcodebuild ... -scheme Ext4KitTests test` |
 | End to end | With the extension installed and enabled, real mounts of images for cp / rsync / xattrs / links / deletion, then e2fsck | `scripts/e2e-mount-test.sh` |
 | Formatting | Geometry and journal location compared with mke2fs; many sizes (including garbage-filled devices, an existing ext4 and a 64 GiB sparse image) pass e2fsck after formatting, mount and take writes in many groups; option parsing | `cargo test -p ext4-core --test mkfs` |
 | Random operations (real volume) | On a mounted volume: random overwrites, uncached writes, appends, truncation, extension, preallocation, memory-mapped writes, renames over other files, deletion; every round compared byte by byte with an in-memory model, remount every 3 rounds; run with and without kernel offloaded I/O | `python3 scripts/fsstress.py /Volumes/X/stress 1 15 diskNsM` |
@@ -166,6 +206,8 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 - **Block mappings for kernel offloaded I/O**: write mappings first allocate unwritten extents and zero partly covered new blocks; only when the kernel reports completion are they converted to written and the file grown, so a power loss never exposes stale data. The kernel caches the mappings it gets, writes through them later and asks again only for blocks it has no mapping for; so a mapping request starting past the end of file must not zero the rest of the last block (the kernel may be filling it in the same write; an early version lost data this way). The kernel zero-fills the gap of an extending write itself; leftovers of a failed write in the last block are cleared by the extension.
 - **Kernel data caching**: FSKit's `DataCacheHandler` is not implemented. Measured: explicitly granting write-back caching behaves exactly like not implementing it (the kernel caches reads and writes and coalesces writes anyway), except for an extra open and close request per file; write-through sends every write at once, making small appends over a hundred times slower; without caching the kernel reads and rewrites the whole file sector by sector on every append.
 - **Formatting through FSKit**: FSKit loads a device (with `-f`, as before mounting) before formatting it, so loading succeeds even without a usable ext4 file system: a placeholder volume is handed out that fails activation and checks with the original error. Running as root, `newfs_fskit` takes the user whose modules it may use from `SUDO_UID`; the format executable in `ext4.fs` sets it to the console user, because StorageKit runs it as root outside any user session.
+- **fscrypt**: names are translated at the edge of the engine. A lookup encrypts the name it is given (or decodes a no-key name back to the ciphertext) and compares ciphertexts; htree directories hash the ciphertext, as Linux does, so encrypted directories keep their indexes. Each encrypted inode's key is derived from its context (HKDF-SHA512 for v2, AES-ECB of the master key for v1) and cached. Contents are encrypted per data unit (the block, or the policy's smaller unit); partial blocks, truncation and hole punching decrypt, modify and re-encrypt the block. New files take their directory's policy with a fresh random nonce and are never stored inline, as on Linux.
+- **LUKS**: the decrypted volume is a block device under the engine: reads decrypt whole sectors, writes encrypt them (partial sectors are read, modified and written whole). The IV of a sector is its number in 512-byte units plus the segment's IV tweak, also for 4K sectors, as dm-crypt does for LUKS2.
 
 ## Measurements (macOS 27, Apple Silicon)
 
@@ -197,6 +239,8 @@ Correctness was also checked with the SD card of an RK3399 board (written by the
 
 Formatting was checked against the Linux kernel: a 3 GB image formatted by this project passed `e2fsck` in an Arch Linux ARM virtual machine (kernel 5.18, e2fsprogs 1.46.5), stayed clean after the kernel mounted it and wrote about 3,600 files and 300 MB of data, and back on the Mac all 2,430 files written by Linux read back through this engine with identical SHA-256 sums.
 
+Encryption was checked in both directions against Linux 7.2.8 (e2fsprogs 1.47.4, cryptsetup 2.8.8): in every fscrypt policy of the test images, files, folders, short and long symlinks and renames written on the Mac read back correctly with the Linux kernel, folders encrypted on the Mac (v1 and v2 policies) opened with their keys on Linux, and Linux `e2fsck` stayed clean, also after Linux wrote into those folders; files written on the Mac into LUKS1 (XTS, CBC-ESSIV) and LUKS2 (Argon2, PBKDF2, 4K sectors) volumes read back correctly after `cryptsetup open`.
+
 **Capacity**: as on Linux, the total excludes metadata (inode tables, journal, ...). mke2fs reserves 5% for root by default; that space counts as free but not available, and Finder shows it as "used". For data-only disks, run `sudo tune2fs -m 0 /dev/diskNsM` while unmounted to drop the reserve. Note that e2fsprogs must use the block device `/dev/diskNsM` to modify an existing file system: the raw device `/dev/rdiskNsM` requires sector-aligned I/O and `tune2fs` fails with `Invalid argument` when writing the superblock.
 
 **Vendor partition types**: board images (e.g. Rockchip) often use vendor-specific partition type GUIDs, which macOS does not probe (Linux desktops do not mount them automatically either). To mount by hand, note that FSKit extensions are enabled per user, so `sudo mount` does not work; give the device to your user first:
@@ -220,7 +264,7 @@ mkdir -p ~/mnt/sd && mount -F -t ext4 disk4s9 ~/mnt/sd
   ```
 - `fcntl(F_LOG2PHYS)` / `F_LOG2PHYS_EXT` return "not supported" on FSKit volumes (the kernel does not forward them to the extension), with kernel offloaded I/O as well.
 - Files on ext2/ext3 cannot be preallocated (`fallocate`; as on Linux, block maps cannot express unwritten blocks).
-- Read-only: volumes with features such as `bigalloc`, `quota`, `encrypt`, `casefold`, `verity`, `ea_inode` or `mmp` can be read but not written. Planned work is listed in [TODO.md](TODO.md) (in Chinese).
+- Read-only: volumes with features such as `bigalloc`, `quota`, `casefold`, `verity`, `ea_inode` or `mmp` can be read but not written. Planned work is listed in [TODO.md](TODO.md) (in Chinese).
 
 ## License
 

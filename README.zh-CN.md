@@ -7,8 +7,9 @@
 - 完整读写：创建 / 删除 / 重命名 / 硬链接 / 符号链接 / 设备节点、读写 / 截断 / 预分配 / 打洞、扩展属性、卷标
 - 崩溃一致性：实现 jbd2 日志（Linux 同格式），所有元数据修改以事务方式原子提交；挂载时自动回放未完成的日志
 - 兼容现代 Linux 默认格式：`metadata_csum`、`64bit`、`flex_bg`、`extent`、htree 目录、`orphan_file`、`inline_data` 等
-- ext3 / ext2（间接块映射）同样支持读写；含 `bigalloc`、`quota`、`encrypt`、`casefold` 等特性的卷以**只读**方式挂载
+- ext3 / ext2（间接块映射）同样支持读写；含 `bigalloc`、`quota`、`casefold` 等特性的卷以**只读**方式挂载
 - 格式化：在 Mac 上直接把磁盘抹成 ext4（`diskutil`、磁盘工具、`newfs_fskit`），结果与 Linux 的 mke2fs 一致
+- 加密：支持 fscrypt 加密的文件夹（Linux 的 `fscrypt` 工具、`fscryptctl`、安卓）和 LUKS1/LUKS2 整盘加密（cryptsetup）。没有密钥时，加密文件夹里的名字和 Linux 上显示的编码名字一样；口令和密钥在 App 里添加，保存在钥匙串中
 
 ## 架构
 
@@ -26,6 +27,9 @@ FSKit ──XPC──▶ Ext4FS.appex (Swift, macOS/Ext4FS)
                   ├─ journal/  jbd2 回放（csum v2/v3、revoke）与提交
                   ├─ cache.rs  元数据块缓存（脏块钉住到提交）
                   ├─ mkfs.rs   创建新的文件系统
+                  ├─ crypto/   AES 各模式（XTS、CBC-CTS、CBC-ESSIV）、SipHash、base64
+                  ├─ fscrypt/  加密上下文、密钥派生、文件名加解密、fscrypt 工具的保护器
+                  ├─ luks/     LUKS1/LUKS2 头、密钥槽、解密块设备
                   └─ fs/       挂载、分配器、extent 树、目录（线性 + htree）、文件读写、孤儿 inode
 ```
 
@@ -123,6 +127,41 @@ cargo run -p ext4-tool -- disk.img mkfs -L DATA
 - 除第 0 组外不清零 inode 表（与 Linux 上 mke2fs 的延迟初始化相同），大盘几秒即可完成；主要耗时是清零日志（最大 1 GB）。
 - `newfs_fskit` 之后系统可能还记着“无法识别”的旧探测结果，需要重新插拔才会自动挂载；`diskutil` 抹盘会自己挂载。
 
+### 加密磁盘
+
+支持 Linux 的两种加密方式：
+
+- **fscrypt**（`encrypt` 特性）：只加密某些文件夹，磁盘其余部分不加密。Linux 的 `fscrypt` 工具、`fscryptctl` 和安卓都用它。支持 v1、v2 策略，内容加密 AES-256-XTS 和 AES-128-CBC-ESSIV，文件名加密 AES-256-CTS 和 AES-128-CTS，各种文件名填充长度，IV_INO_LBLK_64/32 标志，以及小于块大小的数据单元。Adiantum、HCTR2、SM4 按没有密钥处理。
+- **LUKS1 和 LUKS2**（cryptsetup）：整个分区加密，里面是 ext4。支持 `aes-xts-plain64`（cryptsetup 默认）、`aes-xts-plain`、`aes-cbc-essiv:sha256`、`aes-cbc-plain64`，512 到 4096 字节的扇区，使用 PBKDF2、Argon2i、Argon2id 的密钥槽，以及密钥文件。不支持：分离存放的 LUKS 头、带完整性校验的加密（`--integrity`）、正在重新加密的卷、其它算法（serpent、twofish）。
+
+**没有密钥时**，fscrypt 文件夹的表现和 Linux 上没有密钥时一样：文件名以编码形式显示（加密后文件名的 base64url 编码，和 Linux 上 `ls` 看到的完全相同），符号链接的目标也是这样；读取文件会报“权限不足”；文件和空文件夹可以删除。在里面新建、改名、建链接需要密钥。没有密钥的 LUKS 磁盘能被识别，但不会挂载。
+
+**添加密钥**：打开 Ext4Kit，在“加密磁盘”里添加口令或密钥文件。挂载加密磁盘时，扩展会依次尝试：
+
+- LUKS 的口令或密钥文件，用来打开对应的密钥槽；
+- 口令，用来打开 `fscrypt` 工具保存在该磁盘 `/.fscrypt` 里的口令保护器；32 字节的密钥文件，用来打开原始密钥保护器；
+- 内容是 16 到 64 字节 fscrypt 主密钥的密钥文件（二进制，或十六进制文本，例如 `fscryptctl` 生成的），直接作为密钥使用。
+
+打开某块磁盘的密钥会按磁盘记住（LUKS 的卷密钥，或 fscrypt 的主密钥），以后挂载不再需要运行密钥派生。LUKS 磁盘第一次解锁需要几秒钟：在 Apple Silicon 上实测，cryptsetup 默认的 Argon2id 参数约需 5.6 秒、870 MB 内存，因为密钥派生是单线程的。密钥在挂载时加载：给已经连接的磁盘添加密钥后，需要推出再重新连接。终端里也可以操作：
+
+```bash
+APP=/Applications/Ext4Kit.app/Contents/MacOS/Ext4Kit
+$APP add-passphrase                   # 输入口令时不显示
+$APP add-key-file mykey < ~/mykey.bin # 密钥文件从标准输入传入
+$APP list                             # 列出已保存的条目及其 id
+$APP remove secret:…                  # 删除口令、密钥文件或记住的磁盘密钥
+```
+
+说明：
+
+- 所有内容保存在数据保护钥匙串里，所在的访问组只有 App 和它的扩展能用，只保存在这台 Mac 上，不会同步。记住的 LUKS 卷密钥在 Linux 上修改口令后仍能打开磁盘；要让 Mac 忘记这块盘，在 App 里删除对应条目。
+- Linux 系统盘的登录口令保护器保存在那台系统的根文件系统里，不在外接盘上，所以这里无法使用；请在 Linux 上为策略添加一个自定义口令保护器（`fscrypt metadata add-protector-to-policy`），或使用原始密钥。安卓的文件加密密钥由设备硬件保管，这类文件夹会保持锁定。
+- 加密文件和 LUKS 卷的数据始终经过扩展处理，不使用内核直通 I/O（否则内核读写的是密文）。
+- fscrypt 不加密扩展属性（与 Linux 相同）。
+- 尚未在安装好的签名版本中实测：钥匙串存取，以及扩展在挂载时解锁（解锁逻辑本身用内存存储做了测试；见 TODO.md）。
+
+`ext4-tool` 对镜像文件也接受同样的密钥：`--key HEX`、`--key-file FILE`、`--passphrase TEXT`（fscrypt 保护器）、`--luks-passphrase TEXT`、`--luks-key HEX`，另有 `crypt-status PATH`、`encrypt PATH`（加密一个空文件夹）、`luks-dump` 命令。
+
 发布给他人使用时需 Developer ID 签名 + 公证。
 
 ## 测试
@@ -136,7 +175,8 @@ cargo run -p ext4-tool -- disk.img mkfs -L DATA
 | 随机模型测试 | proptest 随机操作序列对照内存模型，大目录 htree 分裂 | `cargo test -p ext4-core --test random` |
 | 长时间浸泡 | 800 个随机断电种子 | `cargo test --release -p ext4-core --test crash -- --ignored` |
 | FFI / CLI | C ABI 全流程、扇区对齐、并发、定时提交；命令行工具 | `cargo test -p ext4-ffi -p ext4-tool` |
-| Swift | 桥接层、FSKit 属性转换、Handler 调用 | `xcodebuild ... -scheme Ext4KitTests test` |
+| 加密 | 由 Linux 7.2.8、`fscrypt` 工具和 cryptsetup 2.8.8 生成的加密镜像（`scripts/make-crypt-fixtures.py`，在 Linux 上以 root 运行）：没有密钥时显示的每个名字、有密钥时的每个文件都与 Linux 一致，覆盖 4K、1K 块上的 7 种 fscrypt 策略、该工具的保护器和 5 个 LUKS 卷；我们写入后 `e2fsck` 干净；AES、XTS、CTS、SipHash、Argon2 公开测试向量 | `cargo test -p ext4-core --test crypt` |
+| Swift | 桥接层、FSKit 属性转换、Handler 调用、LUKS 与 fscrypt 解锁 | `xcodebuild ... -scheme Ext4KitTests test` |
 | 端到端 | 安装并启用扩展后，真实挂载镜像做 cp/rsync/xattr/链接/删除等，卸载后 e2fsck | `scripts/e2e-mount-test.sh` |
 | 格式化 | 与 mke2fs 对比几何参数和日志位置；各种大小（含随机数据填充、已有 ext4、64 GB 稀疏镜像）格式化后 e2fsck 干净、可挂载并在多个组里写入；选项解析 | `cargo test -p ext4-core --test mkfs` |
 | 随机操作（真实卷） | 在已挂载的卷上随机覆盖写、不经缓存写、追加、截断、扩展、预分配、内存映射写、改名覆盖、删除，每轮与内存模型逐字节比对，每 3 轮重新挂载；默认方式和内核直通 I/O 各跑一遍 | `python3 scripts/fsstress.py /Volumes/X/stress 1 15 diskNsM` |
@@ -166,6 +206,8 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 - **内核直通 I/O 的块映射**：写映射先分配未写入 extent，部分覆盖的新块先清零，内核报告完成后才转换为已写入并增长文件大小，断电不会暴露旧数据。内核会缓存拿到的映射，之后直接按缓存写盘、只为缺少映射的块再来请求；因此映射请求即使从文件末尾之后开始，也不能去清零末尾块的剩余部分（内核可能正在同一次写入里填充它，早期版本因此丢过数据）。扩展写入时的空隙由内核自己补零；写入失败时由扩展清理末尾块里的残留。
 - **内核数据缓存**：没有实现 FSKit 的 `DataCacheHandler`。实测显式授予写回缓存和不实现完全一样（内核本来就缓存读写并合并写入），只是每个文件多一次打开和关闭请求；写穿模式下每次写都立即下发，小块追加慢上百倍；不缓存模式下内核每追加一次就按扇区把整个文件从头读一遍、写一遍。
 - **通过 FSKit 格式化**：FSKit 在格式化前会先加载设备（参数和挂载前一样是 `-f`），所以设备里没有可用的 ext4 时加载也要成功：返回一个占位卷，激活和检查时报出原来的错误。以 root 身份运行时，`newfs_fskit` 从 `SUDO_UID` 判断该用哪个用户启用的模块；StorageKit 在用户会话之外以 root 身份运行格式化程序，所以 `ext4.fs` 里的格式化程序把它设成当前登录用户。
+- **fscrypt**：文件名在引擎的边界处转换。查找时先把给定的名字加密（或把无密钥名还原成密文），再比较密文；htree 目录和 Linux 一样对密文计算哈希，所以加密目录也保留索引。每个加密 inode 的密钥由它的加密上下文派生（v2 用 HKDF-SHA512，v1 用主密钥的 AES-ECB 加密）并缓存。内容按数据单元加密（块大小，或策略指定的更小单元）；部分块写入、截断、打洞时先解密整块、修改后再加密。新文件继承所在目录的策略并使用新的随机数，并且像 Linux 一样不使用内联数据。
+- **LUKS**：解密后的卷作为引擎下面的一个块设备：读取时解密整个扇区，写入时加密（不完整的扇区先读出、修改、再整扇区写回）。扇区的 IV 是以 512 字节为单位的扇区号加上数据段的 IV 偏移，4K 扇区也是如此，与 dm-crypt 对 LUKS2 的处理相同。
 
 ## 实测（macOS 27，Apple Silicon）
 
@@ -197,6 +239,8 @@ cargo run -p ext4-tool -- IMAGE put host.txt /a.txt
 
 格式化在 Linux 内核上验证过：本工具格式化的 3 GB 镜像，在 Arch Linux ARM（内核 5.18、e2fsprogs 1.46.5）虚拟机里 `e2fsck` 干净，由内核挂载并写入约 3600 个文件和 300 MB 数据后仍然干净；传回 Mac 后，Linux 写入的 2430 个文件由本引擎读出，SHA-256 全部一致。
 
+加密在 Linux 7.2.8（e2fsprogs 1.47.4、cryptsetup 2.8.8）上做了双向验证：在测试镜像的每种 fscrypt 策略下，Mac 写入的文件、文件夹、长短符号链接和改名，Linux 内核都读得正确；在 Mac 上加密的文件夹（v1、v2 策略）在 Linux 上用对应密钥能打开；Linux 的 `e2fsck` 检查干净，Linux 再往这些文件夹写入后也仍然干净。Mac 写入 LUKS1（XTS、CBC-ESSIV）和 LUKS2（Argon2、PBKDF2、4K 扇区）卷的文件，经 `cryptsetup open` 后读出也都正确。
+
 **容量显示**：和 Linux 一样，总容量不含元数据（inode 表、日志等）；mke2fs 默认保留 5% 给 root，这部分算空闲但不算可用，Finder 会把它显示为“已用”。只存数据的盘可以在卸载状态下执行 `sudo tune2fs -m 0 /dev/diskNsM` 取消保留。注意 e2fsprogs 修改已有文件系统时要用块设备 `/dev/diskNsM`：原始设备 `/dev/rdiskNsM` 要求按扇区对齐读写，`tune2fs` 写超级块时会报 `Invalid argument`。
 
 **自定义分区类型**：开发板镜像（如 Rockchip）常用厂商自定义的分区类型 GUID，macOS 不会自动探测（Linux 桌面同样不会自动挂载）。手动挂载时注意 FSKit 扩展按用户启用，不能用 `sudo mount`；先把设备交给当前用户再挂载：
@@ -220,7 +264,7 @@ mkdir -p ~/mnt/sd && mount -F -t ext4 disk4s9 ~/mnt/sd
   ```
 - FSKit 卷上 `fcntl(F_LOG2PHYS)` / `F_LOG2PHYS_EXT` 返回“不支持”（内核没有转发给扩展），开启内核直通 I/O 时也一样。
 - ext2/ext3 的文件不支持预分配（`fallocate`，与 Linux 相同，块映射无法表示未写入块）。
-- 只读支持：`bigalloc`、`quota`、`encrypt`、`casefold`、`verity`、`ea_inode`、`mmp` 等特性的卷可以读取，但不写入。后续计划见 [TODO.md](TODO.md)。
+- 只读支持：`bigalloc`、`quota`、`casefold`、`verity`、`ea_inode`、`mmp` 等特性的卷可以读取，但不写入。后续计划见 [TODO.md](TODO.md)。
 
 ## 许可证
 

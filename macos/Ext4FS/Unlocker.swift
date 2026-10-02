@@ -5,21 +5,50 @@ import Foundation
 /// works so later mounts skip the slow key derivation.
 final class Unlocker: @unchecked Sendable {
     let store: SecretStore
-    /// "volume|secret" pairs that did not open a volume in this process:
-    /// a key derivation can take seconds, so they are not tried again.
-    private let failed = Locked<Set<String>>([])
+    /// Where "volume|secret" pairs that did not open a volume are kept.
+    /// FSKit runs probing, checking and mounting in separate processes, so
+    /// they are kept on disk (secret ids only, never secrets): a key
+    /// derivation can take seconds, and a LUKS volume no secret opens is
+    /// then only recognized instead of failing every mount.
+    private let defaults: UserDefaults?
+    private static let failedKey = "FailedSecrets"
+    private let failed: Locked<Set<String>>
 
-    init(store: SecretStore) {
+    init(store: SecretStore, defaults: UserDefaults? = nil) {
         self.store = store
+        self.defaults = defaults
+        failed = Locked(Set(defaults?.stringArray(forKey: Self.failedKey) ?? []))
+    }
+
+    /// The failure set, refreshed from disk: other processes add to it.
+    private func refreshed(_ f: inout Set<String>) {
+        if let saved = defaults?.stringArray(forKey: Self.failedKey) {
+            f.formUnion(saved)
+        }
     }
 
     private func untried(_ volume: String) -> [StoredSecret] {
-        let tried = failed.withLock { $0 }
-        return store.secrets().filter { !tried.contains("\(volume)|\($0.id)") }
+        let secrets = store.secrets()
+        let tried = failed.withLock { f in
+            refreshed(&f)
+            // forget pairs of secrets that were removed
+            let ids = Set(secrets.map(\.id))
+            let kept = f.filter { ids.contains(String($0.split(separator: "|").last ?? "")) }
+            if kept.count != f.count {
+                f = kept
+                defaults?.set(Array(kept), forKey: Self.failedKey)
+            }
+            return f
+        }
+        return secrets.filter { !tried.contains("\(volume)|\($0.id)") }
     }
 
     private func markFailed(_ volume: String, _ secret: StoredSecret) {
-        _ = failed.withLock { $0.insert("\(volume)|\(secret.id)") }
+        failed.withLock { f in
+            refreshed(&f)
+            f.insert("\(volume)|\(secret.id)")
+            defaults?.set(Array(f), forKey: Self.failedKey)
+        }
     }
 
     // MARK: LUKS

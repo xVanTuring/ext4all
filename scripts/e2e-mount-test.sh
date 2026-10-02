@@ -86,6 +86,12 @@ run_profile() {
     check "mode" test "$(stat -f %Lp "$MNT/x/moved")" = "600" || ok=1
     check "xattr write" xattr -w com.example.test hello "$MNT/x/moved" || ok=1
     check "xattr read" test "$(xattr -p com.example.test "$MNT/x/moved")" = "hello" || ok=1
+    # native extended attributes: copies get no AppleDouble ._ companions
+    printf tagged > "$src/tagged"
+    xattr -w com.example.copy yes "$src/tagged"
+    check "cp keeps xattrs" sh -c "cp '$src/tagged' '$MNT/x/' && ditto '$src/tagged' '$MNT/x/ditto'" || ok=1
+    check "xattr copied" test "$(xattr -p com.example.copy "$MNT/x/ditto")" = "yes" || ok=1
+    check "no ._ files" test -z "$(find "$MNT" -name '._*')" || ok=1
     check "truncate" truncate -s 100 "$MNT/x/moved" 2>/dev/null || : > "$MNT/x/moved" || ok=1
     check "append" sh -c "printf more >> '$MNT/x/moved'" || ok=1
     check "delete tree" rm -rf "$MNT/rsynced" || ok=1

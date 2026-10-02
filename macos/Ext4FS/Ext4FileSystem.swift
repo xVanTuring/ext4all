@@ -26,7 +26,7 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
     /// was handed out instead).
     let loadFailure = Locked<(any Error)?>(nil)
     /// Keys for LUKS volumes and fscrypt directories.
-    let unlocker = Unlocker(store: KeychainStore.shared)
+    let unlocker = Unlocker(store: KeychainStore.shared, defaults: .standard)
 
     override init() {
         _ = Log.installEngineLogger
@@ -104,15 +104,21 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
         }
         guard luks.supported else {
             Log.fs.error("\(bsdName, privacy: .public): LUKS volume with an unsupported cipher")
-            throw POSIXError(.ENOTSUP)
+            throw LuksUnavailable(error: POSIXError(.ENOTSUP))
         }
         guard let key = try unlocker.luksKey(io: io, volume: luks) else {
             Log.fs.error(
                 "\(bsdName, privacy: .public): LUKS volume \(luks.uuid, privacy: .public) is locked; add its passphrase in Ext4Kit"
             )
-            throw POSIXError(.EACCES)
+            throw LuksUnavailable(error: POSIXError(.EACCES))
         }
         return (try Ext4Mount(luks: io, key: key, readOnly: readOnly), true)
+    }
+
+    /// A LUKS volume that cannot be opened (no key opens it, or its cipher
+    /// is unsupported).
+    struct LuksUnavailable: Error {
+        let error: POSIXError
     }
 
     func loadResource(
@@ -149,6 +155,16 @@ final class Ext4FileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations, FSMa
                 "loaded \(device.bsdName, privacy: .public) \(mount.isReadOnly ? "read-only" : "read-write", privacy: .public)\(kernelIO ? ", kernel offloaded I/O" : "", privacy: .public)"
             )
             reply(volume, nil)
+        } catch let locked as LuksUnavailable {
+            // No stand-in here: FSKit would keep the device loaded (and
+            // busy, even for ejecting) after the mount fails, so a mount
+            // retried once a passphrase is added would not reach us.
+            Log.fs.error(
+                "load \(device.bsdName, privacy: .public) failed: \(locked.error.localizedDescription, privacy: .public)"
+            )
+            self.device.withLock { $0 = nil }
+            containerStatus = .notReady(status: locked.error)
+            reply(nil, locked.error)
         } catch {
             // FSKit also loads a device before formatting it, so loading
             // succeeds with a stand-in that fails activation (and checks)

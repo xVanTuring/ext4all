@@ -47,6 +47,24 @@ final class EncryptionTests: XCTestCase {
         let key = try XCTUnwrap(try unlocker.luksKey(io: io, volume: luks))
         XCTAssertEqual(store.luksKey(uuid: luks.uuid), key)
 
+        // failures are remembered across processes (FSKit probes, checks
+        // and mounts in separate ones)
+        let suite = "ext4kit-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let other = MemoryStore()
+        try other.addSecret(Data("wrong".utf8), kind: .passphrase, name: "")
+        let longLived = Unlocker(store: other, defaults: defaults)
+        XCTAssertTrue(longLived.mayUnlock(luks))
+        XCTAssertNil(try Unlocker(store: other, defaults: defaults).luksKey(io: io, volume: luks))
+        XCTAssertFalse(Unlocker(store: other, defaults: defaults).mayUnlock(luks))
+        // an unlocker created before the failure sees it too
+        XCTAssertFalse(longLived.mayUnlock(luks))
+        // removing the secret forgets its failures
+        try other.remove(other.secrets()[0].id)
+        _ = Unlocker(store: other, defaults: defaults).mayUnlock(luks)
+        XCTAssertEqual(defaults.stringArray(forKey: "FailedSecrets"), [])
+
         // the remembered key alone opens it, with no passphrase left
         for s in store.secrets() {
             try store.remove(s.id)

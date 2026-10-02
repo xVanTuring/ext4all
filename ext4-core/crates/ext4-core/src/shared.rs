@@ -1,12 +1,15 @@
-//! A mounted file system shared across threads, with periodic commits.
+//! A mounted file system shared across threads, with periodic commits:
+//! what a platform layer (the macOS FSKit extension, the Android app) holds
+//! while a volume is mounted.
 
-use ext4_core::{Error, Fs, Result};
+use crate::error::errno::EIO;
+use crate::{Error, Fs, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-pub struct Shared {
+struct Shared {
     fs: Mutex<Option<Fs>>,
     /// Set after a panic inside an operation: in-memory state may be
     /// inconsistent, so nothing more may be written.
@@ -15,14 +18,14 @@ pub struct Shared {
     wake: Condvar,
 }
 
-pub struct Ext4Handle {
+pub struct SharedFs {
     shared: Arc<Shared>,
     committer: Mutex<Option<JoinHandle<()>>>,
     read_only: bool,
 }
 
-impl Ext4Handle {
-    pub fn new(fs: Fs, commit_interval: Duration) -> Ext4Handle {
+impl SharedFs {
+    pub fn new(fs: Fs, commit_interval: Duration) -> SharedFs {
         let read_only = fs.is_read_only();
         let shared = Arc::new(Shared {
             fs: Mutex::new(Some(fs)),
@@ -41,7 +44,7 @@ impl Ext4Handle {
                     .expect("spawn commit thread"),
             )
         };
-        Ext4Handle {
+        SharedFs {
             shared,
             committer: Mutex::new(committer),
             read_only,
@@ -56,12 +59,12 @@ impl Ext4Handle {
 
     fn lock(&self) -> Result<MutexGuard<'_, Option<Fs>>> {
         if self.shared.broken.load(Ordering::SeqCst) {
-            return Err(Error::Device(ext4_core::error::errno::EIO));
+            return Err(Error::Device(EIO));
         }
         self.shared
             .fs
             .lock()
-            .map_err(|_| Error::Device(ext4_core::error::errno::EIO))
+            .map_err(|_| Error::Device(EIO))
     }
 
     /// Run `f` with the file system locked. Panics mark the handle broken.
@@ -74,7 +77,7 @@ impl Ext4Handle {
             Err(_) => {
                 self.shared.broken.store(true, Ordering::SeqCst);
                 log::error!("panic inside file system operation; volume disabled");
-                Err(Error::Device(ext4_core::error::errno::EIO))
+                Err(Error::Device(EIO))
             }
         }
     }
@@ -98,7 +101,7 @@ impl Ext4Handle {
         self.with(|fs| fs.unmount_in_place())
     }
 
-    /// Undo [`Ext4Handle::finish`] when the volume is mounted again.
+    /// Undo [`SharedFs::finish`] when the volume is mounted again.
     pub fn remount(&self) -> Result<()> {
         self.with(|fs| fs.remount_rw())
     }
@@ -113,18 +116,18 @@ impl Ext4Handle {
         if self.shared.broken.load(Ordering::SeqCst) {
             // do not write possibly inconsistent state; leave needs_recovery
             fs.abandon();
-            return Err(Error::Device(ext4_core::error::errno::EIO));
+            return Err(Error::Device(EIO));
         }
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fs.unmount_in_place()));
         drop(fs);
         match r {
             Ok(v) => v,
-            Err(_) => Err(Error::Device(ext4_core::error::errno::EIO)),
+            Err(_) => Err(Error::Device(EIO)),
         }
     }
 }
 
-impl Drop for Ext4Handle {
+impl Drop for SharedFs {
     fn drop(&mut self) {
         if let Err(e) = self.unmount() {
             log::error!("unmount while closing handle failed: {e}");

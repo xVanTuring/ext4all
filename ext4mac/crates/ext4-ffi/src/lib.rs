@@ -9,18 +9,29 @@
 //!   into this library.
 
 pub mod device;
-pub mod handle;
 pub mod types;
 pub mod xattr_names;
 
 use device::CallbackDevice;
 use ext4_core::error::errno::EIO;
-use ext4_core::{AlignedDevice, Error, FileType, Fs, MountOptions, RenameFlags, Result, SetAttr, XattrSetMode};
-pub use handle::Ext4Handle;
+use ext4_core::{
+    AlignedDevice, Error, FileType, Fs, MountOptions, RenameFlags, Result, SetAttr, SharedFs, XattrSetMode,
+};
 use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 use std::time::Duration;
 pub use types::*;
+
+/// A mounted volume; opaque to C.
+pub struct Ext4Handle(SharedFs);
+
+impl std::ops::Deref for Ext4Handle {
+    type Target = SharedFs;
+
+    fn deref(&self) -> &SharedFs {
+        &self.0
+    }
+}
 
 fn guard(f: impl FnOnce() -> Result<()>) -> i32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -287,7 +298,7 @@ fn mount_on(dev: Arc<dyn ext4_core::BlockDevice>, mo: &Ext4MountOptions) -> Resu
     } else {
         mo.commit_interval_secs as u64
     });
-    Ok(Box::new(Ext4Handle::new(fs, interval)))
+    Ok(Box::new(Ext4Handle(SharedFs::new(fs, interval))))
 }
 
 // --- encryption ----------------------------------------------------------------------

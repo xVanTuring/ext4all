@@ -102,6 +102,9 @@
 
 #define EXT4_XATTR_REPLACE 2
 
+/**
+ * A mounted volume; opaque to C.
+ */
 typedef struct Ext4Handle Ext4Handle;
 
 /**

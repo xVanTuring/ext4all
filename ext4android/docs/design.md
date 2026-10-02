@@ -79,7 +79,7 @@ macOS 上由系统提供分区设备（`disk4s1`），所以 `ext4-core` 里没�
 
 ### 3. 卷管理与 JNI（`crates/ext4-jni`）
 
-- 挂载后的 `Fs` 放在互斥锁里，配一个提交线程；操作中发生 panic 时停用这个卷。做法与 `ext4-ffi/src/handle.rs` 相同，计划把它移进核心两边共用（见“与核心、macOS 项目的关系”）。
+- 挂载后的卷用核心里的 `SharedFs`（`ext4_core::shared`）：`Fs` 放在互斥锁里，配一个提交线程；操作中发生 panic 时停用这个卷。macOS 的 `ext4-ffi` 也用它。
 - 提交策略：
   - 和 macOS 版一样，每 5 秒把新的修改提交到日志，空闲时做 checkpoint；
   - 额外规定：写过的文件被关闭（`onRelease`）或调用 `onFsync` 时，立即提交并发送写屏障。手机上不点“安全移除”就直接拔线的情况很常见，修改要尽快落盘。
@@ -215,6 +215,5 @@ ext4all/ext4android/
   - `ext4-core/`：和平台无关的 `ext4-core`、`ext4-tool`、`part`（分区表解析，最早写在本项目里，已移过去）；
   - `ext4mac/`：macOS 的 FSKit 扩展和 `ext4-ffi`；
   - `ext4android/`：本项目，`ext4-jni` 和 `usb-msc`。
-- 待整理的核心改动：
-  1. 把提交线程和互斥锁封装（`ext4mac/crates/ext4-ffi/src/handle.rs`）移进核心，macOS 和 Android 共用；
-  2. 错误码不再固定为 macOS 编号，改成各平台自行转换。
+- 提交线程和互斥锁封装已移进核心（`ext4_core::shared::SharedFs`），macOS 和 Android 共用。
+- 待整理：核心的 `Error::errno()` 是 macOS 编号。Android 不用它，按错误种类直接转换成 Java 异常；以后视情况把 macOS 的映射移到 `ext4-ffi`。

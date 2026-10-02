@@ -15,11 +15,11 @@
 
 | 访问方式 | 能否使用 |
 |---|---|
-| 系统文件选择器里打开、保存文件（`ACTION_OPEN_DOCUMENT`、`ACTION_CREATE_DOCUMENT`） | 可以 |
+| 系统文件选择器（DocumentsUI）里打开、保存文件（`ACTION_OPEN_DOCUMENT`、`ACTION_CREATE_DOCUMENT`） | 可以 |
 | 授权整个文件夹或整个盘（`ACTION_OPEN_DOCUMENT_TREE`），之后长期读写 | 可以 |
 | 随机读写：视频拖动进度、编辑器原地保存 | 可以，通过 `openProxyFileDescriptor` 返回可定位的文件描述符 |
 | 系统“文件”App（DocumentsUI）浏览、复制、移动 | 可以 |
-| 小米、vivo 自带的文件管理器 | 不一定列出第三方存储 |
+| 厂商自己的选择器 | 看不到。实测 vivo OriginOS 6 默认用 vivo 文件管理的选择器响应 `ACTION_OPEN_DOCUMENT` 和 `ACTION_GET_CONTENT`，只列手机存储；`ACTION_CREATE_DOCUMENT` 和 `ACTION_OPEN_DOCUMENT_TREE` 仍由 DocumentsUI 响应 |
 | 只按路径访问、或只查媒体库的 App（例如系统相册） | 看不到 |
 
 ## 整体结构
@@ -104,7 +104,11 @@ macOS 上由系统提供分区设备（`disk4s1`），所以 `ext4-core` 里没�
 - 能力标志：可写的卷给出写入、删除、改名、移动、复制、在目录中新建；只读的卷（例如带 `quota`、`casefold` 特性）都不给。
 - `openDocument`：
   - 通过 `StorageManager.openProxyFileDescriptor` 返回描述符；
-  - 模式按 `ParcelFileDescriptor.parseMode` 的语义处理，其中 `w` 和 `wt` 都会截断文件；
+  - 模式按 `ParcelFileDescriptor.parseMode` 解析，`openProxyFileDescriptor` 只接受读写方式，截断和追加由我们处理：
+    - `wt`、`rwt` 截断；
+    - `w` 也截断：Android 10 起 `parseMode("w")` 不含截断，但用 `w` 保存的 App 是要替换整个文件，不截断会在较短的新内容后留下旧内容；
+    - `rw` 原地改写，保留其余内容；
+    - `wa` 追加：回调把每次写入放到文件当前的末尾；
   - 回调运行在 Handler 线程上，每个打开的文件一个 `HandlerThread`，避免一个文件的慢读写拖住其他文件。
 - 新建文件的属主取父目录的 uid/gid，权限为 0644，目录为 0755。
 - 变更通知：

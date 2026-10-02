@@ -93,12 +93,17 @@ class Ext4DocumentsProvider : DocumentsProvider() {
         if (writing && !writable(volume)) {
             throw FileNotFoundException("read-only volume: $documentId opened with \"$mode\"")
         }
-        val truncate = writing && flags and ParcelFileDescriptor.MODE_TRUNCATE != 0
+        val append = writing && flags and ParcelFileDescriptor.MODE_APPEND != 0
+        // parseMode("w") has no MODE_TRUNCATE since Android 10, but an app
+        // saving with "w" means to replace the file: a shorter save would
+        // keep the old tail. Only "rw" and "wa" keep the contents.
+        val truncate = writing && (flags and ParcelFileDescriptor.MODE_TRUNCATE != 0 ||
+            access == ParcelFileDescriptor.MODE_WRITE_ONLY && !append)
         val ino = read { Native.openFile(volume.id, path, truncate) }[0].toInt()
         val thread = HandlerThread("ext4-fd-$ino").apply { start() }
         val storage = ctx.getSystemService(StorageManager::class.java)
         return try {
-            storage.openProxyFileDescriptor(access, FileCallback(volume.id, ino, thread), Handler(thread.looper))
+            storage.openProxyFileDescriptor(access, FileCallback(volume.id, ino, append, thread), Handler(thread.looper))
         } catch (e: IOException) {
             thread.quitSafely()
             runCatching { Native.closeFile(volume.id, ino, false) }

@@ -43,15 +43,24 @@ private const val SAMPLE_MIB = 128
 private const val RANDOM_READS = 200
 private const val RANDOM_READ_BYTES = 4096
 
-/** OpenDocument that starts in a given folder. */
+/**
+ * OpenDocument that starts in a given folder, in the system's own picker
+ * (DocumentsUI): some vendors answer ACTION_OPEN_DOCUMENT with a picker of
+ * their own that leaves out other apps' storage (vivo OriginOS 6).
+ */
 private class OpenDocumentAt : ActivityResultContracts.OpenDocument() {
     var initial: Uri? = null
 
     override fun createIntent(context: Context, input: Array<String>): Intent =
         super.createIntent(context, input).apply {
             initial?.let { putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) }
+            documentsUi(context)?.let { setPackage(it) }
         }
 }
+
+/** The package of the system's DocumentsUI: the one picking folders. */
+private fun documentsUi(context: Context): String? =
+    Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).resolveActivity(context.packageManager)?.packageName
 
 /**
  * Debug tools for milestone M1 and experiment 3: a sample image, mounted
@@ -128,6 +137,12 @@ fun ImageSection() {
             OutlinedButton(enabled = !busy, onClick = {
                 run { withContext(Dispatchers.IO) { measureReads(context, volume) } }
             }) { Text(stringResource(R.string.image_speed)) }
+            val writable = remember(volume) { runCatching { !Volumes.info(volume).readOnly }.getOrDefault(false) }
+            if (writable) {
+                OutlinedButton(enabled = !busy, onClick = {
+                    run { withContext(Dispatchers.IO) { providerCheck(context, volume) } }
+                }) { Text(stringResource(R.string.image_check_writes)) }
+            }
             OutlinedButton(enabled = !busy, onClick = {
                 run {
                     withContext(Dispatchers.IO) { Volumes.unmount(context, volume) }

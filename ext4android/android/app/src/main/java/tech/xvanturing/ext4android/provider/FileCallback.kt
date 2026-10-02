@@ -15,10 +15,14 @@ import tech.xvanturing.ext4android.jni.Native
  * (StorageManager.openProxyFileDescriptor) from a file of a mounted volume.
  * All calls come on its own [thread], which ends when the descriptor is
  * closed; closing commits what was written.
+ *
+ * A proxy descriptor only takes an access mode, so [append] (mode "wa") is
+ * done here: every write goes to the current end of the file.
  */
 class FileCallback(
     private val volume: Int,
     private val ino: Int,
+    private val append: Boolean,
     private val thread: HandlerThread,
 ) : ProxyFileDescriptorCallback() {
     private var written = false
@@ -30,7 +34,8 @@ class FileCallback(
 
     override fun onWrite(offset: Long, size: Int, data: ByteArray): Int =
         call("write") {
-            Native.write(volume, ino, offset, data, size)
+            val at = if (append) Native.fileSize(volume, ino) else offset
+            Native.write(volume, ino, at, data, size)
             written = true
             size
         }

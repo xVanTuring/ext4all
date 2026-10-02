@@ -37,6 +37,7 @@
     <string name="image_unmounted_done">已卸载</string>
     <string name="image_pick_open">选择文件并用其他 App 打开</string>
     <string name="image_speed">通过文档提供者测读取速度</string>
+    <string name="image_check_writes">通过文档提供者测试写操作</string>
     <string name="image_speed_result">顺序读 %1$s：%2$.1f MB/s\n随机读 %3$d 次，每次 4 KiB：平均 %4$.2f ms\n数据：%5$s</string>
     <string name="data_ok">正确</string>
     <string name="data_bad">有误</string>

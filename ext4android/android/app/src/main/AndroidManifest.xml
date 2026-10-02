@@ -5,6 +5,13 @@
         android:name="android.hardware.usb.host"
         android:required="false" />
 
+    <!-- to find the system's DocumentsUI (package visibility, Android 11+) -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT_TREE" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:label="@string/app_name"

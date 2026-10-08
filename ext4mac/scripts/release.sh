@@ -4,8 +4,14 @@
 # One-time setup (by you):
 #   1. Sign in to Xcode with the developer account (team T8F5T6HKG8) so the
 #      FSKit Module capability can be provisioned.
-#   2. Store notarization credentials in the keychain:
-#        xcrun notarytool store-credentials ext4kit \
+#   2. On the developer website, create two Developer ID provisioning profiles
+#      on the Developer ID Application certificate whose private key is in
+#      this Mac's keychain, and install them:
+#        "Ext4Kit"   for tech.xvanturing.ext4
+#        "Ext4KitFS" for tech.xvanturing.ext4.fs (with FSKit Module)
+#      (Export uses manual signing: the account has no cloud signing access.)
+#   3. Store notarization credentials in the keychain:
+#        xcrun notarytool store-credentials notary \
 #            --apple-id YOUR_APPLE_ID --team-id T8F5T6HKG8 --password APP_SPECIFIC_PASSWORD
 #
 # Usage: scripts/release.sh [VERSION]   (e.g. 0.2.0; default: project version)
@@ -16,7 +22,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MACOS="$ROOT/macos"
 BUILD="$MACOS/build/release"
 TEAM="T8F5T6HKG8"
-PROFILE="${NOTARY_PROFILE:-ext4kit}"
+PROFILE="${NOTARY_PROFILE:-notary}"
+APP_PROFILE="${APP_PROFILE:-Ext4Kit}"
+FS_PROFILE="${FS_PROFILE:-Ext4KitFS}"
 VERSION="${1:-}"
 
 cd "$MACOS"
@@ -49,13 +57,22 @@ cat > "$BUILD/ExportOptions.plist" <<EOF
     <key>teamID</key>
     <string>$TEAM</string>
     <key>signingStyle</key>
-    <string>automatic</string>
+    <string>manual</string>
+    <key>signingCertificate</key>
+    <string>Developer ID Application</string>
+    <key>provisioningProfiles</key>
+    <dict>
+        <key>tech.xvanturing.ext4</key>
+        <string>$APP_PROFILE</string>
+        <key>tech.xvanturing.ext4.fs</key>
+        <string>$FS_PROFILE</string>
+    </dict>
 </dict>
 </plist>
 EOF
 
 xcodebuild -exportArchive -archivePath "$BUILD/Ext4Kit.xcarchive" \
-    -exportOptionsPlist "$BUILD/ExportOptions.plist" -exportPath "$BUILD/export" -allowProvisioningUpdates
+    -exportOptionsPlist "$BUILD/ExportOptions.plist" -exportPath "$BUILD/export"
 
 APP="$BUILD/export/Ext4Kit.app"
 codesign --verify --deep --strict --verbose=2 "$APP"

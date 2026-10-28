@@ -5,6 +5,13 @@
         android:name="android.hardware.usb.host"
         android:required="false" />
 
+    <!-- MountService keeps mounted disks alive in the foreground; the USB
+         permission of a disk is the runtime prerequisite of the type -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- its notification, with the safe removal button (Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- to find the system's DocumentsUI (package visibility, Android 11+) -->
     <queries>
         <intent>
@@ -20,12 +27,25 @@
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- offered when a USB disk is plugged in; mounts it -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
         </activity>
+
+        <service
+            android:name=".service.MountService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
         <!-- mounted volumes in the system file picker (Storage Access Framework) -->
         <provider

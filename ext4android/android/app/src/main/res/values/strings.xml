@@ -7,8 +7,30 @@
     <string name="self_test_result">Self test: %1$s</string>
     <string name="refresh">Refresh</string>
 
-    <string name="usb_title">USB disks (experiment)</string>
-    <string name="usb_none">No USB mass storage device found</string>
+    <string name="usb_title">USB disks</string>
+    <string name="usb_none">No USB disk connected</string>
+    <string name="usb_mount_rw">Mount (read-write)</string>
+    <string name="usb_mount_ro">Mount (read-only)</string>
+    <string name="usb_mounting">Mounting…</string>
+    <string name="usb_mount_failed">Not mounted: %1$s</string>
+    <string name="usb_no_volume">no ext4 volume could be mounted</string>
+    <string name="usb_volume">\"%1$s\", %2$s, %3$s free</string>
+    <string name="usb_eject">Safely remove</string>
+    <string name="usb_ejecting">Saving changes and unmounting…</string>
+    <string name="usb_ejected">Safely removed: you can unplug the disk now</string>
+    <string name="usb_eject_failed">unmounting failed: %1$s</string>
+    <string name="toast_ejected">%1$s can be unplugged now</string>
+    <string name="channel_mounted">Mounted disks</string>
+    <string name="channel_removed">Disks unplugged while mounted</string>
+    <string name="notif_mounting">Mounting a USB disk…</string>
+    <plurals name="notif_mounted">
+        <item quantity="one">%d ext4 volume mounted</item>
+        <item quantity="other">%d ext4 volumes mounted</item>
+    </plurals>
+    <string name="notif_volume">%1$s · %2$s · %3$s free</string>
+    <string name="notif_eject_named">Safely remove %1$s</string>
+    <string name="notif_removed_title">Disk unplugged without safe removal</string>
+    <string name="notif_removed_text">%1$s was unplugged while mounted read-write. Changes from the last few seconds may not have been saved.</string>
     <string name="usb_ids" translatable="false">VID %1$s · PID %2$s · %3$s</string>
     <string name="usb_probe">Probe (read-only)</string>
     <string name="usb_probing">Probing…</string>

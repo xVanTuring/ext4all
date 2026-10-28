@@ -3,8 +3,9 @@
 
 mod common;
 use common::*;
-use ext4_core::{BlockDevice, FileType, Fs, MemDevice, MountOptions, RenameFlags};
+use ext4_core::{BlockDevice, Error, FileType, Fs, MemDevice, MountOptions, RenameFlags, SharedFs};
 use std::sync::Arc;
+use std::time::Duration;
 
 fn load(img: &Image) -> Arc<MemDevice> {
     Arc::new(MemDevice::from_vec(std::fs::read(&img.path).unwrap()))
@@ -334,6 +335,45 @@ fn crash_without_commit_loses_only_uncommitted_work() {
     let mut fs = img.mount();
     assert!(!check_atomic(&mut fs));
     fs.unmount().unwrap();
+    img.assert_clean();
+}
+
+/// An unplugged disk: the shared handle is abandoned with uncommitted
+/// changes. Nothing more reaches the device, and the next mount holds
+/// exactly what was committed.
+#[test]
+fn abandoned_shared_fs_writes_nothing_more() {
+    let img = base_image(&["-t", "ext4"]);
+    let dev = load(&img);
+    let fs = Fs::mount(dev.clone(), no_auto_commit()).unwrap();
+    let shared = SharedFs::new(fs, Duration::from_secs(3600));
+    shared
+        .with(|fs| {
+            let f = fs.create(2, b"kept", FileType::Regular, 0o644, 0, 0, 0)?.ino;
+            fs.write(f, 0, b"committed")?;
+            fs.commit()
+        })
+        .unwrap();
+    shared
+        .with(|fs| {
+            fs.create(2, b"lost", FileType::Regular, 0o644, 0, 0, 0)?;
+            Ok(())
+        })
+        .unwrap();
+    let before = dev.snapshot();
+    shared.abandon();
+    assert_eq!(dev.snapshot(), before, "abandon wrote to the device");
+    assert!(matches!(shared.with(|fs| Ok(fs.root())), Err(Error::Busy)));
+    shared.abandon();
+    drop(shared);
+    assert_eq!(dev.snapshot(), before, "dropping the handle wrote to the device");
+
+    let mut fs = Fs::mount(dev.clone(), MountOptions::default()).unwrap();
+    let kept = fs.lookup(2, b"kept").unwrap();
+    assert_eq!(read_all(&mut fs, kept), b"committed");
+    assert!(matches!(fs.lookup(2, b"lost"), Err(Error::NotFound)));
+    fs.unmount().unwrap();
+    save(&img, &dev);
     img.assert_clean();
 }
 

@@ -30,29 +30,50 @@ object Volumes {
 
     /** Mounts the ext4 volume of an image file; throws IOException. */
     fun mountImage(context: Context, image: File, readOnly: Boolean): MountedVolume {
-        val id = Native.mountImage(image.path, readOnly)
+        val volume = add(Native.mountImage(image.path, readOnly), image.path)
+        notifyRoots(context)
+        return volume
+    }
+
+    /**
+     * Lists volumes mounted by libext4android (from [source]) in the
+     * documents provider. A volume whose facts cannot be read is unmounted
+     * and left out.
+     */
+    fun register(context: Context, ids: IntArray, source: String): List<MountedVolume> {
+        val volumes = ids.toList().mapNotNull { id -> runCatching { add(id, source) }.getOrNull() }
+        notifyRoots(context)
+        return volumes
+    }
+
+    private fun add(id: Int, source: String): MountedVolume {
         val uuid = runCatching { Records.volumeInfo(Native.volumeInfo(id)).uuidString }
             .getOrElse { e ->
-                Native.unmount(id)
+                runCatching { Native.unmount(id) }
                 throw e
             }
-        val volume = synchronized(mounted) {
+        return synchronized(mounted) {
             // the same image or a copy of a disk mounted twice
             var rootId = uuid
             var n = 2
             while (rootId in mounted) {
                 rootId = "$uuid-${n++}"
             }
-            MountedVolume(id, rootId, image.path).also { mounted[rootId] = it }
+            MountedVolume(id, rootId, source).also { mounted[rootId] = it }
         }
-        notifyRoots(context)
-        return volume
     }
 
     fun unmount(context: Context, volume: MountedVolume) {
         synchronized(mounted) { mounted.remove(volume.rootId) }
         notifyRoots(context)
         Native.unmount(volume.id)
+    }
+
+    /** The volume's disk is gone: forget it without writing anything more. */
+    fun abandon(context: Context, volume: MountedVolume) {
+        synchronized(mounted) { mounted.remove(volume.rootId) }
+        notifyRoots(context)
+        Native.abandon(volume.id)
     }
 
     private fun notifyRoots(context: Context) {

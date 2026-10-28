@@ -4,7 +4,7 @@
 
 文件系统部分复用同仓库的 [`ext4-core`](../ext4-core)（纯 Rust，macOS 版 [Ext4Kit](../ext4mac) 也用它）。
 
-状态：M0–M2 完成，并在 iQOO 15 上测过；下一步是 M3（USB 盘接入文档提供者）。见 [docs/design.md](docs/design.md) 和 [TODO.md](TODO.md)。
+状态：M0–M2 完成，并在 iQOO 15 上测过；M3（USB 盘接入文档提供者）的功能已完成，在模拟器上用模拟的 USB 硬盘测过，还差真机测试。见 [docs/design.md](docs/design.md) 和 [TODO.md](TODO.md)。
 
 ## 已完成的部分
 
@@ -13,6 +13,7 @@
 - `crates/ext4-jni`：
   - 自检和 USB 检测（只读）；
   - 卷管理：挂载镜像文件（文件系统镜像，或带分区表的磁盘镜像），用编号登记，挂载后的卷用核心的 `SharedFs`；
+  - USB 盘：经 usbdevfs 打开，盘上每个 ext2/3/4 分区各挂载为一个卷（没有分区表时整个盘作为一个卷），只有 LUKS 卷时提示暂不支持；拔盘时放弃这些卷，不再写入任何数据（核心的 `SharedFs::abandon`），已提交的修改由日志保证一致；
   - 文档层：路径编码（非 UTF-8 的字节、`%` 和控制字符写成 `%XX`）、列目录、属性、读文件；只跟随卷内的相对符号链接（最多 40 层），断开的、指向绝对路径的、循环的链接和设备文件、FIFO、socket 不显示；
   - 写操作：新建（重名时加 ` (1)` 等编号，属主跟随所在目录）、删除（目录连同内容；删除链接只删链接本身）、改名、移动、复制（目录连同内容，每 1 MiB 释放一次锁）、通过文件描述符写入、截断、fsync；
   - 打开文件表：打开期间被删除的文件仍可读写，最后一次关闭时才释放；写过的文件关闭时立即提交日志；
@@ -20,8 +21,24 @@
   - 调试用的测试镜像：各种文件名、链接和一个大文件 `big.bin`；把手机上的文件导入镜像。
   - 一连串写操作后用 e2fsprogs 的 `e2fsck -fn` 检查镜像，结果干净（单元测试）。
 - App：
+  - 插盘：`MainActivity` 声明 `USB_DEVICE_ATTACHED` 意图过滤器（接口类 8、子类 6、协议 0x50）；用户在系统弹窗里同意后，自动以可写方式挂载；
+  - 前台服务 `MountService`（类型 `connectedDevice`）：挂载期间运行，通知栏列出已挂载的卷（卷标、只读或可写、可用空间），每个盘一个“安全移除”按钮；安全移除时提交并卸载所有卷，再把设备交还系统；
+  - 拔盘：收到 `USB_DEVICE_DETACHED` 后立即放弃这个盘的卷，移除对应的 root；以可写方式挂载时发通知提醒最近几秒的修改可能没有保存；
+  - 界面的“USB 磁盘”一栏：列出连接的盘（插拔时自动刷新），可写或只读挂载、安全移除，挂载后可在系统文件选择器里选文件、测试写操作；原来的只读检测（M0 实验）保留；
   - `Ext4DocumentsProvider`：每个挂载的卷是一个 root（ID 为文件系统 UUID），文档 ID 为 `<root>:<编码路径>`；打开文件时返回代理文件描述符（`openProxyFileDescriptor`），每个打开的文件一个线程；可写的卷支持新建、删除、改名、移动、复制和写模式打开（`w`、`wt` 截断，`rw` 原地改写，`wa` 追加）；跨卷的移动和复制交给系统文件管理器按字节复制；修改后通知所在目录刷新；
   - 调试界面：创建、导入、挂载（只读或可写）测试镜像；在系统的 DocumentsUI 里选文件交给其他 App 打开；通过文档提供者测读取速度，以及用其他 App 会用的系统接口（`DocumentsContract`、`ContentResolver`）测试全部写操作。
+
+## M3 模拟器测试
+
+没有真机时用模拟器测：QEMU 的 `usb-storage` 把 Mac 上的一个磁盘镜像文件模拟成 USB 硬盘插进模拟器，App 收到的是真实的 USB 设备，读写走的也是同一套 usbdevfs 路径（见下文“在模拟器上测试 USB 硬盘”）。Android 16（API 36，arm64），256 MiB 磁盘镜像，MBR 分区表加一个 1 KiB 块的 ext4 分区：
+
+- App 列出“QEMU USB HARDDRIVE”；点“挂载（可写）”后系统弹出 USB 权限对话框，同意后挂载，卡片和通知栏显示“EMUDISK”、可写、可用空间。
+- 写操作测试 14 步全部通过（和 M2 相同的步骤，这次经过 USB）。
+- 经文档提供者读回盘上原有的文件：5 MB 随机数据的校验和一致，中文文件名和内容正确；系统文件 App（DocumentsUI）的“其他应用中的文件”里出现 EMUDISK，能浏览目录。
+- 点通知栏的“安全移除”：前台服务结束，通知消失，界面显示“已安全移除”；镜像在 Mac 上 `e2fsck -fn` 干净。
+- 拔出再插入：系统弹出“用 ext4android 打开”，确认后自动挂载。模拟的盘每次插入序列号都不同，所以勾选“始终打开”后仍会再问；真实的盘需要在真机上确认。
+- 写入文件后立即拔出：服务结束，root 消失，弹出“未经安全移除就被拔下”的通知；镜像带 `needs_recovery`，`e2fsck -fy` 回放日志后干净，文件内容是新写入的；再插入由 App 自己回放日志，安全移除后 `e2fsck -fn` 干净。
+- 中文界面检查过（`cmd locale set-app-locales`）。
 
 ## M1、M2 真机测试（iQOO 15）
 
@@ -68,5 +85,22 @@
    ./gradlew :app:assembleDebug          # 输出 app/build/outputs/apk/debug/app-debug.apk
    ./gradlew :app:installDebug           # 安装到 adb 连接的设备
    ```
+
+### 在模拟器上测试 USB 硬盘
+
+1. 安装系统镜像并创建模拟器，只需一次（下载约 1.7 GB）：
+   ```bash
+   scripts/setup-emulator.sh
+   ```
+2. 准备一个磁盘镜像（例如 MBR 分区表加一个 ext4 分区，`mke2fs -E offset=1048576` 可直接在镜像里的分区位置建文件系统），然后启动。脚本一直运行到模拟器关闭，加 `--window` 显示窗口：
+   ```bash
+   scripts/emulator.sh start disk.img
+   ```
+3. 第一次启动后执行一次：模拟器的系统镜像没有声明 USB 主机功能，App 看不到任何 USB 设备。这一步在模拟器的可写系统分区里补上声明并重启：
+   ```bash
+   scripts/emulator.sh enable-usb-host
+   ```
+4. 安装 App 后即可测试。`scripts/emulator.sh unplug`、`plug` 模拟拔插，`stop` 关闭模拟器。
+5. 修改直接写进镜像文件。拔出或关闭模拟器后在 Mac 上检查：`dd if=disk.img of=part.img bs=1m skip=1` 取出分区，再 `e2fsck -fn part.img`。
 
 只改 Rust 时也可以单独编译：`scripts/build-rust.sh arm64-v8a`。Rust 单元测试在 Mac 上、仓库根目录运行：`cargo test -p usb-msc -p part -p ext4-jni`。

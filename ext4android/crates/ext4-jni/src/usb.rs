@@ -1,12 +1,50 @@
-//! USB disks as ext4-core block devices, and the probe of experiment M0:
-//! what the app sees on a disk through its own USB access.
+//! USB disks as ext4-core block devices, mounting their volumes, and the
+//! probe of experiment M0: what the app sees on a disk through its own USB
+//! access.
 
+use crate::volumes;
 use ext4_core::error::errno;
 use ext4_core::{AlignedDevice, BlockDevice, Fs, MountOptions, Slice};
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
 use usb_msc::{Disk, Transport};
+
+/// Open a USB disk and mount every ext2/3/4 volume on it; returns their
+/// volume numbers. The volumes share the transport: release it (the USB
+/// interface) only once all of them are unmounted or abandoned.
+pub fn mount<T: Transport + 'static>(t: T, read_only: bool) -> ext4_core::Result<Vec<u32>> {
+    let disk = Disk::open(t).map_err(|e| {
+        log::error!("opening the USB disk failed: {e}");
+        ext4_core::Error::Io(std::io::Error::other(format!("opening the USB disk failed: {e}")))
+    })?;
+    if disk.info().max_lun > 0 {
+        log::warn!("{} LUNs: only LUN 0 is used", disk.info().max_lun as u32 + 1);
+    }
+    mount_disk(Arc::new(disk), read_only)
+}
+
+/// [`mount`] for an opened disk. A volume that fails to mount is left out
+/// when another one mounts.
+fn mount_disk<T: Transport + 'static>(disk: Arc<Disk<T>>, read_only: bool) -> ext4_core::Result<Vec<u32>> {
+    // ext4 reads the superblock at byte 1024, inside a 4 KiB sector
+    let whole: Arc<dyn BlockDevice> = Arc::new(AlignedDevice::new(UsbDisk::new(disk, read_only)));
+    let mut ids = Vec::new();
+    let mut failure = None;
+    for dev in volumes::find_volumes(whole, read_only)? {
+        match volumes::mount_on(dev, read_only) {
+            Ok(id) => ids.push(id),
+            Err(e) => {
+                log::error!("mounting a volume of the USB disk failed: {e}");
+                failure.get_or_insert(e);
+            }
+        }
+    }
+    match failure {
+        Some(e) if ids.is_empty() => Err(e),
+        _ => Ok(ids),
+    }
+}
 
 /// A whole USB disk as a block device; partitions are [`Slice`]s of it.
 /// Offsets and lengths must be whole blocks: wrap in [`AlignedDevice`].
@@ -295,16 +333,17 @@ fn read_speed<T: Transport>(disk: &Disk<T>, total: u64) -> usb_msc::Result<f64> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ext4_core::{FileType, FormatOptions, MemDevice};
+    use crate::{docs, ops};
+    use ext4_core::{Error, FileType, FormatOptions, MemDevice};
     use usb_msc::mock::SimDisk;
 
     const PART_LBA: u64 = 2048;
 
     /// An ext4 volume of `len` bytes holding one file.
-    fn ext4_image(len: usize) -> Vec<u8> {
+    fn ext4_image(len: usize, label: &str) -> Vec<u8> {
         let dev = Arc::new(MemDevice::new(len));
         let opts = FormatOptions {
-            label: "USBDATA".into(),
+            label: label.into(),
             ..Default::default()
         };
         ext4_core::format(&*dev, &opts, &mut |_, _| {}).unwrap();
@@ -322,7 +361,7 @@ mod tests {
         let blocks = 64 * 2048;
         let mut sim = SimDisk::new(blocks, 512);
         let count = blocks - PART_LBA;
-        let image = ext4_image((count * 512) as usize);
+        let image = ext4_image((count * 512) as usize, "USBDATA");
         let o = (PART_LBA * 512) as usize;
         sim.data[o..o + image.len()].copy_from_slice(&image);
         let e = 446;
@@ -332,6 +371,93 @@ mod tests {
         sim.data[510] = 0x55;
         sim.data[511] = 0xAA;
         sim
+    }
+
+    /// A 64 MiB disk with an MBR and two Linux partitions, ext4 labeled ONE
+    /// and TWO.
+    fn two_volume_disk() -> SimDisk {
+        let blocks = 64 * 2048;
+        let mut sim = SimDisk::new(blocks, 512);
+        let count = (blocks - PART_LBA) / 2;
+        for (i, label) in ["ONE", "TWO"].into_iter().enumerate() {
+            let start = PART_LBA + i as u64 * count;
+            let image = ext4_image((count * 512) as usize, label);
+            let o = (start * 512) as usize;
+            sim.data[o..o + image.len()].copy_from_slice(&image);
+            let e = 446 + 16 * i;
+            sim.data[e + 4] = 0x83;
+            sim.data[e + 8..e + 12].copy_from_slice(&(start as u32).to_le_bytes());
+            sim.data[e + 12..e + 16].copy_from_slice(&(count as u32).to_le_bytes());
+        }
+        sim.data[510] = 0x55;
+        sim.data[511] = 0xAA;
+        sim
+    }
+
+    fn root_names(id: u32) -> Vec<String> {
+        let v = volumes::get(id).unwrap();
+        v.fs.with(|fs| docs::list(fs, "")).unwrap().into_iter().map(|e| e.name).collect()
+    }
+
+    #[test]
+    fn mounts_every_ext4_volume_of_a_disk() {
+        let ids = mount(two_volume_disk(), true).unwrap();
+        let labels: Vec<String> = ids.iter().map(|&id| volumes::get(id).unwrap().label.clone()).collect();
+        assert_eq!(labels, ["ONE", "TWO"]);
+        for id in ids {
+            volumes::unmount(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn disk_without_ext4_is_refused() {
+        let r = mount(SimDisk::new(16 * 2048, 512), true);
+        assert!(matches!(r, Err(Error::Unsupported(_))), "{:?}", r.err());
+    }
+
+    #[test]
+    fn changes_reach_the_disk() {
+        let disk = Arc::new(Disk::open(sim_disk()).unwrap());
+        let id = mount_disk(disk.clone(), false).unwrap()[0];
+        let v = volumes::get(id).unwrap();
+        ops::create(&v, "", "notes.txt", false).unwrap();
+        let (ino, _) = ops::open(&v, "notes.txt", false).unwrap();
+        ops::write(&v, ino, 0, b"written over USB").unwrap();
+        v.closed(ino, true).unwrap();
+        drop(v);
+        volumes::unmount(id).unwrap();
+
+        let id = mount_disk(disk, true).unwrap()[0];
+        let v = volumes::get(id).unwrap();
+        let (ino, size) = v.fs.with(|fs| docs::open(fs, "notes.txt")).unwrap();
+        let mut b = vec![0u8; size as usize];
+        v.fs.with(|fs| docs::read(fs, ino, 0, &mut b)).unwrap();
+        assert_eq!(b, b"written over USB");
+        drop(v);
+        volumes::unmount(id).unwrap();
+    }
+
+    /// An unplugged disk: the volume is abandoned with an uncommitted
+    /// change, which is lost; what was committed is there on the next
+    /// mount.
+    #[test]
+    fn abandoned_volume_keeps_committed_changes() {
+        let disk = Arc::new(Disk::open(sim_disk()).unwrap());
+        let id = mount_disk(disk.clone(), false).unwrap()[0];
+        let v = volumes::get(id).unwrap();
+        ops::create(&v, "", "committed", false).unwrap();
+        ops::sync(&v).unwrap();
+        ops::create(&v, "", "pending", false).unwrap();
+        volumes::abandon(id).unwrap();
+        assert!(volumes::get(id).is_err());
+        assert!(matches!(ops::create(&v, "", "late", false), Err(Error::Busy)));
+        drop(v);
+
+        let id = mount_disk(disk, true).unwrap()[0];
+        let names = root_names(id);
+        assert!(names.iter().any(|n| n == "committed"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "pending" || n == "late"), "{names:?}");
+        volumes::unmount(id).unwrap();
     }
 
     #[test]
@@ -363,7 +489,7 @@ mod tests {
     #[test]
     fn whole_disk_volume_without_table() {
         let mut sim = SimDisk::new(32 * 2048, 512);
-        let image = ext4_image(sim.data.len());
+        let image = ext4_image(sim.data.len(), "USBDATA");
         sim.data.copy_from_slice(&image);
         let report = probe(sim);
         assert!(report.contains("partition table: none (whole disk)"), "{report}");

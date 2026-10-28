@@ -40,8 +40,22 @@ object Native {
     @JvmStatic
     external fun mountImage(path: String, readOnly: Boolean): Int
 
+    /**
+     * Mounts every ext2/3/4 volume of a USB disk through usbdevfs on [fd] (a
+     * UsbDeviceConnection with [iface] claimed); returns their volume
+     * numbers. The connection must stay open until all of them are
+     * unmounted or abandoned.
+     */
+    @JvmStatic
+    external fun mountUsb(fd: Int, iface: Int, endpointIn: Int, endpointOut: Int, readOnly: Boolean): IntArray
+
+    /** Commits, marks the file system clean and forgets the volume. */
     @JvmStatic
     external fun unmount(volume: Int)
+
+    /** Forgets a volume whose disk is gone, writing nothing more. */
+    @JvmStatic
+    external fun abandon(volume: Int)
 
     /** See [Records.volumeInfo]. */
     @JvmStatic

@@ -1,5 +1,10 @@
 package tech.xvanturing.ext4android.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
@@ -11,12 +16,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +39,17 @@ fun HomeScreen() {
     var running by remember { mutableStateOf(false) }
     var report by remember { mutableStateOf<String?>(null) }
 
+    // the notification of mounted disks holds the safe removal button
+    val context = LocalContext.current
+    val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     Scaffold { padding ->
         Column(
             modifier = Modifier
@@ -42,6 +60,10 @@ fun HomeScreen() {
         ) {
             Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineSmall)
             Text(stringResource(R.string.native_library, version))
+            UsbSection()
+            HorizontalDivider()
+            ImageSection()
+            HorizontalDivider()
             Button(
                 enabled = !running,
                 onClick = {
@@ -60,10 +82,6 @@ fun HomeScreen() {
             } else if (result != null) {
                 Text(stringResource(R.string.self_test_result, result))
             }
-            HorizontalDivider()
-            ImageSection()
-            HorizontalDivider()
-            UsbSection()
         }
     }
 }

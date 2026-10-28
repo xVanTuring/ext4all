@@ -113,24 +113,51 @@ pub fn unmount(id: u32) -> Result<()> {
     v.fs.unmount()
 }
 
-/// The file system of a device: the device itself, or else the first
-/// partition holding ext2/3/4.
-fn find_volume(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<Arc<dyn BlockDevice>> {
+/// Forget the volume without writing anything more: its disk is gone.
+/// Operations still running fail.
+pub fn abandon(id: u32) -> Result<()> {
+    let v = registry()
+        .volumes
+        .remove(&id)
+        .ok_or_else(|| Error::invalid(format!("no mounted volume {id}")))?;
+    v.fs.abandon();
+    Ok(())
+}
+
+/// The file systems of a device: the device itself, or else every
+/// partition holding ext2/3/4, in table order.
+pub fn find_volumes(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<Vec<Arc<dyn BlockDevice>>> {
     if Fs::probe(&*dev).is_ok() {
-        return Ok(dev);
+        return Ok(vec![dev]);
     }
     let mut read = |o: u64, b: &mut [u8]| dev.read_at(o, b);
     let table = part::read(&mut read, dev.sector_size(), dev.size()).map_err(|e| Error::invalid(e.to_string()))?;
+    let mut found: Vec<Arc<dyn BlockDevice>> = Vec::new();
+    let mut encrypted = matches!(table, part::Table::None) && is_luks(&*dev);
     for p in table.partitions() {
         let s = Slice::new(dev.clone(), p.start, p.len, read_only)?;
         if Fs::probe(&s).is_ok() {
-            return Ok(Arc::new(s));
+            found.push(Arc::new(s));
+        } else {
+            encrypted |= is_luks(&s);
         }
     }
-    Err(Error::unsupported("no ext2/3/4 file system found"))
+    if found.is_empty() {
+        // unlocking comes with milestone M5
+        return Err(Error::unsupported(if encrypted {
+            "encrypted (LUKS) volumes are not supported yet"
+        } else {
+            "no ext2/3/4 file system found"
+        }));
+    }
+    Ok(found)
 }
 
-fn mount_on(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
+fn is_luks(dev: &dyn BlockDevice) -> bool {
+    matches!(ext4_core::luks::Header::read(dev), Ok(Some(_)))
+}
+
+pub fn mount_on(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
     let mut fs = Fs::mount(
         dev,
         MountOptions {
@@ -160,7 +187,8 @@ pub fn mount_device(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
 /// image with a partition table).
 pub fn mount_image(path: &Path, read_only: bool) -> Result<u32> {
     let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open(path, read_only)?);
-    mount_on(find_volume(dev, read_only)?, read_only)
+    let first = find_volumes(dev, read_only)?.swap_remove(0);
+    mount_on(first, read_only)
 }
 
 /// Volume facts for Kotlin (`VolumeInfo`), little-endian: label (u16

@@ -121,14 +121,17 @@ macOS 上由系统提供分区设备（`disk4s1`），所以 `ext4-core` 里没�
 ### 5. 生命周期
 
 - 插盘：
-  - 清单里给一个 Activity 声明 `USB_DEVICE_ATTACHED` 意图过滤器，设备过滤条件为接口类 8、子类 6、协议 0x50；
-  - 用户在系统弹窗里选择“默认用此应用打开”后，以后插同一个盘不再询问权限。
+  - 清单里给 `MainActivity` 声明 `USB_DEVICE_ATTACHED` 意图过滤器，设备过滤条件为接口类 8、子类 6、协议 0x50；用户在系统弹窗里同意后，它启动前台服务以可写方式挂载，界面显示进度；
+  - 用户在系统弹窗里选择“默认用此应用打开”后，以后插同一个盘不再询问权限；
+  - 盘上每个 ext2/3/4 分区各挂载为一个卷，共用一个 USB 连接，全部卸载或放弃后才释放接口、关闭连接。
+- 挂载、安全移除、拔盘处理都交给 `UsbDisks`，在一个专用线程上按请求顺序逐个执行，不会互相穿插（例如挂载到一半时拔盘，拔盘处理排在挂载之后）。
 - 挂载期间运行前台服务：
-  - 类型为 `connectedDevice`，Android 14 起需要声明 `FOREGROUND_SERVICE_CONNECTED_DEVICE` 权限；
-  - 通知栏显示已挂载的卷，并提供“安全移除”按钮。
+  - 类型为 `connectedDevice`，Android 14 起需要声明 `FOREGROUND_SERVICE_CONNECTED_DEVICE` 权限，运行时的前提条件是持有某个已连接 USB 设备的权限（挂载前一定已取得）；
+  - 通知栏显示已挂载的卷，并提供“安全移除”按钮（每个盘一个，最多三个）；
+  - 请求都处理完、没有挂载的盘时，服务自行结束。
 - 拔盘（`USB_DEVICE_DETACHED`）：
-  - 立即对这个卷调用 `abandon`，不再写入任何数据；
-  - 移除对应的 root 并发出通知；
+  - 立即对这个盘的卷调用 `abandon`（核心的 `SharedFs::abandon`：停止提交线程，丢弃内存中的文件系统，不再写入任何数据）；
+  - 移除对应的 root；以可写方式挂载时，发通知提醒最近几秒的修改可能没有保存；
   - 尚未提交的修改会丢失，但日志保证盘上的文件系统是一致的。
 - 进程被系统结束：效果等同于拔盘。下次挂载时回放日志。
 - 系统检测到这个盘时，可能仍会弹出“不支持此设备”的通知。需要实测：我们 `claimInterface` 之后，这个通知是否会消失。
@@ -154,7 +157,9 @@ ext4all/ext4android/
 ├─ scripts/
 │  ├─ setup-toolchain.sh     安装 Android 构建工具（手动执行）
 │  ├─ fetch-deps.sh          下载 Rust 和 Gradle 依赖（手动执行）
-│  └─ build-rust.sh          cargo-ndk 编译 .so 到 jniLibs
+│  ├─ build-rust.sh          cargo-ndk 编译 .so 到 jniLibs
+│  ├─ setup-emulator.sh      安装系统镜像、创建模拟器（手动执行）
+│  └─ emulator.sh            启动模拟器并把磁盘镜像作为 USB 硬盘插入
 ├─ crates/                    属于 ext4all 根目录的 Cargo workspace
 │  ├─ usb-msc/                Bulk-Only + SCSI
 │  └─ ext4-jni/               cdylib：JNI 接口、卷管理
@@ -190,6 +195,10 @@ ext4all/ext4android/
   - `part` 用构造的 GPT/MBR 样本；
   - 卷管理用 `MemDevice` 和 `FileDevice`。
 - 镜像文件模式（仅调试版）：挂载 App 私有目录下的 ext4 镜像（用 adb 推上去）。不需要 USB 就能在模拟器上测试 DocumentsProvider，并写成 `androidTest` 仪器测试。
+- 模拟器上的 USB 硬盘（`scripts/emulator.sh`）：QEMU 的 `usb-storage` 挂在 xHCI 控制器上，后端是 Mac 上的磁盘镜像文件。客体内核把它识别为 USB 大容量存储设备，App 经 `UsbManager` 和 usbdevfs 访问，和真机走同一条路径；通过 QEMU 监视器的 `device_del`、`device_add` 模拟拔插。要点：
+  - 系统镜像没有声明 `android.hardware.usb.host`，USB 主机服务不启动，App 看不到设备；用可写系统分区（`-writable-system`）补一个声明文件；
+  - 模拟器的 QEMU 延后打开 `-drive` 指定的磁盘，`usb-storage` 创建时拿不到，要用 `-blockdev`；
+  - 模拟的盘序列号随插入的端口变化，“始终用本应用打开”记不住。
 - 真机：先在 Pad 6 上测（不跑服务），再测 iQOO 15 和红米。用 Union Memory（UNION）那块盘，Fanxiang S790MAX 有读到旧数据的问题，不用于测试。
 - 交叉验证：手机写过的盘，拿到 Mac 上运行 `e2fsck -fn`，或者在 Linux 虚拟机里挂载读写。
 - 拔盘测试：边写边拔线，然后回放日志并运行 `e2fsck`，结果必须干净。

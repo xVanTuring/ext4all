@@ -253,6 +253,19 @@ impl SharedFs {
             Err(_) => Err(Error::Device(EIO)),
         }
     }
+
+    /// Stop at once and write nothing more: the device is gone (a USB disk
+    /// was unplugged). Changes not yet committed are lost; the journal
+    /// keeps the file system on the device consistent. Later operations
+    /// fail with [`Error::Busy`].
+    pub fn abandon(&self) {
+        self.stop_committer();
+        let _data = self.shared.data.write().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.shared.fs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(fs) = g.take() {
+            fs.abandon();
+        }
+    }
 }
 
 impl Drop for SharedFs {

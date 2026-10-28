@@ -189,6 +189,32 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_mountImage<'c
     .resolve::<ThrowRuntimeExAndDefault>()
 }
 
+/// Mount every ext2/3/4 volume of a USB disk through usbdevfs on `fd` (a
+/// `UsbDeviceConnection` with `interface` claimed, kept open until all the
+/// volumes are unmounted or abandoned); returns their volume numbers.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_mountUsb<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    fd: jint,
+    interface: jint,
+    endpoint_in: jint,
+    endpoint_out: jint,
+    read_only: jboolean,
+) -> jni::objects::JIntArray<'caller> {
+    env.with_env(|env| {
+        call(env, |env| {
+            let t = usb_msc::usbfs::UsbFs::new(fd, interface as u8, endpoint_in as u8, endpoint_out as u8);
+            let ids: Vec<jint> = usb::mount(t, read_only)?.into_iter().map(|id| id as jint).collect();
+            let out = env.new_int_array(ids.len())?;
+            out.set_region(env, 0, &ids)?;
+            Ok(out)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_unmount<'caller>(
     mut env: EnvUnowned<'caller>,
@@ -196,6 +222,17 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_unmount<'call
     volume: jint,
 ) {
     env.with_env(|env| call(env, |_| Ok(volumes::unmount(volume as u32)?)))
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// Forget a volume whose disk is gone, writing nothing more.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_abandon<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    volume: jint,
+) {
+    env.with_env(|env| call(env, |_| Ok(volumes::abandon(volume as u32)?)))
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 

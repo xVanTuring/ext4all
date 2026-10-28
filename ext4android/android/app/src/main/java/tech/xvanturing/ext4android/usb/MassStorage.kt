@@ -34,31 +34,43 @@ class MassStorage(
             .ifBlank { device.deviceName }
 }
 
-/**
- * Connected mass storage devices. A UAS enclosure lists its Bulk-Only
- * interface as alternate setting 0; that one is picked.
- */
+/** Connected mass storage devices. */
 fun findMassStorage(manager: UsbManager): List<MassStorage> =
-    manager.deviceList.values.mapNotNull { device ->
-        (0 until device.interfaceCount).firstNotNullOfOrNull { i ->
-            val iface = device.getInterface(i)
-            if (iface.interfaceClass != UsbConstants.USB_CLASS_MASS_STORAGE ||
-                iface.interfaceSubclass != SUBCLASS_SCSI ||
-                iface.interfaceProtocol != PROTOCOL_BULK_ONLY
-            ) {
-                return@firstNotNullOfOrNull null
-            }
-            val bulk = (0 until iface.endpointCount)
-                .map(iface::getEndpoint)
-                .filter { it.type == UsbConstants.USB_ENDPOINT_XFER_BULK }
-            val endpointIn = bulk.firstOrNull { it.direction == UsbConstants.USB_DIR_IN }
-            val endpointOut = bulk.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
-            if (endpointIn != null && endpointOut != null) {
-                MassStorage(device, iface, endpointIn, endpointOut)
-            } else {
-                null
-            }
+    manager.deviceList.values.mapNotNull(::massStorageOf)
+
+/**
+ * The Bulk-Only interface of [device], or null if it has none. A UAS
+ * enclosure lists its Bulk-Only interface as alternate setting 0; that one
+ * is picked.
+ */
+fun massStorageOf(device: UsbDevice): MassStorage? =
+    (0 until device.interfaceCount).firstNotNullOfOrNull { i ->
+        val iface = device.getInterface(i)
+        if (iface.interfaceClass != UsbConstants.USB_CLASS_MASS_STORAGE ||
+            iface.interfaceSubclass != SUBCLASS_SCSI ||
+            iface.interfaceProtocol != PROTOCOL_BULK_ONLY
+        ) {
+            return@firstNotNullOfOrNull null
         }
+        val bulk = (0 until iface.endpointCount)
+            .map(iface::getEndpoint)
+            .filter { it.type == UsbConstants.USB_ENDPOINT_XFER_BULK }
+        val endpointIn = bulk.firstOrNull { it.direction == UsbConstants.USB_DIR_IN }
+        val endpointOut = bulk.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
+        if (endpointIn != null && endpointOut != null) {
+            MassStorage(device, iface, endpointIn, endpointOut)
+        } else {
+            null
+        }
+    }
+
+/** The device of a USB_DEVICE_ATTACHED or USB_DEVICE_DETACHED broadcast or intent. */
+fun Intent.usbDevice(): UsbDevice? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+    } else {
+        @Suppress("DEPRECATION")
+        getParcelableExtra(UsbManager.EXTRA_DEVICE)
     }
 
 /** Ask the user for access to [device]; true when granted. */

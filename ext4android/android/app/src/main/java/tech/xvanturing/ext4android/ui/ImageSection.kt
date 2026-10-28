@@ -1,9 +1,6 @@
 package tech.xvanturing.ext4android.ui
 
-import android.content.ActivityNotFoundException
-import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
@@ -45,30 +42,6 @@ private const val RANDOM_READS = 200
 private const val RANDOM_READ_BYTES = 4096
 
 /**
- * OpenDocument that starts in a given folder, in the system's own picker
- * (DocumentsUI): some vendors answer ACTION_OPEN_DOCUMENT with a picker of
- * their own that leaves out other apps' storage. vivo OriginOS 6 does so
- * even for an intent limited to the DocumentsUI package; only naming the
- * activity reaches DocumentsUI.
- */
-private class OpenDocumentAt : ActivityResultContracts.OpenDocument() {
-    var initial: Uri? = null
-
-    override fun createIntent(context: Context, input: Array<String>): Intent =
-        super.createIntent(context, input).apply {
-            initial?.let { putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) }
-            documentsUi(context)?.let { component = it }
-        }
-}
-
-/**
- * The picker activity of the system's DocumentsUI: the one answering
- * ACTION_OPEN_DOCUMENT_TREE also answers ACTION_OPEN_DOCUMENT.
- */
-private fun documentsUi(context: Context): ComponentName? =
-    Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).resolveActivity(context.packageManager)
-
-/**
  * Debug tools for milestone M1 and experiment 3: a sample image, mounted
  * read-only and shown to other apps by the documents provider.
  */
@@ -98,12 +71,6 @@ fun ImageSection() {
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             run { withContext(Dispatchers.IO) { importFile(context, image, uri) } }
-        }
-    }
-    val picker = remember { OpenDocumentAt() }
-    val opener = rememberLauncherForActivityResult(picker) { uri ->
-        if (uri != null) {
-            message = openWithOtherApp(context, uri)
         }
     }
 
@@ -136,19 +103,10 @@ fun ImageSection() {
                 }) { Text(stringResource(if (readOnly) R.string.image_mount else R.string.image_mount_rw)) }
             }
         } else {
-            Button(enabled = !busy, onClick = {
-                picker.initial = DocumentsContract.buildDocumentUri(Volumes.AUTHORITY, DocumentIds.root(volume.rootId))
-                opener.launch(arrayOf("*/*"))
-            }) { Text(stringResource(R.string.image_pick_open)) }
+            VolumeActions(volume, enabled = !busy, run = ::run, show = { message = it })
             OutlinedButton(enabled = !busy, onClick = {
                 run { withContext(Dispatchers.IO) { measureReads(context, volume) } }
             }) { Text(stringResource(R.string.image_speed)) }
-            val writable = remember(volume) { runCatching { !Volumes.info(volume).readOnly }.getOrDefault(false) }
-            if (writable) {
-                OutlinedButton(enabled = !busy, onClick = {
-                    run { withContext(Dispatchers.IO) { providerCheck(context, volume) } }
-                }) { Text(stringResource(R.string.image_check_writes)) }
-            }
             OutlinedButton(enabled = !busy, onClick = {
                 run {
                     withContext(Dispatchers.IO) { Volumes.unmount(context, volume) }
@@ -190,18 +148,6 @@ private fun importFile(context: Context, image: File, uri: Uri): String {
         ?: return context.getString(R.string.failed, uri.toString())
     val bytes = pfd.use { Native.importIntoImage(image.path, it.fd, name) }
     return context.getString(R.string.image_imported, name, Formatter.formatShortFileSize(context, bytes))
-}
-
-private fun openWithOtherApp(context: Context, uri: Uri): String {
-    val intent = Intent(Intent.ACTION_VIEW)
-        .setDataAndType(uri, context.contentResolver.getType(uri))
-        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    return try {
-        context.startActivity(Intent.createChooser(intent, null))
-        uri.toString()
-    } catch (e: ActivityNotFoundException) {
-        context.getString(R.string.failed, e.message ?: uri.toString())
-    }
 }
 
 /** `big.bin` of the sample holds `offset % 251` at every offset. */

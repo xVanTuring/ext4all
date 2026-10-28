@@ -48,9 +48,9 @@ private fun documentsUi(context: Context): ComponentName? =
 
 /**
  * Checks on a mounted volume as other apps see it: pick a file in the
- * system picker and open it with another app; on a writable volume, every
- * kind of change through the documents provider. [run] runs a check and
- * shows its text; [show] shows a text.
+ * system picker and open it with another app; read and write speed; on a
+ * writable volume, every kind of change through the documents provider.
+ * [run] runs a check and shows its text; [show] shows a text.
  */
 @Composable
 fun VolumeActions(
@@ -70,6 +70,9 @@ fun VolumeActions(
         picker.initial = DocumentsContract.buildDocumentUri(Volumes.AUTHORITY, DocumentIds.root(volume.rootId))
         opener.launch(arrayOf("*/*"))
     }) { Text(stringResource(R.string.image_pick_open)) }
+    OutlinedButton(enabled = enabled, onClick = {
+        run { withContext(Dispatchers.IO) { speedTest(context, volume) } }
+    }) { Text(stringResource(R.string.volume_speed)) }
     val writable = remember(volume) { runCatching { !Volumes.info(volume).readOnly }.getOrDefault(false) }
     if (writable) {
         OutlinedButton(enabled = enabled, onClick = {

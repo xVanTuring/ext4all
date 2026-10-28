@@ -101,14 +101,20 @@ impl<T: Transport> Bot<T> {
         self.shrinks
     }
 
-    /// Half of `want` (whole pages, at least [`MIN_TRANSFER`]), also used
-    /// for later commands.
-    fn shrink(&mut self, want: usize) -> usize {
-        let n = (want / 2 / MIN_TRANSFER * MIN_TRANSFER).max(MIN_TRANSFER);
-        log::warn!("no kernel memory for a {want}-byte transfer; using {n}-byte transfers");
+    /// Halve the transfer size (whole pages, at least [`MIN_TRANSFER`]),
+    /// also for later commands; returns the new size of a bulk call.
+    fn shrink(&mut self) -> usize {
+        let was = self.t.max_transfer();
+        let n = (was / 2 / MIN_TRANSFER * MIN_TRANSFER).max(MIN_TRANSFER);
+        log::warn!("no kernel memory for a {was}-byte transfer; using {n}-byte transfers");
         self.t.set_max_transfer(n);
         self.shrinks += 1;
-        n
+        self.t.max_queued()
+    }
+
+    /// Whether ENOMEM can be met with smaller transfers.
+    fn can_shrink(&self) -> bool {
+        self.t.max_transfer() > MIN_TRANSFER
     }
 
     pub fn transport(&self) -> &T {
@@ -171,7 +177,7 @@ impl<T: Transport> Bot<T> {
             Err(e) => return self.fail(e),
         }
 
-        let mut max = self.t.max_transfer().max(512);
+        let mut max = self.t.max_queued().max(512);
         let mut transferred = 0;
         let mut early = None;
         match data {
@@ -202,7 +208,7 @@ impl<T: Transport> Bot<T> {
                             }
                             break;
                         }
-                        Err(e) if e.is_out_of_memory() && want > MIN_TRANSFER => max = self.shrink(want),
+                        Err(e) if e.is_out_of_memory() && self.can_shrink() => max = self.shrink(),
                         Err(e) => return self.fail(e),
                     }
                 }
@@ -223,7 +229,7 @@ impl<T: Transport> Bot<T> {
                             }
                             break;
                         }
-                        Err(e) if e.is_out_of_memory() && want > MIN_TRANSFER => max = self.shrink(want),
+                        Err(e) if e.is_out_of_memory() && self.can_shrink() => max = self.shrink(),
                         Err(e) => return self.fail(e),
                     }
                 }
@@ -308,6 +314,30 @@ mod tests {
         let o = bot.command(&[0x2A; 10], Data::Out(&data), WRAPPER_TIMEOUT).unwrap();
         assert_eq!(o, Outcome { transferred: 20_000, passed: true });
         assert_eq!((bot.shrinks(), bot.t.max_transfer()), (3, 8192));
+    }
+
+    /// A transport queueing four transfers per call gets data phases in
+    /// calls of four transfers; ENOMEM halves each transfer.
+    #[test]
+    fn queued_transfers_take_bigger_calls() {
+        let mut m = MockTransport::new(16384);
+        m.queued = 4;
+        m.push_in(vec![1u8; 100_000]);
+        m.push_csw(csw(1, 0, 0));
+        let mut bot = Bot::new(m);
+        let mut buf = vec![0u8; 100_000];
+        let o = bot.command(&[0x28; 10], Data::In(&mut buf), WRAPPER_TIMEOUT).unwrap();
+        assert_eq!(o, Outcome { transferred: 100_000, passed: true });
+        assert_eq!(bot.t.events[1..3], [Event::In(65536), Event::In(34464)]);
+
+        bot.t.enomem_above = Some(40_000);
+        bot.t.push_csw(csw(2, 0, 0));
+        let data = vec![5u8; 50_000];
+        let o = bot.command(&[0x2A; 10], Data::Out(&data), WRAPPER_TIMEOUT).unwrap();
+        assert_eq!(o, Outcome { transferred: 50_000, passed: true });
+        assert_eq!((bot.shrinks(), bot.t.max_transfer()), (1, 8192));
+        let n = bot.t.events.len();
+        assert_eq!(bot.t.events[n - 3..], [Event::Out(32768), Event::Out(17232), Event::In(CSW_LEN)]);
     }
 
     #[test]

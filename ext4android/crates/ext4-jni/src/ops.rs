@@ -295,22 +295,28 @@ fn write_all(fs: &mut Fs, ino: Ino, offset: u64, data: &[u8]) -> Result<()> {
 }
 
 /// Open the regular file at `path` for a descriptor, emptied first with
-/// `truncate`; returns its inode and size. Pair with [`Volume::closed`].
-pub fn open(vol: &Volume, path: &str, truncate: bool) -> Result<(Ino, u64)> {
-    let (ino, size) = vol.fs.with(|fs| {
+/// `truncate`; returns the descriptor's handle and the size. Pair with
+/// [`Volume::close_file`].
+pub fn open(vol: &Volume, path: &str, truncate: bool) -> Result<(u64, u64)> {
+    let (ino, size, truncated) = vol.fs.with(|fs| {
         let (ino, size) = docs::open(fs, path)?;
         if truncate && size > 0 {
             fs.truncate(ino, 0)?;
-            return Ok((ino, 0));
+            return Ok((ino, 0, true));
         }
-        Ok((ino, size))
+        Ok((ino, size, false))
     })?;
-    vol.opened(ino);
-    Ok((ino, size))
+    if truncated {
+        vol.changed(ino);
+    }
+    Ok((vol.open_file(ino), size))
 }
 
 pub fn write(vol: &Volume, ino: Ino, offset: u64, data: &[u8]) -> Result<()> {
-    vol.fs.with(|fs| write_all(fs, ino, offset, data))
+    let r = vol.fs.with(|fs| write_all(fs, ino, offset, data));
+    // also after a failure: part of it may be written
+    vol.changed(ino);
+    r
 }
 
 pub fn size(vol: &Volume, ino: Ino) -> Result<u64> {
@@ -445,7 +451,8 @@ mod tests {
         let free = || vol.fs.with(|fs| Ok(fs.statfs().free_files)).unwrap();
         let (_, path) = create(&vol, "", "new.txt", false).unwrap();
         let before = free();
-        let (ino, size) = open(&vol, &path, false).unwrap();
+        let (h, size) = open(&vol, &path, false).unwrap();
+        let ino = vol.file(h).unwrap().ino;
         assert_eq!(size, 0);
         write(&vol, ino, 0, b"hello ").unwrap();
         write(&vol, ino, 6, b"world").unwrap();
@@ -459,15 +466,16 @@ mod tests {
         vol.fs.with(|fs| docs::read(fs, ino, 0, &mut b)).unwrap();
         assert_eq!(&b, b"hello world");
         assert_eq!(free(), before, "not freed while open");
-        vol.closed(ino, true).unwrap();
+        vol.close_file(h, true).unwrap();
         assert_eq!(free(), before + 1);
+        assert!(vol.file(h).is_err() && vol.close_file(h, false).is_err());
 
         // "wt" empties the file
-        let (ino, _) = open(&vol, "README.txt", false).unwrap();
-        vol.closed(ino, false).unwrap();
-        let (ino, size) = open(&vol, "README.txt", true).unwrap();
+        let (h, _) = open(&vol, "README.txt", false).unwrap();
+        vol.close_file(h, false).unwrap();
+        let (h, size) = open(&vol, "README.txt", true).unwrap();
         assert_eq!(size, 0);
-        vol.closed(ino, true).unwrap();
+        vol.close_file(h, true).unwrap();
         assert!(read_all(&vol, "README.txt").is_empty());
         drop(vol);
         volumes::unmount(id).unwrap();
@@ -493,11 +501,12 @@ mod tests {
         let vol = volumes::get(id).unwrap();
 
         let (_, path) = create(&vol, "docs", "report.txt", false).unwrap();
-        let (ino, _) = open(&vol, &path, false).unwrap();
+        let (h, _) = open(&vol, &path, false).unwrap();
+        let ino = vol.file(h).unwrap().ino;
         for i in 0..64u64 {
             write(&vol, ino, i * 65536, &[i as u8; 65536]).unwrap();
         }
-        vol.closed(ino, true).unwrap();
+        vol.close_file(h, true).unwrap();
         let path = rename(&vol, &path, "报告.txt").unwrap();
         let path = move_to(&vol, &path, "photos").unwrap();
         create(&vol, "photos", "相册", true).unwrap();
@@ -505,9 +514,9 @@ mod tests {
         copy(&vol, "big.bin", "").unwrap();
         delete(&vol, "deep").unwrap();
         // deleted while open, freed on close
-        let (ino, _) = open(&vol, &path, false).unwrap();
+        let (h, _) = open(&vol, &path, false).unwrap();
         delete(&vol, &path).unwrap();
-        vol.closed(ino, false).unwrap();
+        vol.close_file(h, false).unwrap();
         for i in 0..200 {
             create(&vol, "docs", &format!("many-{i}.txt"), false).unwrap();
         }

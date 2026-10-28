@@ -421,9 +421,9 @@ mod tests {
         let id = mount_disk(disk.clone(), false).unwrap()[0];
         let v = volumes::get(id).unwrap();
         ops::create(&v, "", "notes.txt", false).unwrap();
-        let (ino, _) = ops::open(&v, "notes.txt", false).unwrap();
-        ops::write(&v, ino, 0, b"written over USB").unwrap();
-        v.closed(ino, true).unwrap();
+        let (h, _) = ops::open(&v, "notes.txt", false).unwrap();
+        ops::write(&v, v.file(h).unwrap().ino, 0, b"written over USB").unwrap();
+        v.close_file(h, true).unwrap();
         drop(v);
         volumes::unmount(id).unwrap();
 

@@ -3,8 +3,10 @@
 use ext4_core::{BlockDevice, Error, FileDevice, Fs, Ino, MountOptions, Result, SharedFs, Slice};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use crate::files::OpenFile;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// Changes reach the journal at least this often.
 const COMMIT_INTERVAL: Duration = Duration::from_secs(5);
@@ -13,34 +15,66 @@ pub struct Volume {
     pub fs: SharedFs,
     pub label: String,
     pub uuid: [u8; 16],
-    /// Open file descriptors per inode. The volume is mounted with
-    /// deferred unlinking: a deleted inode is freed only once no
-    /// descriptor uses it (Linux semantics).
-    open: Mutex<HashMap<Ino, u32>>,
+    /// What the file system is on (a partition of a USB disk, an image).
+    dev: Arc<dyn BlockDevice>,
+    /// Inodes with open descriptors. The volume is mounted with deferred
+    /// unlinking: a deleted inode is freed only once no descriptor uses it
+    /// (Linux semantics).
+    open: Mutex<HashMap<Ino, OpenInode>>,
+    /// Descriptors handed out, by handle.
+    files: Mutex<HashMap<u64, Arc<OpenFile>>>,
+    next_file: AtomicU64,
+}
+
+/// Descriptors of an open inode, and how often its data changed since it
+/// was opened: read-ahead of the descriptors is stale after a change.
+#[derive(Default)]
+struct OpenInode {
+    descriptors: u32,
+    changes: u64,
 }
 
 impl Volume {
-    fn open_table(&self) -> std::sync::MutexGuard<'_, HashMap<Ino, u32>> {
+    fn open_table(&self) -> MutexGuard<'_, HashMap<Ino, OpenInode>> {
         self.open.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn files_table(&self) -> MutexGuard<'_, HashMap<u64, Arc<OpenFile>>> {
+        self.files.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn is_open(&self, ino: Ino) -> bool {
         self.open_table().contains_key(&ino)
     }
 
-    /// A descriptor for `ino` was handed out.
-    pub fn opened(&self, ino: Ino) {
-        *self.open_table().entry(ino).or_insert(0) += 1;
+    /// Hand out a descriptor for `ino`; returns its handle.
+    pub fn open_file(&self, ino: Ino) -> u64 {
+        self.open_table().entry(ino).or_default().descriptors += 1;
+        let handle = self.next_file.fetch_add(1, Ordering::Relaxed);
+        self.files_table().insert(handle, Arc::new(OpenFile::new(ino)));
+        handle
     }
 
-    /// A descriptor for `ino` was closed: free the inode if it was deleted
+    pub fn file(&self, handle: u64) -> Result<Arc<OpenFile>> {
+        self.files_table()
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| Error::invalid(format!("no open file {handle}")))
+    }
+
+    /// The descriptor `handle` was closed: free its inode if it was deleted
     /// meanwhile and this was its last descriptor; commit what was written.
-    pub fn closed(&self, ino: Ino, written: bool) -> Result<()> {
+    pub fn close_file(&self, handle: u64, written: bool) -> Result<()> {
+        let ino = self
+            .files_table()
+            .remove(&handle)
+            .ok_or_else(|| Error::invalid(format!("no open file {handle}")))?
+            .ino;
         let last = {
             let mut t = self.open_table();
             match t.get_mut(&ino) {
-                Some(n) if *n > 1 => {
-                    *n -= 1;
+                Some(o) if o.descriptors > 1 => {
+                    o.descriptors -= 1;
                     false
                 }
                 Some(_) => {
@@ -59,8 +93,22 @@ impl Volume {
         })
     }
 
+    /// The data of `ino` changed (written, truncated): what descriptors
+    /// read ahead of it is stale. Call it once the change is done.
+    pub fn changed(&self, ino: Ino) {
+        if let Some(o) = self.open_table().get_mut(&ino) {
+            o.changes += 1;
+        }
+    }
+
+    /// Changes of `ino`'s data while it has been open (see
+    /// [`Volume::changed`]).
+    pub fn changes(&self, ino: Ino) -> u64 {
+        self.open_table().get(&ino).map_or(0, |o| o.changes)
+    }
+
     /// Free inodes an operation unlinked, unless a descriptor still uses
-    /// them (then [`Volume::closed`] frees them).
+    /// them (then [`Volume::close_file`] frees them).
     pub fn reclaim(&self, fs: &mut Fs, inos: &[Ino]) -> Result<()> {
         for &ino in inos {
             if !self.is_open(ino) {
@@ -159,7 +207,7 @@ fn is_luks(dev: &dyn BlockDevice) -> bool {
 
 pub fn mount_on(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
     let mut fs = Fs::mount(
-        dev,
+        dev.clone(),
         MountOptions {
             read_only,
             ..Default::default()
@@ -173,8 +221,28 @@ pub fn mount_on(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
         fs: SharedFs::new(fs, COMMIT_INTERVAL),
         label,
         uuid,
+        dev,
         open: Mutex::new(HashMap::new()),
+        files: Mutex::new(HashMap::new()),
+        next_file: AtomicU64::new(1),
     }))
+}
+
+/// MB/s reading up to `bytes` from the start of the volume's device in
+/// 1 MiB reads, beside the file system: the speed of the disk (for a USB
+/// disk, of its transfers) without the file system and the documents
+/// provider.
+pub fn device_read_speed(v: &Volume, bytes: u64) -> Result<f64> {
+    const CHUNK: u64 = 1 << 20;
+    let total = bytes.min(v.dev.size()) / CHUNK * CHUNK;
+    let mut buf = vec![0u8; CHUNK as usize];
+    let started = Instant::now();
+    let mut done = 0;
+    while done < total {
+        v.dev.read_at(done, &mut buf)?;
+        done += CHUNK;
+    }
+    Ok(total as f64 / 1e6 / started.elapsed().as_secs_f64().max(1e-9))
 }
 
 /// Mount the file system of a device (tests: an in-memory device).
@@ -223,6 +291,7 @@ mod tests {
         assert_eq!(v.label, "SAMPLE");
         let entries = v.fs.with(|fs| docs::list(fs, "")).unwrap();
         assert!(entries.iter().any(|e| e.name == "big.bin" && e.size == 16 << 20));
+        assert!(device_read_speed(&v, 8 << 20).unwrap() > 0.0);
         let info = info(&v).unwrap();
         assert_eq!(&info[0..2], &6u16.to_le_bytes());
         assert_eq!(&info[2..8], b"SAMPLE");

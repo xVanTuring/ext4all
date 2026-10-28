@@ -57,6 +57,13 @@ object Native {
     @JvmStatic
     external fun abandon(volume: Int)
 
+    /**
+     * MB/s reading the first [mib] MiB of the volume's device directly:
+     * the disk without the file system and the documents provider.
+     */
+    @JvmStatic
+    external fun deviceReadSpeed(volume: Int, mib: Int): Double
+
     /** See [Records.volumeInfo]. */
     @JvmStatic
     external fun volumeInfo(volume: Int): ByteArray
@@ -71,25 +78,28 @@ object Native {
 
     /**
      * Opens the regular file at [path] for a descriptor, emptied first with
-     * [truncate]: `[ino, size]`. Every open is paired with [closeFile].
+     * [truncate]: `[handle, size]`. Every open is paired with [closeFile].
      */
     @JvmStatic
     external fun openFile(volume: Int, path: String, truncate: Boolean): LongArray
 
-    /** A descriptor from [openFile] was closed; [written] commits the changes. */
+    /** The descriptor [handle] from [openFile] was closed; [written] commits the changes. */
     @JvmStatic
-    external fun closeFile(volume: Int, ino: Int, written: Boolean)
+    external fun closeFile(volume: Int, handle: Long, written: Boolean)
 
-    /** Reads up to [len] bytes at [offset] of inode [ino] into [buf]; 0 at the end of the file. */
+    /**
+     * Reads up to [len] bytes at [offset] through the descriptor [handle]
+     * into [buf]; 0 at the end of the file. Reads in order are read ahead.
+     */
     @JvmStatic
-    external fun read(volume: Int, ino: Int, offset: Long, buf: ByteArray, len: Int): Int
+    external fun read(volume: Int, handle: Long, offset: Long, buf: ByteArray, len: Int): Int
 
-    /** Writes [len] bytes of [buf] at [offset] of inode [ino]. */
+    /** Writes [len] bytes of [buf] at [offset] through the descriptor [handle]. */
     @JvmStatic
-    external fun write(volume: Int, ino: Int, offset: Long, buf: ByteArray, len: Int)
+    external fun write(volume: Int, handle: Long, offset: Long, buf: ByteArray, len: Int)
 
     @JvmStatic
-    external fun fileSize(volume: Int, ino: Int): Long
+    external fun fileSize(volume: Int, handle: Long): Long
 
     /** fsync: commits what was written so far. */
     @JvmStatic

@@ -99,14 +99,14 @@ class Ext4DocumentsProvider : DocumentsProvider() {
         // keep the old tail. Only "rw" and "wa" keep the contents.
         val truncate = writing && (flags and ParcelFileDescriptor.MODE_TRUNCATE != 0 ||
             access == ParcelFileDescriptor.MODE_WRITE_ONLY && !append)
-        val ino = read { Native.openFile(volume.id, path, truncate) }[0].toInt()
-        val thread = HandlerThread("ext4-fd-$ino").apply { start() }
+        val file = read { Native.openFile(volume.id, path, truncate) }[0]
+        val thread = HandlerThread("ext4-fd-$file").apply { start() }
         val storage = ctx.getSystemService(StorageManager::class.java)
         return try {
-            storage.openProxyFileDescriptor(access, FileCallback(volume.id, ino, append, thread), Handler(thread.looper))
+            storage.openProxyFileDescriptor(access, FileCallback(volume.id, file, append, thread), Handler(thread.looper))
         } catch (e: IOException) {
             thread.quitSafely()
-            runCatching { Native.closeFile(volume.id, ino, false) }
+            runCatching { Native.closeFile(volume.id, file, false) }
             throw FileNotFoundException("cannot open $documentId: ${e.message}")
         }
     }

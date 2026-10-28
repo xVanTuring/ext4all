@@ -12,6 +12,7 @@
 
 mod docs;
 mod errors;
+mod files;
 #[cfg(target_os = "android")]
 mod logger;
 mod names;
@@ -252,6 +253,23 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_volumeInfo<'c
     .resolve::<ThrowRuntimeExAndDefault>()
 }
 
+/// MB/s reading the first `mib` MiB of the volume's device directly (see
+/// [`volumes::device_read_speed`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_deviceReadSpeed<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    mib: jint,
+) -> jni::sys::jdouble {
+    env.with_env(|env| {
+        call(env, |_| {
+            Ok(volumes::device_read_speed(&*volume(id)?, (mib.max(0) as u64) << 20)?)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
 /// The document at an encoded path, as one entry (see
 /// [`docs::encode_entries`]).
 #[unsafe(no_mangle)]
@@ -290,7 +308,7 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_list<'caller>
 }
 
 /// Open a regular file for a descriptor (emptied first with `truncate`):
-/// `[ino, size]`. Every open is paired with `closeFile`.
+/// `[handle, size]`. Every open is paired with `closeFile`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_openFile<'caller>(
     mut env: EnvUnowned<'caller>,
@@ -302,9 +320,9 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_openFile<'cal
     env.with_env(|env| {
         call(env, |env| {
             let path = string(env, &path)?;
-            let (ino, size) = ops::open(&*volume(id)?, &path, truncate)?;
+            let (handle, size) = ops::open(&*volume(id)?, &path, truncate)?;
             let out = env.new_long_array(2)?;
-            out.set_region(env, 0, &[ino as jlong, size as jlong])?;
+            out.set_region(env, 0, &[handle as jlong, size as jlong])?;
             Ok(out)
         })
     })
@@ -317,20 +335,20 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_closeFile<'ca
     mut env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     id: jint,
-    ino: jint,
+    handle: jlong,
     written: jboolean,
 ) {
-    env.with_env(|env| call(env, |_| Ok(volume(id)?.closed(ino as u32, written)?)))
+    env.with_env(|env| call(env, |_| Ok(volume(id)?.close_file(handle as u64, written)?)))
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 
-/// Write `len` bytes of `buf` at `offset` of inode `ino`.
+/// Write `len` bytes of `buf` at `offset` through the descriptor `handle`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_write<'caller>(
     mut env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     id: jint,
-    ino: jint,
+    handle: jlong,
     offset: jlong,
     buf: JByteArray<'caller>,
     len: jint,
@@ -341,7 +359,9 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_write<'caller
             buf.get_region(env, 0, &mut signed)?;
             // SAFETY: i8 and u8 have the same size and alignment
             let data = unsafe { std::slice::from_raw_parts(signed.as_ptr() as *const u8, signed.len()) };
-            Ok(ops::write(&*volume(id)?, ino as u32, offset.max(0) as u64, data)?)
+            let v = volume(id)?;
+            let ino = v.file(handle as u64)?.ino;
+            Ok(ops::write(&v, ino, offset.max(0) as u64, data)?)
         })
     })
     .resolve::<ThrowRuntimeExAndDefault>()
@@ -352,10 +372,16 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_fileSize<'cal
     mut env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     id: jint,
-    ino: jint,
+    handle: jlong,
 ) -> jlong {
-    env.with_env(|env| call(env, |_| Ok(ops::size(&*volume(id)?, ino as u32)? as jlong)))
-        .resolve::<ThrowRuntimeExAndDefault>()
+    env.with_env(|env| {
+        call(env, |_| {
+            let v = volume(id)?;
+            let ino = v.file(handle as u64)?.ino;
+            Ok(ops::size(&v, ino)? as jlong)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
 }
 
 /// fsync: commit what was written so far.
@@ -469,14 +495,15 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_copyDocument<
     .resolve::<ThrowRuntimeExAndDefault>()
 }
 
-/// Read up to `len` bytes at `offset` of inode `ino` into `buf`; returns
-/// the bytes read (0 at the end of the file).
+/// Read up to `len` bytes at `offset` through the descriptor `handle` into
+/// `buf`; returns the bytes read (0 at the end of the file). Reads in order
+/// are read ahead (see [`files`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_read<'caller>(
     mut env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     id: jint,
-    ino: jint,
+    handle: jlong,
     offset: jlong,
     buf: JByteArray<'caller>,
     len: jint,
@@ -484,9 +511,8 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_read<'caller>
     env.with_env(|env| {
         call(env, |env| {
             let mut data = vec![0u8; len.max(0) as usize];
-            let n = volume(id)?
-                .fs
-                .with(|fs| docs::read(fs, ino as u32, offset.max(0) as u64, &mut data))?;
+            let v = volume(id)?;
+            let n = v.file(handle as u64)?.read(&v, offset.max(0) as u64, &mut data)?;
             // SAFETY: u8 and i8 have the same size and alignment
             let signed = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i8, n) };
             buf.set_region(env, 0, signed)?;

@@ -30,6 +30,8 @@ pub struct MockTransport {
     /// Bulk transfers longer than this fail with ENOMEM, like usbdevfs
     /// when the kernel cannot allocate their buffer.
     pub enomem_above: Option<usize>,
+    /// Transfers one call takes (see [`Transport::max_queued`]).
+    pub queued: usize,
     pub events: Vec<Event>,
     pub written: Vec<u8>,
 }
@@ -49,6 +51,7 @@ impl MockTransport {
             out_error: None,
             class_in_stall: false,
             enomem_above: None,
+            queued: 1,
             events: Vec::new(),
             written: Vec::new(),
         }
@@ -128,6 +131,10 @@ impl Transport for MockTransport {
 
     fn max_transfer(&self) -> usize {
         self.max
+    }
+
+    fn max_queued(&self) -> usize {
+        self.max * self.queued
     }
 
     fn set_max_transfer(&mut self, bytes: usize) {

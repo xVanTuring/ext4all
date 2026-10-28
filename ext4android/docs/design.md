@@ -62,7 +62,7 @@ Rust 侧：
   - READ CAPACITY(10)，容量超过 2 TiB 时改用 (16)；
   - READ(10)/WRITE(10)，超过 2 TiB 时改用 (16)；
   - SYNCHRONIZE CACHE(10) 作为 `BlockDevice::flush` 的写屏障。部分转接芯片不支持这条命令，需要能识别出来并记录下来。
-- 单条命令的传输长度先按 64 KiB 实现，M4 再实测调整。
+- 单次传输默认 64 KiB，一个数据阶段一次排队 4 个（usbdevfs 异步传输 `USBDEVFS_SUBMITURB`）。和 libusb 一样，第一个之后的传输标为续传（`USBDEVFS_URB_BULK_CONTINUATION`），输入方向标为短包算错（`USBDEVFS_URB_SHORT_NOT_OK`）：一个传输提前结束或出错时，内核取消其余的，它们不会读走下一阶段的状态包。超时后取消并收回全部传输再返回；收不回时这个连接不再收回任何传输（内核收回时会写用户内存），之后的传输全部报错。
 - 扇区大小取 READ CAPACITY 的结果（512 或 4096），对齐交给 `ext4-core` 现有的 `AlignedDevice`。
 - 先只支持 LUN 0；GET MAX LUN 大于 0 时在界面上提示。
 - 收发通过一个 `Transport` trait 抽象出来，单元测试用模拟实现。如果实测发现某些系统不允许 App 对这个描述符做 ioctl，就换成 Kotlin 的 `bulkTransfer` 加 JNI 回调实现同一个 trait。
@@ -85,7 +85,8 @@ macOS 上由系统提供分区设备（`disk4s1`），所以 `ext4-core` 里没�
   - 额外规定：写过的文件被关闭（`onRelease`）或调用 `onFsync` 时，立即提交并发送写屏障。手机上不点“安全移除”就直接拔线的情况很常见，修改要尽快落盘。
 - 错误转换：`ext4_core::Error` 的 `errno()` 用的是 macOS 的编号，Android 的不同（例如 `ENOTEMPTY` 在 macOS 是 66，在 Linux 是 39）。JNI 层直接按错误种类转换成 Java 异常（`FileNotFoundException`、`IOException` 等），不使用 `errno()`。
 - 文件名：两侧都按字节数组传递，由 Kotlin 侧按 UTF-8 解码后显示。
-- 打开文件表：记录每个 inode 被打开的次数。挂载时开启 `set_defer_unlinked(true)`，文件被删除时如果仍有打开的描述符，就等最后一次 `onRelease` 后再调用 `reclaim`，和 Linux 上“删除后仍可读写到关闭为止”的行为一致。
+- 打开文件表：每个描述符一个编号（Kotlin 的 `FileCallback` 用它读写）；另外记录每个 inode 被打开的次数和打开期间内容被改的次数。
+- 预读：系统每次只交给我们 128 KiB 的读请求，一个接一个。一个描述符按顺序读时，在另一个线程上提前读下一段 1 MiB（设备读取在文件系统锁之外，`SharedFs::read_parallel`），App 处理当前这段时下一段已经在读。写入或截断后 inode 的修改次数加一，之前预读的数据不再使用。挂载时开启 `set_defer_unlinked(true)`，文件被删除时如果仍有打开的描述符，就等最后一次 `onRelease` 后再调用 `reclaim`，和 Linux 上“删除后仍可读写到关闭为止”的行为一致。
 
 ### 4. DocumentsProvider
 

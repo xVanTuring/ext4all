@@ -7,6 +7,7 @@ import android.system.OsConstants
 import android.util.Log
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 import tech.xvanturing.ext4android.jni.Ext4Exception
 import tech.xvanturing.ext4android.jni.Native
 
@@ -21,22 +22,34 @@ import tech.xvanturing.ext4android.jni.Native
  */
 class FileCallback(
     private val volume: Int,
-    private val ino: Int,
+    /** The descriptor's handle in libext4android. */
+    private val file: Long,
     private val append: Boolean,
     private val thread: HandlerThread,
 ) : ProxyFileDescriptorCallback() {
     private var written = false
 
-    override fun onGetSize(): Long = call("size") { Native.fileSize(volume, ino) }
+    override fun onGetSize(): Long = call("size") { Native.fileSize(volume, file) }
 
     override fun onRead(offset: Long, size: Int, data: ByteArray): Int =
-        call("read") { Native.read(volume, ino, offset, data, size) }
+        call("read") {
+            val start = System.nanoTime()
+            val n = Native.read(volume, file, offset, data, size)
+            Requests.reads.incrementAndGet()
+            Requests.readBytes.addAndGet(size.toLong())
+            Requests.readNanos.addAndGet(System.nanoTime() - start)
+            n
+        }
 
     override fun onWrite(offset: Long, size: Int, data: ByteArray): Int =
         call("write") {
-            val at = if (append) Native.fileSize(volume, ino) else offset
-            Native.write(volume, ino, at, data, size)
+            val start = System.nanoTime()
+            val at = if (append) Native.fileSize(volume, file) else offset
+            Native.write(volume, file, at, data, size)
             written = true
+            Requests.writes.incrementAndGet()
+            Requests.writeBytes.addAndGet(size.toLong())
+            Requests.writeNanos.addAndGet(System.nanoTime() - start)
             size
         }
 
@@ -46,9 +59,9 @@ class FileCallback(
 
     override fun onRelease() {
         try {
-            Native.closeFile(volume, ino, written)
+            Native.closeFile(volume, file, written)
         } catch (e: IOException) {
-            Log.w(TAG, "closing inode $ino failed", e)
+            Log.w(TAG, "closing file $file failed", e)
         } finally {
             thread.quitSafely()
         }
@@ -58,16 +71,33 @@ class FileCallback(
         try {
             block()
         } catch (e: Ext4Exception) {
-            Log.w(TAG, "$op of inode $ino failed", e)
+            Log.w(TAG, "$op of file $file failed", e)
             throw ErrnoException(op, e.errno)
         } catch (e: FileNotFoundException) {
             throw ErrnoException(op, OsConstants.ENOENT)
         } catch (e: IOException) {
-            Log.w(TAG, "$op of inode $ino failed", e)
+            Log.w(TAG, "$op of file $file failed", e)
             throw ErrnoException(op, OsConstants.EIO)
         }
 
     private companion object {
         const val TAG = "ext4android"
+    }
+
+    /**
+     * Reads and writes the system asked of all proxy descriptors, and the
+     * time spent in libext4android for them, for the speed test.
+     */
+    object Requests {
+        val reads = AtomicLong()
+        val readBytes = AtomicLong()
+        val readNanos = AtomicLong()
+        val writes = AtomicLong()
+        val writeBytes = AtomicLong()
+        val writeNanos = AtomicLong()
+
+        fun reset() {
+            for (n in listOf(reads, readBytes, readNanos, writes, writeBytes, writeNanos)) n.set(0)
+        }
     }
 }

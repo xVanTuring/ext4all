@@ -63,6 +63,10 @@
     <string name="image_speed">Measure reads through the documents provider</string>
     <string name="image_check_writes">Test changes through the documents provider</string>
     <string name="image_speed_result">Sequential read of %1$s: %2$.1f MB/s\n%3$d random reads of 4 KiB: %4$.2f ms each\nData: %5$s</string>
+    <string name="volume_speed">Measure read and write speed</string>
+    <string name="speed_file">Wrote %1$s: %2$.1f MB/s (%3$d requests of %4$s on average, %5$.0f%% of the time in the file system and the disk)\nRead it back: %6$.1f MB/s (%7$d requests of %8$s on average, %9$.0f%% of the time in the file system and the disk)\nData: %10$s</string>
+    <string name="speed_no_space">Not enough free space for the file test (needs %1$s)</string>
+    <string name="speed_device">Reading the first %1$d MiB of the disk directly (without the file system and the documents provider): %2$.1f MB/s</string>
     <string name="data_ok">correct</string>
     <string name="data_bad">WRONG</string>
 </resources>

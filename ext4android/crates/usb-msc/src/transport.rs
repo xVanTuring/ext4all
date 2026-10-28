@@ -21,9 +21,17 @@ pub trait Transport: Send {
     /// received.
     fn class_in(&mut self, request: u8, buf: &mut [u8]) -> Result<usize>;
 
-    /// Largest single bulk transfer; bigger data phases are split.
+    /// Largest single bulk transfer.
     fn max_transfer(&self) -> usize {
         64 * 1024
+    }
+
+    /// Most bytes one `bulk_in` or `bulk_out` call takes: a transport that
+    /// queues several transfers of [`Transport::max_transfer`] at once
+    /// takes more. Bigger data phases are split into calls of this size;
+    /// a call that moves less than asked ended on a short packet.
+    fn max_queued(&self) -> usize {
+        self.max_transfer()
     }
 
     /// Change the largest single bulk transfer, where supported.

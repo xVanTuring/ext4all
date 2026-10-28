@@ -60,6 +60,10 @@
     <string name="image_speed">通过文档提供者测读取速度</string>
     <string name="image_check_writes">通过文档提供者测试写操作</string>
     <string name="image_speed_result">顺序读 %1$s：%2$.1f MB/s\n随机读 %3$d 次，每次 4 KiB：平均 %4$.2f ms\n数据：%5$s</string>
+    <string name="volume_speed">测读写速度</string>
+    <string name="speed_file">写入 %1$s：%2$.1f MB/s（%3$d 次请求，平均每次 %4$s，%5$.0f%% 的时间用在文件系统和盘上）\n读回：%6$.1f MB/s（%7$d 次请求，平均每次 %8$s，%9$.0f%% 的时间用在文件系统和盘上）\n数据：%10$s</string>
+    <string name="speed_no_space">剩余空间不够做文件测试（需要 %1$s）</string>
+    <string name="speed_device">直接读盘的前 %1$d MiB（不经过文件系统和文档提供者）：%2$.1f MB/s</string>
     <string name="data_ok">正确</string>
     <string name="data_bad">有误</string>
 </resources>

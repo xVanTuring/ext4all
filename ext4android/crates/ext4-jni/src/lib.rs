@@ -270,6 +270,66 @@ pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_deviceReadSpe
     .resolve::<ThrowRuntimeExAndDefault>()
 }
 
+/// MB/s reading the regular file at an encoded path through the file
+/// system, without the documents provider (see
+/// [`volumes::file_read_speed`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_fileReadSpeed<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    path: JString<'caller>,
+) -> jni::sys::jdouble {
+    env.with_env(|env| {
+        call(env, |env| {
+            let path = string(env, &path)?;
+            Ok(volumes::file_read_speed(&*volume(id)?, &path)?)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// MB/s writing `mib` MiB to a new file in writes of `chunk_kib` KiB,
+/// without the documents provider (see [`volumes::file_write_speed`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_fileWriteSpeed<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+    mib: jint,
+    chunk_kib: jint,
+) -> jni::sys::jdouble {
+    env.with_env(|env| {
+        call(env, |_| {
+            let bytes = (mib.max(0) as u64) << 20;
+            let chunk = (chunk_kib.max(1) as usize) << 10;
+            Ok(volumes::file_write_speed(&*volume(id)?, bytes, chunk)?)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// The USB transfers of the volume's disk: `[bytes per transfer, times
+/// halved]`, or empty when it is not on a USB disk.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_xvanturing_ext4android_jni_Native_usbTransfers<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jint,
+) -> JLongArray<'caller> {
+    env.with_env(|env| {
+        call(env, |env| {
+            let state: Vec<jlong> = volumes::usb_transfers(&*volume(id)?)
+                .map(|(size, halved)| vec![size as jlong, halved as jlong])
+                .unwrap_or_default();
+            let out = env.new_long_array(state.len())?;
+            out.set_region(env, 0, &state)?;
+            Ok(out)
+        })
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
 /// The document at an encoded path, as one entry (see
 /// [`docs::encode_entries`]).
 #[unsafe(no_mangle)]

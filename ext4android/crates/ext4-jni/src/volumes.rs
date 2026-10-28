@@ -3,7 +3,8 @@
 use ext4_core::{BlockDevice, Error, FileDevice, Fs, Ino, MountOptions, Result, SharedFs, Slice};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use crate::files::OpenFile;
+use crate::files::{self, OpenFile};
+use crate::{docs, ops};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -17,6 +18,8 @@ pub struct Volume {
     pub uuid: [u8; 16],
     /// What the file system is on (a partition of a USB disk, an image).
     dev: Arc<dyn BlockDevice>,
+    /// The USB disk under it, for the speed test.
+    usb: Option<Arc<dyn UsbTransfers>>,
     /// Inodes with open descriptors. The volume is mounted with deferred
     /// unlinking: a deleted inode is freed only once no descriptor uses it
     /// (Linux semantics).
@@ -24,6 +27,12 @@ pub struct Volume {
     /// Descriptors handed out, by handle.
     files: Mutex<HashMap<u64, Arc<OpenFile>>>,
     next_file: AtomicU64,
+}
+
+/// The state of a USB disk's transfers: the size of one transfer now and
+/// how often it was halved after the kernel had no memory for it.
+pub trait UsbTransfers: Send + Sync {
+    fn transfers(&self) -> (usize, u32);
 }
 
 /// Descriptors of an open inode, and how often its data changed since it
@@ -205,7 +214,7 @@ fn is_luks(dev: &dyn BlockDevice) -> bool {
     matches!(ext4_core::luks::Header::read(dev), Ok(Some(_)))
 }
 
-pub fn mount_on(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
+pub fn mount_on(dev: Arc<dyn BlockDevice>, read_only: bool, usb: Option<Arc<dyn UsbTransfers>>) -> Result<u32> {
     let mut fs = Fs::mount(
         dev.clone(),
         MountOptions {
@@ -222,6 +231,7 @@ pub fn mount_on(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
         label,
         uuid,
         dev,
+        usb,
         open: Mutex::new(HashMap::new()),
         files: Mutex::new(HashMap::new()),
         next_file: AtomicU64::new(1),
@@ -242,13 +252,67 @@ pub fn device_read_speed(v: &Volume, bytes: u64) -> Result<f64> {
         v.dev.read_at(done, &mut buf)?;
         done += CHUNK;
     }
-    Ok(total as f64 / 1e6 / started.elapsed().as_secs_f64().max(1e-9))
+    Ok(mb_per_s(total, started))
+}
+
+fn mb_per_s(bytes: u64, started: Instant) -> f64 {
+    bytes as f64 / 1e6 / started.elapsed().as_secs_f64().max(1e-9)
+}
+
+/// MB/s reading the regular file at `path` through the file system in
+/// 1 MiB reads (device reads outside the lock), as read-ahead does, but
+/// without the documents provider.
+pub fn file_read_speed(v: &Volume, path: &str) -> Result<f64> {
+    let (ino, size) = v.fs.with(|fs| docs::open(fs, path))?;
+    let mut buf = vec![0u8; 1 << 20];
+    let started = Instant::now();
+    let mut done = 0;
+    while done < size {
+        let n = files::read_at(v, ino, done, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        done += n as u64;
+    }
+    Ok(mb_per_s(done, started))
+}
+
+/// MB/s writing `bytes` to a new file in writes of `chunk` bytes, as the
+/// documents provider writes each request but without it, then closing
+/// it (which commits and flushes the disk's cache). The file is deleted.
+pub fn file_write_speed(v: &Volume, bytes: u64, chunk: usize) -> Result<f64> {
+    let (_, path) = ops::create(v, "", ".ext4android-write-test", false)?;
+    let r = (|| {
+        let (handle, _) = ops::open(v, &path, false)?;
+        let ino = v.file(handle)?.ino;
+        let data = vec![0x5Au8; chunk];
+        let started = Instant::now();
+        let mut done = 0;
+        let written = (|| {
+            while done < bytes {
+                let n = chunk.min((bytes - done) as usize);
+                ops::write(v, ino, done, &data[..n])?;
+                done += n as u64;
+            }
+            Ok(())
+        })();
+        v.close_file(handle, true)?;
+        written.map(|()| mb_per_s(done, started))
+    })();
+    ops::delete(v, &path)?;
+    r
+}
+
+/// The USB transfers of the volume's disk (see [`UsbTransfers`]), if it is
+/// on one.
+pub fn usb_transfers(v: &Volume) -> Option<(usize, u32)> {
+    v.usb.as_ref().map(|u| u.transfers())
 }
 
 /// Mount the file system of a device (tests: an in-memory device).
 #[cfg(test)]
 pub fn mount_device(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
-    mount_on(dev, read_only)
+    mount_on(dev, read_only, None)
 }
 
 /// Mount the ext4 volume in an image file (a file system image, or a disk
@@ -256,7 +320,7 @@ pub fn mount_device(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<u32> {
 pub fn mount_image(path: &Path, read_only: bool) -> Result<u32> {
     let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open(path, read_only)?);
     let first = find_volumes(dev, read_only)?.swap_remove(0);
-    mount_on(first, read_only)
+    mount_on(first, read_only, None)
 }
 
 /// Volume facts for Kotlin (`VolumeInfo`), little-endian: label (u16
@@ -292,6 +356,8 @@ mod tests {
         let entries = v.fs.with(|fs| docs::list(fs, "")).unwrap();
         assert!(entries.iter().any(|e| e.name == "big.bin" && e.size == 16 << 20));
         assert!(device_read_speed(&v, 8 << 20).unwrap() > 0.0);
+        assert!(file_read_speed(&v, "big.bin").unwrap() > 0.0);
+        assert!(usb_transfers(&v).is_none());
         let info = info(&v).unwrap();
         assert_eq!(&info[0..2], &6u16.to_le_bytes());
         assert_eq!(&info[2..8], b"SAMPLE");

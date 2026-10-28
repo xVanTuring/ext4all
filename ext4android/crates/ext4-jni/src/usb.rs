@@ -28,11 +28,12 @@ pub fn mount<T: Transport + 'static>(t: T, read_only: bool) -> ext4_core::Result
 /// when another one mounts.
 fn mount_disk<T: Transport + 'static>(disk: Arc<Disk<T>>, read_only: bool) -> ext4_core::Result<Vec<u32>> {
     // ext4 reads the superblock at byte 1024, inside a 4 KiB sector
+    let transfers: Arc<dyn volumes::UsbTransfers> = Arc::new(Transfers(disk.clone()));
     let whole: Arc<dyn BlockDevice> = Arc::new(AlignedDevice::new(UsbDisk::new(disk, read_only)));
     let mut ids = Vec::new();
     let mut failure = None;
     for dev in volumes::find_volumes(whole, read_only)? {
-        match volumes::mount_on(dev, read_only) {
+        match volumes::mount_on(dev, read_only, Some(transfers.clone())) {
             Ok(id) => ids.push(id),
             Err(e) => {
                 log::error!("mounting a volume of the USB disk failed: {e}");
@@ -66,6 +67,14 @@ impl<T: Transport> UsbDisk<T> {
             )));
         }
         Ok(offset / self.disk.info().block_size as u64)
+    }
+}
+
+struct Transfers<T: Transport>(Arc<Disk<T>>);
+
+impl<T: Transport> volumes::UsbTransfers for Transfers<T> {
+    fn transfers(&self) -> (usize, u32) {
+        (self.0.max_transfer(), self.0.transfer_shrinks())
     }
 }
 
@@ -404,6 +413,9 @@ mod tests {
         let ids = mount(two_volume_disk(), true).unwrap();
         let labels: Vec<String> = ids.iter().map(|&id| volumes::get(id).unwrap().label.clone()).collect();
         assert_eq!(labels, ["ONE", "TWO"]);
+        let v = volumes::get(ids[0]).unwrap();
+        assert!(matches!(volumes::usb_transfers(&v), Some((n, 0)) if n > 0));
+        drop(v);
         for id in ids {
             volumes::unmount(id).unwrap();
         }
@@ -420,6 +432,10 @@ mod tests {
         let disk = Arc::new(Disk::open(sim_disk()).unwrap());
         let id = mount_disk(disk.clone(), false).unwrap()[0];
         let v = volumes::get(id).unwrap();
+        for chunk in [128 << 10, 1 << 20] {
+            assert!(volumes::file_write_speed(&v, 3 << 20, chunk).unwrap() > 0.0);
+        }
+        assert!(!root_names(id).iter().any(|n| n.contains("write-test")), "{:?}", root_names(id));
         ops::create(&v, "", "notes.txt", false).unwrap();
         let (h, _) = ops::open(&v, "notes.txt", false).unwrap();
         ops::write(&v, v.file(h).unwrap().ino, 0, b"written over USB").unwrap();

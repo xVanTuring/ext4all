@@ -64,6 +64,28 @@ object Native {
     @JvmStatic
     external fun deviceReadSpeed(volume: Int, mib: Int): Double
 
+    /**
+     * MB/s reading the regular file at [path] through the file system in
+     * 1 MiB reads, without the documents provider.
+     */
+    @JvmStatic
+    external fun fileReadSpeed(volume: Int, path: String): Double
+
+    /**
+     * MB/s writing [mib] MiB to a new file in writes of [chunkKiB] KiB
+     * through the file system, without the documents provider, then
+     * closing it; the file is deleted.
+     */
+    @JvmStatic
+    external fun fileWriteSpeed(volume: Int, mib: Int, chunkKiB: Int): Double
+
+    /**
+     * The USB transfers of the volume's disk: `[bytes per transfer, times
+     * halved after ENOMEM]`; empty when it is not on a USB disk.
+     */
+    @JvmStatic
+    external fun usbTransfers(volume: Int): LongArray
+
     /** See [Records.volumeInfo]. */
     @JvmStatic
     external fun volumeInfo(volume: Int): ByteArray

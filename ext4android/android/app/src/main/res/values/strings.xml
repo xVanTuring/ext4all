@@ -67,6 +67,12 @@
     <string name="speed_file">Wrote %1$s: %2$.1f MB/s (%3$d requests of %4$s on average, %5$.0f%% of the time in the file system and the disk)\nRead it back: %6$.1f MB/s (%7$d requests of %8$s on average, %9$.0f%% of the time in the file system and the disk)\nData: %10$s</string>
     <string name="speed_no_space">Not enough free space for the file test (needs %1$s)</string>
     <string name="speed_device">Reading the first %1$d MiB of the disk directly (without the file system and the documents provider): %2$.1f MB/s</string>
+    <string name="speed_fs_read">Reading the same file again through the file system alone (1 MiB reads, without the documents provider): %1$.1f MB/s</string>
+    <string name="speed_fs_write">Writing %1$d MiB through the file system alone (without the documents provider):</string>
+    <string name="speed_fs_write_item">%1$s per write: %2$.1f MB/s</string>
+    <string name="speed_usb">USB transfers: %1$d KiB each now, halved %2$d times after the kernel ran out of memory</string>
+    <string name="speed_proxy">The system\'s proxy descriptor alone (no file system or disk, data thrown away): writing %1$.1f MB/s, reading %2$.1f MB/s</string>
+    <string name="speed_pipe">A pipe instead (what a documents provider can hand out for writing in order): writing %1$.1f MB/s</string>
     <string name="data_ok">correct</string>
     <string name="data_bad">WRONG</string>
 </resources>

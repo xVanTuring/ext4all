@@ -146,7 +146,7 @@ impl OpenFile {
 
 /// Read until `buf` is full or the file ends; the device reads run outside
 /// the file system lock.
-fn read_at(vol: &Volume, ino: Ino, offset: u64, buf: &mut [u8]) -> Result<usize> {
+pub fn read_at(vol: &Volume, ino: Ino, offset: u64, buf: &mut [u8]) -> Result<usize> {
     let mut done = 0;
     while done < buf.len() {
         let n = vol.fs.read_parallel(ino, offset + done as u64, &mut buf[done..])?;
